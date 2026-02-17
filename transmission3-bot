@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
+SERVICE_NAME = "transmission3-bot"
 
 
 def run(cmd: list[str], *, check: bool = True) -> int:
@@ -55,6 +56,15 @@ def do_update_from_github() -> None:
     print("✅ Update complete.")
 
 
+def restart_bot_service() -> None:
+    cmd = ["systemctl", "restart", SERVICE_NAME]
+    if os.geteuid() != 0:
+        cmd = ["sudo", *cmd]
+
+    run(cmd)
+    print(f"✅ Service '{SERVICE_NAME}' restarted.")
+
+
 def set_env_key(key: str, prompt: str) -> None:
     data = load_env()
     value = input(prompt).strip()
@@ -72,7 +82,8 @@ def menu() -> None:
             "1) Download updates from GitHub\n"
             "2) Set Telegram bot token (TG_TOKEN)\n"
             "3) Set Telegram allowed user id(s) (ALLOWED_USER_IDS)\n"
-            "4) Set Transmission RPC URL (TR_URL)\n"
+            "4) Set Transmission RPC URL (TR_URL, example: http://127.0.0.1:9091/transmission/rpc)\n"
+            "5) Restart bot service\n"
             "0) Exit\n"
         )
 
@@ -86,7 +97,12 @@ def menu() -> None:
             elif choice == "3":
                 set_env_key("ALLOWED_USER_IDS", "Enter user id(s), comma-separated: ")
             elif choice == "4":
-                set_env_key("TR_URL", "Enter Transmission RPC URL: ")
+                set_env_key(
+                    "TR_URL",
+                    "Enter Transmission RPC URL (for example: http://127.0.0.1:9091/transmission/rpc): ",
+                )
+            elif choice == "5":
+                restart_bot_service()
             elif choice == "0":
                 print("Bye")
                 return
