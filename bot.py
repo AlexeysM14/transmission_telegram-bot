@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,8 @@ log = logging.getLogger("tg-transmission-bot")
 
 TG_MAX_MESSAGE = 4096
 TORRENT_ID_RE = re.compile(r"\b(\d{1,9})\b")
+_TR_CLIENT: Optional[Client] = None
+_TR_CLIENT_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -246,8 +249,53 @@ def build_client() -> Client:
     )
 
 
+def get_client() -> Client:
+    global _TR_CLIENT
+    if _TR_CLIENT is None:
+        _TR_CLIENT = build_client()
+    return _TR_CLIENT
+
+
 async def tr_call(fn: Callable[[Client], Any]) -> Any:
-    return await asyncio.to_thread(lambda: fn(build_client()))
+    def _call() -> Any:
+        with _TR_CLIENT_LOCK:
+            client = get_client()
+            try:
+                return fn(client)
+            except TransmissionError:
+                # Recreate client once on Transmission RPC failure and retry.
+                global _TR_CLIENT
+                _TR_CLIENT = None
+                client = get_client()
+                return fn(client)
+
+    return await asyncio.to_thread(_call)
+
+
+def _build_torrent_messages(header: str, lines: Sequence[str], tail: str) -> list[str]:
+    messages: list[str] = []
+    current = f"{header}\n\n"
+
+    for idx, line in enumerate(lines):
+        separator = "\n\n" if idx > 0 else ""
+        candidate = current + separator + line
+        if len(candidate) <= TG_MAX_MESSAGE:
+            current = candidate
+            continue
+
+        messages.append(current)
+        current = f"{header}\n\n{line}"
+
+    if tail:
+        candidate = f"{current}{tail}"
+        if len(candidate) <= TG_MAX_MESSAGE:
+            current = candidate
+        else:
+            messages.append(current)
+            current = f"{header}\n\n{tail.strip()}"
+
+    messages.append(current)
+    return messages
 
 
 async def reply_chunks(
@@ -355,12 +403,14 @@ async def send_torrent_list(
     if total > CFG.list_limit:
         tail = f"\n\nПоказано: {len(items)} из {total}."
 
-    await reply_chunks(
-        update,
-        f"{header}\n\n" + "\n\n".join(lines) + tail,
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb_torrents(),
-    )
+    messages = _build_torrent_messages(header, lines, tail)
+    for idx, text in enumerate(messages):
+        await reply_chunks(
+            update,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_torrents() if idx == len(messages) - 1 else None,
+        )
 
 
 async def add_magnet_or_url(update: Update, text: str) -> None:
