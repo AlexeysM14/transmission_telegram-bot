@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+ENV_FILE = ROOT / ".env"
+
+
+def run(cmd: list[str], *, check: bool = True) -> int:
+    print(f"\n$ {' '.join(cmd)}")
+    proc = subprocess.run(cmd, cwd=ROOT)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return proc.returncode
+
+
+def load_env() -> dict[str, str]:
+    data: dict[str, str] = {}
+    if not ENV_FILE.exists():
+        return data
+
+    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        data[key.strip()] = value.strip().strip('"').strip("'")
+    return data
+
+
+def save_env(values: dict[str, str]) -> None:
+    lines = [
+        "# telegram bot settings",
+        *(f"{k}={v}" for k, v in sorted(values.items())),
+        "",
+    ]
+    ENV_FILE.write_text("\n".join(lines), encoding="utf-8")
+    print(f"✅ Saved {ENV_FILE}")
+
+
+def do_update_from_github() -> None:
+    run(["git", "fetch", "--all"])
+    run(["git", "pull", "--ff-only"])
+
+    venv_python = ROOT / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        run([str(venv_python), "-m", "pip", "install", "-r", "requirements.txt"])
+    else:
+        run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+
+    print("✅ Update complete.")
+
+
+def set_env_key(key: str, prompt: str) -> None:
+    data = load_env()
+    value = input(prompt).strip()
+    if not value:
+        print("⚠️ Empty value, nothing changed")
+        return
+    data[key] = value
+    save_env(data)
+
+
+def menu() -> None:
+    while True:
+        print(
+            "\n=== transmission3-bot update ===\n"
+            "1) Download updates from GitHub\n"
+            "2) Set Telegram bot token (TG_TOKEN)\n"
+            "3) Set Telegram allowed user id(s) (ALLOWED_USER_IDS)\n"
+            "4) Set Transmission RPC URL (TR_URL)\n"
+            "0) Exit\n"
+        )
+
+        choice = input("Select an action: ").strip()
+
+        try:
+            if choice == "1":
+                do_update_from_github()
+            elif choice == "2":
+                set_env_key("TG_TOKEN", "Enter Telegram token: ")
+            elif choice == "3":
+                set_env_key("ALLOWED_USER_IDS", "Enter user id(s), comma-separated: ")
+            elif choice == "4":
+                set_env_key("TR_URL", "Enter Transmission RPC URL: ")
+            elif choice == "0":
+                print("Bye")
+                return
+            else:
+                print("❌ Unknown item")
+        except Exception as exc:
+            print(f"❌ {exc}")
+
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "update":
+        menu()
+        return 0
+
+    print("Usage: transmission3-bot update")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

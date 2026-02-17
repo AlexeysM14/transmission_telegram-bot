@@ -37,6 +37,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("tg-transmission-bot")
 
+
+
+def load_dotenv_file(path: Path) -> None:
+    if not path.exists():
+        return
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
+
+
+load_dotenv_file(Path(__file__).resolve().with_name(".env"))
+
 TG_MAX_MESSAGE = 4096
 TORRENT_ID_RE = re.compile(r"\b(\d{1,9})\b")
 _TR_CLIENT: Optional[Client] = None
