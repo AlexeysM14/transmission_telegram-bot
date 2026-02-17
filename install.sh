@@ -10,7 +10,7 @@ if [[ ${EUID} -ne 0 ]]; then
   exit 1
 fi
 
-if ! command -v git >/dev/null 2>&1; then
+if ! command -v git >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
   apt-get update
   apt-get install -y git python3 python3-venv
 fi
