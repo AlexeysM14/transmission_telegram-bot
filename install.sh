@@ -1,18 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/your-user/transmission_telegram-bot.git}"
+REPO_URL="${REPO_URL:-https://github.com/AlexeysM14/transmission_telegram-bot.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/transmission3-bot}"
 SERVICE_NAME="transmission3-bot"
 
 if [[ ${EUID} -ne 0 ]]; then
-  echo "Please run as root: sudo bash install.sh"
+  echo "Please run as root: bash install.sh"
   exit 1
 fi
 
+packages=()
 if ! command -v git >/dev/null 2>&1; then
+  packages+=(git)
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  packages+=(python3)
+fi
+if ! python3 -m venv --help >/dev/null 2>&1; then
+  packages+=(python3-venv)
+fi
+
+if (( ${#packages[@]} > 0 )); then
   apt-get update
-  apt-get install -y git python3 python3-venv
+  apt-get install -y "${packages[@]}"
 fi
 
 if [[ -d "$INSTALL_DIR/.git" ]]; then
