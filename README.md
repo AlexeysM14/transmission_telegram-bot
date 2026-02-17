@@ -34,7 +34,8 @@ transmission3-bot update
 - `1` — скачать обновления бота из GitHub (`git pull` + обновление зависимостей);
 - `2` — задать токен Telegram-бота (`TG_TOKEN`);
 - `3` — задать Telegram user id (`ALLOWED_USER_IDS`);
-- `4` — задать URL Transmission RPC (`TR_URL`).
+- `4` — задать URL Transmission RPC (`TR_URL`, например: `http://127.0.0.1:9091/transmission/rpc`);
+- `5` — перезапустить systemd-сервис бота (`transmission3-bot`).
 
 5) После настройки запустите сервис:
 
@@ -81,7 +82,7 @@ curl -s "https://api.telegram.org/bot<TG_TOKEN>/getUpdates"
 
 - `TG_TOKEN` — **обязательно**.
 - `ALLOWED_USER_IDS` — список Telegram user id через запятую.
-- `TR_URL` — полный URL подключения к Transmission RPC (если указан, перекрывает host/port/path).
+- `TR_URL` — полный URL подключения к Transmission RPC в явном виде, например: `http://127.0.0.1:9091/transmission/rpc` (если указан, перекрывает host/port/path).
 - `TR_PROTOCOL` — `http` или `https` (по умолчанию `http`).
 - `TR_HOST` — хост Transmission (по умолчанию `127.0.0.1`).
 - `TR_PORT` — порт Transmission RPC (по умолчанию `9091`).
