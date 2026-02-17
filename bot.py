@@ -91,6 +91,32 @@ def _parse_allowed_ids(raw: str) -> Optional[set[int]]:
     return values
 
 
+def _parse_int_env(name: str, default: str, *, min_value: int = 1, max_value: Optional[int] = None) -> int:
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+
+    if value < min_value or (max_value is not None and value > max_value):
+        if max_value is None:
+            raise RuntimeError(f"{name} must be >= {min_value}")
+        raise RuntimeError(f"{name} must be in {min_value}..{max_value}")
+    return value
+
+
+def _parse_float_env(name: str, default: str, *, min_exclusive: float = 0.0) -> float:
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+
+    if value <= min_exclusive:
+        raise RuntimeError(f"{name} must be > {min_exclusive:g}")
+    return value
+
+
 def load_config() -> Config:
     tg_token = os.environ.get("TG_TOKEN", "").strip()
     if not tg_token:
@@ -100,17 +126,9 @@ def load_config() -> Config:
     if tr_protocol not in {"http", "https"}:
         raise RuntimeError("TR_PROTOCOL must be 'http' or 'https'")
 
-    tr_port = int(os.environ.get("TR_PORT", "9091").strip())
-    if not (1 <= tr_port <= 65535):
-        raise RuntimeError("TR_PORT must be in 1..65535")
-
-    tr_timeout = float(os.environ.get("TR_TIMEOUT", "10").strip())
-    if tr_timeout <= 0:
-        raise RuntimeError("TR_TIMEOUT must be > 0")
-
-    list_limit = int(os.environ.get("LIST_LIMIT", "25").strip())
-    if list_limit <= 0:
-        raise RuntimeError("LIST_LIMIT must be > 0")
+    tr_port = _parse_int_env("TR_PORT", "9091", min_value=1, max_value=65535)
+    tr_timeout = _parse_float_env("TR_TIMEOUT", "10", min_exclusive=0.0)
+    list_limit = _parse_int_env("LIST_LIMIT", "25", min_value=1)
 
     return Config(
         tg_token=tg_token,
@@ -186,6 +204,12 @@ def kb_ctrl() -> ReplyKeyboardMarkup:
             ["⬅️ Назад"],
         ]
     )
+
+
+KB_MAIN = kb_main()
+KB_TORRENTS = kb_torrents()
+KB_ADD = kb_add()
+KB_CTRL = kb_ctrl()
 
 
 def set_menu(ctx: ContextTypes.DEFAULT_TYPE, menu: str) -> None:
@@ -307,19 +331,23 @@ async def tr_call(fn: Callable[[Client], Any]) -> Any:
     return await asyncio.to_thread(_call)
 
 
+def _chunk_text(text: str, *, max_len: int) -> list[str]:
+    return [text[i : i + max_len] for i in range(0, len(text), max_len)] or [""]
+
+
 def _build_torrent_messages(header: str, lines: Sequence[str], tail: str) -> list[str]:
     messages: list[str] = []
     current = f"{header}\n\n"
 
-    for idx, line in enumerate(lines):
-        separator = "\n\n" if idx > 0 else ""
-        candidate = current + separator + line
-        if len(candidate) <= TG_MAX_MESSAGE:
-            current = candidate
-            continue
-
-        messages.append(current)
-        current = f"{header}\n\n{line}"
+    for line in lines:
+        for part in _chunk_text(line, max_len=TG_MAX_MESSAGE - len(header) - 2):
+            separator = "" if current.endswith("\n\n") else "\n\n"
+            candidate = f"{current}{separator}{part}"
+            if len(candidate) <= TG_MAX_MESSAGE:
+                current = candidate
+            else:
+                messages.append(current)
+                current = f"{header}\n\n{part}"
 
     if tail:
         candidate = f"{current}{tail}"
@@ -332,7 +360,6 @@ def _build_torrent_messages(header: str, lines: Sequence[str], tail: str) -> lis
     messages.append(current)
     return messages
 
-
 async def reply_chunks(
     update: Update,
     text: str,
@@ -344,7 +371,7 @@ async def reply_chunks(
     if message is None:
         return
 
-    chunks = [text[i : i + TG_MAX_MESSAGE] for i in range(0, len(text), TG_MAX_MESSAGE)] or [""]
+    chunks = _chunk_text(text, max_len=TG_MAX_MESSAGE)
     for idx, part in enumerate(chunks):
         kwargs: dict[str, Any] = {"text": part, "parse_mode": parse_mode}
         if idx == len(chunks) - 1:
@@ -356,7 +383,7 @@ async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         stats = await tr_call(lambda c: c.session_stats())
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=kb_main())
+        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_MAIN)
         return
 
     cur = stats.current_stats
@@ -370,7 +397,7 @@ async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         f"Трафик (всего): ⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>\n"
         f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
-    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
+    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=KB_MAIN)
 
 
 def _is_active(status: str) -> bool:
@@ -393,7 +420,7 @@ async def send_torrent_list(
     try:
         torrents = await tr_call(lambda c: c.get_torrents())
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=kb_torrents())
+        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_TORRENTS)
         return
 
     items = torrents
@@ -417,7 +444,7 @@ async def send_torrent_list(
     items = items[: CFG.list_limit]
 
     if total == 0:
-        await reply_chunks(update, "Пусто.", reply_markup=kb_torrents())
+        await reply_chunks(update, "Пусто.", reply_markup=KB_TORRENTS)
         return
 
     lines = []
@@ -446,39 +473,39 @@ async def send_torrent_list(
             update,
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_torrents() if idx == len(messages) - 1 else None,
+            reply_markup=KB_TORRENTS if idx == len(messages) - 1 else None,
         )
 
 
 async def add_magnet_or_url(update: Update, text: str) -> None:
     link = text.strip()
     if not (link.startswith("magnet:") or link.startswith("http://") or link.startswith("https://")):
-        await reply_chunks(update, "❌ Нужна magnet-ссылка или http(s) URL на .torrent.", reply_markup=kb_add())
+        await reply_chunks(update, "❌ Нужна magnet-ссылка или http(s) URL на .torrent.", reply_markup=KB_ADD)
         return
 
     try:
         torrent = await tr_call(lambda c: c.add_torrent(link))
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Не удалось добавить: {html.escape(str(exc))}", reply_markup=kb_add())
+        await reply_chunks(update, f"❌ Не удалось добавить: {html.escape(str(exc))}", reply_markup=KB_ADD)
         return
 
     await reply_chunks(
         update,
         f"✅ Добавлено: <b>{html.escape(torrent.name)}</b>\nID: <b>{torrent.id}</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_add(),
+        reply_markup=KB_ADD,
     )
 
 
 async def add_torrent_file(update: Update) -> None:
     message = update.effective_message
     if message is None or message.document is None:
-        await reply_chunks(update, "Пришли .torrent файлом.", reply_markup=kb_add())
+        await reply_chunks(update, "Пришли .torrent файлом.", reply_markup=KB_ADD)
         return
 
     doc = message.document
     if not (doc.file_name or "").lower().endswith(".torrent"):
-        await reply_chunks(update, "Это не .torrent файл.", reply_markup=kb_add())
+        await reply_chunks(update, "Это не .torrent файл.", reply_markup=KB_ADD)
         return
 
     tg_file = await doc.get_file()
@@ -498,7 +525,7 @@ async def add_torrent_file(update: Update) -> None:
         torrent = await tr_call(_add)
 
     except (TelegramError, OSError, TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Не удалось добавить .torrent: {html.escape(str(exc))}", reply_markup=kb_add())
+        await reply_chunks(update, f"❌ Не удалось добавить .torrent: {html.escape(str(exc))}", reply_markup=KB_ADD)
         return
     finally:
         if tmp_path and tmp_path.exists():
@@ -508,7 +535,7 @@ async def add_torrent_file(update: Update) -> None:
         update,
         f"✅ Добавлено из файла: <b>{html.escape(torrent.name)}</b>\nID: <b>{torrent.id}</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=kb_add(),
+        reply_markup=KB_ADD,
     )
 
 
@@ -529,10 +556,10 @@ async def ctrl_action(update: Update, action: str, torrent_id: int) -> None:
         else:
             msg = "❌ Неизвестное действие"
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=kb_ctrl())
+        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_CTRL)
         return
 
-    await reply_chunks(update, msg, reply_markup=kb_ctrl())
+    await reply_chunks(update, msg, reply_markup=KB_CTRL)
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -545,7 +572,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     set_menu(ctx, MENU_MAIN)
     set_wait(ctx, WAIT_NONE)
-    await reply_chunks(update, "Привет! Я бот для управления Transmission.\nВыбирай пункт меню ниже 👇", reply_markup=kb_main())
+    await reply_chunks(update, "Привет! Я бот для управления Transmission.\nВыбирай пункт меню ниже 👇", reply_markup=KB_MAIN)
 
 
 async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -567,7 +594,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"
         "Подсказка: ID виден в списках торрентов."
     )
-    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=kb_main())
+    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=KB_MAIN)
 
 
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -585,7 +612,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         set_wait(ctx, WAIT_NONE)
         return
 
-    await reply_chunks(update, "Я жду команду из меню 🙂", reply_markup=kb_main())
+    await reply_chunks(update, "Я жду команду из меню 🙂", reply_markup=KB_MAIN)
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -604,7 +631,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if text == "⬅️ Назад":
         set_menu(ctx, MENU_MAIN)
         set_wait(ctx, WAIT_NONE)
-        await reply_chunks(update, "Ок, назад в главное меню.", reply_markup=kb_main())
+        await reply_chunks(update, "Ок, назад в главное меню.", reply_markup=KB_MAIN)
         return
 
     menu = get_menu(ctx)
@@ -625,7 +652,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if wait in {WAIT_CTRL_PAUSE, WAIT_CTRL_START, WAIT_CTRL_DEL_KEEP, WAIT_CTRL_DEL_DATA}:
         torrent_id = parse_id(text)
         if torrent_id is None:
-            await reply_chunks(update, "Пришли числовой ID торрента (например: 12).", reply_markup=kb_ctrl())
+            await reply_chunks(update, "Пришли числовой ID торрента (например: 12).", reply_markup=KB_CTRL)
             return
 
         set_wait(ctx, WAIT_NONE)
@@ -650,17 +677,17 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if text == "📋 Торренты":
         set_menu(ctx, MENU_TORRENTS)
         set_wait(ctx, WAIT_NONE)
-        await reply_chunks(update, "Меню торрентов:", reply_markup=kb_torrents())
+        await reply_chunks(update, "Меню торрентов:", reply_markup=KB_TORRENTS)
         return
     if text == "➕ Добавить":
         set_menu(ctx, MENU_ADD)
         set_wait(ctx, WAIT_NONE)
-        await reply_chunks(update, "Как будем добавлять?", reply_markup=kb_add())
+        await reply_chunks(update, "Как будем добавлять?", reply_markup=KB_ADD)
         return
     if text == "⚙️ Управление":
         set_menu(ctx, MENU_CTRL)
         set_wait(ctx, WAIT_NONE)
-        await reply_chunks(update, "Выбери действие:", reply_markup=kb_ctrl())
+        await reply_chunks(update, "Выбери действие:", reply_markup=KB_CTRL)
         return
 
     if menu == MENU_TORRENTS:
@@ -678,38 +705,38 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             return
         if text == "🔎 Поиск":
             set_wait(ctx, WAIT_SEARCH)
-            await reply_chunks(update, "Введи часть названия для поиска:", reply_markup=kb_torrents())
+            await reply_chunks(update, "Введи часть названия для поиска:", reply_markup=KB_TORRENTS)
             return
 
     if menu == MENU_ADD:
         if text == "🧲 Магнет/URL":
             set_wait(ctx, WAIT_ADD_MAGNET)
-            await reply_chunks(update, "Пришли magnet-ссылку или URL на .torrent:", reply_markup=kb_add())
+            await reply_chunks(update, "Пришли magnet-ссылку или URL на .torrent:", reply_markup=KB_ADD)
             return
         if text == "📄 .torrent файл":
             set_wait(ctx, WAIT_ADD_TORRENT_FILE)
-            await reply_chunks(update, "Ок, пришли .torrent файлом сюда в чат.", reply_markup=kb_add())
+            await reply_chunks(update, "Ок, пришли .torrent файлом сюда в чат.", reply_markup=KB_ADD)
             return
 
     if menu == MENU_CTRL:
         if text == "⏸️ Пауза":
             set_wait(ctx, WAIT_CTRL_PAUSE)
-            await reply_chunks(update, "Пришли ID торрента для остановки:", reply_markup=kb_ctrl())
+            await reply_chunks(update, "Пришли ID торрента для остановки:", reply_markup=KB_CTRL)
             return
         if text == "▶️ Старт":
             set_wait(ctx, WAIT_CTRL_START)
-            await reply_chunks(update, "Пришли ID торрента для запуска:", reply_markup=kb_ctrl())
+            await reply_chunks(update, "Пришли ID торрента для запуска:", reply_markup=KB_CTRL)
             return
         if text == "🗑️ Удалить (оставить данные)":
             set_wait(ctx, WAIT_CTRL_DEL_KEEP)
-            await reply_chunks(update, "Пришли ID торрента для удаления (данные останутся на диске):", reply_markup=kb_ctrl())
+            await reply_chunks(update, "Пришли ID торрента для удаления (данные останутся на диске):", reply_markup=KB_CTRL)
             return
         if text == "💥 Удалить (с данными)":
             set_wait(ctx, WAIT_CTRL_DEL_DATA)
-            await reply_chunks(update, "⚠️ Пришли ID торрента для удаления вместе с данными:", reply_markup=kb_ctrl())
+            await reply_chunks(update, "⚠️ Пришли ID торрента для удаления вместе с данными:", reply_markup=KB_CTRL)
             return
 
-    await reply_chunks(update, "Не понял. Выбери пункт меню 🙂", reply_markup=kb_main())
+    await reply_chunks(update, "Не понял. Выбери пункт меню 🙂", reply_markup=KB_MAIN)
 
 
 def main() -> None:
