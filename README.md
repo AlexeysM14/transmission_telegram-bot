@@ -9,6 +9,8 @@ Telegram-бот для управления Transmission 3 через меню-�
 ```bash
 apt update
 apt install -y git python3-venv
+sudo apt update
+sudo apt install -y git
 ```
 
 2) Склонируйте репозиторий и перейдите в него:
