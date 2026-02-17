@@ -43,6 +43,10 @@ _TR_CLIENT: Optional[Client] = None
 _TR_CLIENT_LOCK = threading.Lock()
 
 
+class TRCallError(Exception):
+    """Wrapper for errors during Transmission RPC calls."""
+
+
 @dataclass(frozen=True)
 class Config:
     tg_token: str
@@ -80,7 +84,11 @@ def _parse_allowed_ids(raw: str) -> Optional[set[int]]:
     if ignored:
         log.warning("Ignored invalid ALLOWED_USER_IDS entries: %s", ", ".join(ignored))
 
-    return values if values else set()
+    if not values:
+        log.warning("No valid ALLOWED_USER_IDS values found; access restriction disabled")
+        return None
+
+    return values
 
 
 def load_config() -> Config:
@@ -198,10 +206,25 @@ def get_wait(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
 
 
 def user_allowed(update: Update) -> bool:
+    chat = update.effective_chat
+    if chat and chat.type != "private":
+        return False
+
     if CFG.allowed_user_ids is None:
         return True
     uid = update.effective_user.id if update.effective_user else None
     return uid in CFG.allowed_user_ids
+
+
+def _sort_torrents(items: Sequence[Any]) -> list[Any]:
+    return sorted(
+        items,
+        key=lambda t: (
+            0 if _is_active(str(t.status)) else 1,
+            -float(getattr(t, "progress", 0.0)),
+            (t.name or "").lower(),
+        ),
+    )
 
 
 def fmt_bytes(n: int | float) -> str:
@@ -252,22 +275,34 @@ def build_client() -> Client:
 def get_client() -> Client:
     global _TR_CLIENT
     if _TR_CLIENT is None:
-        _TR_CLIENT = build_client()
+        with _TR_CLIENT_LOCK:
+            if _TR_CLIENT is None:
+                _TR_CLIENT = build_client()
     return _TR_CLIENT
 
 
 async def tr_call(fn: Callable[[Client], Any]) -> Any:
-    def _call() -> Any:
+    def _run() -> Any:
+        client = get_client()
+        return fn(client)
+
+    def _reset_client() -> None:
+        global _TR_CLIENT
         with _TR_CLIENT_LOCK:
-            client = get_client()
+            _TR_CLIENT = None
+
+    def _call() -> Any:
+        try:
+            return _run()
+        except TransmissionError:
+            # Recreate client once on Transmission RPC failure and retry.
+            _reset_client()
             try:
-                return fn(client)
-            except TransmissionError:
-                # Recreate client once on Transmission RPC failure and retry.
-                global _TR_CLIENT
-                _TR_CLIENT = None
-                client = get_client()
-                return fn(client)
+                return _run()
+            except Exception as exc:
+                raise TRCallError("Transmission RPC request failed") from exc
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            raise TRCallError("Transmission RPC connection failed") from exc
 
     return await asyncio.to_thread(_call)
 
@@ -320,7 +355,7 @@ async def reply_chunks(
 async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         stats = await tr_call(lambda c: c.session_stats())
-    except TransmissionError as exc:
+    except (TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=kb_main())
         return
 
@@ -357,7 +392,7 @@ async def send_torrent_list(
 ) -> None:
     try:
         torrents = await tr_call(lambda c: c.get_torrents())
-    except TransmissionError as exc:
+    except (TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=kb_torrents())
         return
 
@@ -372,6 +407,8 @@ async def send_torrent_list(
     if query:
         q = query.strip().lower()
         items = [t for t in items if q in (t.name or "").lower()]
+
+    items = _sort_torrents(items)
 
     ctx.user_data["last_list_mode"] = mode
     ctx.user_data["last_list_query"] = query
@@ -421,7 +458,7 @@ async def add_magnet_or_url(update: Update, text: str) -> None:
 
     try:
         torrent = await tr_call(lambda c: c.add_torrent(link))
-    except TransmissionError as exc:
+    except (TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Не удалось добавить: {html.escape(str(exc))}", reply_markup=kb_add())
         return
 
@@ -460,7 +497,7 @@ async def add_torrent_file(update: Update) -> None:
 
         torrent = await tr_call(_add)
 
-    except (TelegramError, OSError, TransmissionError) as exc:
+    except (TelegramError, OSError, TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Не удалось добавить .torrent: {html.escape(str(exc))}", reply_markup=kb_add())
         return
     finally:
@@ -491,7 +528,7 @@ async def ctrl_action(update: Update, action: str, torrent_id: int) -> None:
             msg = f"💥 Удалено вместе с данными: ID {torrent_id}"
         else:
             msg = "❌ Неизвестное действие"
-    except TransmissionError as exc:
+    except (TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=kb_ctrl())
         return
 
@@ -499,6 +536,9 @@ async def ctrl_action(update: Update, action: str, torrent_id: int) -> None:
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
     if not user_allowed(update):
         await reply_chunks(update, "⛔️ Доступ запрещён.")
         return
@@ -509,6 +549,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
     if not user_allowed(update):
         await reply_chunks(update, "⛔️ Доступ запрещён.")
         return
@@ -528,6 +571,9 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
     if not user_allowed(update):
         return
 
@@ -543,6 +589,9 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat and update.effective_chat.type != "private":
+        return
+
     if not user_allowed(update):
         return
 
