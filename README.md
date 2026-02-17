@@ -4,20 +4,27 @@ Telegram-бот для управления Transmission 3 через меню-�
 
 ## Установка в Linux (с systemd)
 
-1) Склонируйте репозиторий и перейдите в него:
+1) Установите Git (если ещё не установлен):
 
 ```bash
-git clone https://github.com/your-user/transmission_telegram-bot.git
+sudo apt update
+sudo apt install -y git
+```
+
+2) Склонируйте репозиторий и перейдите в него:
+
+```bash
+git clone https://github.com/AlexeysM14/transmission_telegram-bot.git
 cd transmission_telegram-bot
 ```
 
-2) Запустите установку (создаст `.venv`, systemd-сервис и команду `transmission3-bot`):
+3) Запустите установку (создаст `.venv`, systemd-сервис и команду `transmission3-bot`):
 
 ```bash
 sudo bash install.sh
 ```
 
-3) Откройте меню настройки:
+4) Откройте меню настройки:
 
 ```bash
 transmission3-bot update
@@ -29,7 +36,7 @@ transmission3-bot update
 - `3` — задать Telegram user id (`ALLOWED_USER_IDS`);
 - `4` — задать URL Transmission RPC (`TR_URL`).
 
-4) После настройки запустите сервис:
+5) После настройки запустите сервис:
 
 ```bash
 sudo systemctl start transmission3-bot
