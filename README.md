@@ -2,7 +2,41 @@
 
 Telegram-бот для управления Transmission 3 через меню-кнопки.
 
-## Запуск
+## Установка в Linux (с systemd)
+
+1) Склонируйте репозиторий и перейдите в него:
+
+```bash
+git clone https://github.com/your-user/transmission_telegram-bot.git
+cd transmission_telegram-bot
+```
+
+2) Запустите установку (создаст `.venv`, systemd-сервис и команду `transmission3-bot`):
+
+```bash
+sudo bash install.sh
+```
+
+3) Откройте меню настройки:
+
+```bash
+transmission3-bot update
+```
+
+В меню доступны пункты:
+- `1` — скачать обновления бота из GitHub (`git pull` + обновление зависимостей);
+- `2` — задать токен Telegram-бота (`TG_TOKEN`);
+- `3` — задать Telegram user id (`ALLOWED_USER_IDS`);
+- `4` — задать URL Transmission RPC (`TR_URL`).
+
+4) После настройки запустите сервис:
+
+```bash
+sudo systemctl start transmission3-bot
+sudo systemctl status transmission3-bot
+```
+
+## Быстрый запуск вручную (без systemd)
 
 ```bash
 python3 -m venv .venv
@@ -11,6 +45,19 @@ pip install -r requirements.txt
 export TG_TOKEN="<telegram-bot-token>"
 python bot.py
 ```
+
+## Как получить токен Telegram
+
+1. Откройте Telegram и найдите `@BotFather`.
+2. Отправьте команду `/newbot`.
+3. Задайте имя бота (display name), затем username (должен оканчиваться на `bot`, например `my_transmission3_bot`).
+4. BotFather отправит строку вида `123456789:AA...` — это и есть `TG_TOKEN`.
+5. Введите этот токен в `transmission3-bot update` → пункт `2`.
+
+## Как узнать свой Telegram user id
+
+- Самый простой способ: написать боту `@userinfobot` и получить свой `Id`.
+- Полученный id впишите в `transmission3-bot update` → пункт `3`.
 
 ## Переменные окружения
 
