@@ -15,13 +15,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CommandHandler,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -230,6 +231,9 @@ KB_TORRENTS = kb_torrents()
 KB_ADD = kb_add()
 KB_CTRL = kb_ctrl()
 
+STATUS_REFRESH_CB = "status_refresh"
+LAST_EPHEMERAL_MESSAGE_KEY = "last_ephemeral_message_id"
+
 
 def set_menu(ctx: ContextTypes.DEFAULT_TYPE, menu: str) -> None:
     ctx.user_data["menu"] = menu
@@ -384,7 +388,7 @@ async def reply_chunks(
     text: str,
     *,
     parse_mode: Optional[str] = None,
-    reply_markup: Optional[ReplyKeyboardMarkup] = None,
+    reply_markup: Optional[Any] = None,
 ) -> None:
     message = update.effective_message
     if message is None:
@@ -398,6 +402,72 @@ async def reply_chunks(
         await message.reply_text(**kwargs)
 
 
+def _status_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить статус", callback_data=STATUS_REFRESH_CB)]])
+
+
+def _format_session_duration(seconds: int | float) -> str:
+    total_seconds = max(0, int(seconds))
+    days, rem = divmod(total_seconds, 24 * 3600)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+async def _delete_message_safe(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
+    try:
+        await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramError:
+        return
+
+
+async def _cleanup_previous_ephemeral(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    old_message_id = ctx.user_data.get(LAST_EPHEMERAL_MESSAGE_KEY)
+    if isinstance(old_message_id, int):
+        await _delete_message_safe(ctx, chat.id, old_message_id)
+
+
+async def send_ephemeral(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: ReplyKeyboardMarkup) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    await _cleanup_previous_ephemeral(update, ctx)
+    sent = await message.reply_text(text=text, reply_markup=reply_markup)
+    ctx.user_data[LAST_EPHEMERAL_MESSAGE_KEY] = sent.message_id
+
+
+async def _delete_user_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    await _delete_message_safe(ctx, chat.id, message.message_id)
+
+
+def _build_status_text(stats: Any) -> str:
+    cur = stats.current_stats
+    cum = stats.cumulative_stats
+    session_duration = _format_session_duration(getattr(cur, "seconds_active", 0))
+    return (
+        "📊 <b>Transmission — статус</b>\n"
+        f"Скорость: ⇣ <b>{fmt_rate(stats.download_speed)}</b> | ⇡ <b>{fmt_rate(stats.upload_speed)}</b>\n"
+        f"Торренты: активных <b>{stats.active_torrent_count}</b>, на паузе <b>{stats.paused_torrent_count}</b>, всего <b>{stats.torrent_count}</b>\n\n"
+        f"Трафик (сессия - {session_duration}): ⇣ <b>{fmt_bytes(cur.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cur.uploaded_bytes)}</b>\n"
+        f"Трафик (всего): ⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>\n"
+        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+
 async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         stats = await tr_call(lambda c: c.session_stats())
@@ -405,18 +475,31 @@ async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_MAIN)
         return
 
-    cur = stats.current_stats
-    cum = stats.cumulative_stats
+    text = _build_status_text(stats)
+    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=_status_keyboard())
 
-    text = (
-        "📊 <b>Transmission — статус</b>\n"
-        f"Скорость: ⇣ <b>{fmt_rate(stats.download_speed)}</b> | ⇡ <b>{fmt_rate(stats.upload_speed)}</b>\n"
-        f"Торренты: активных <b>{stats.active_torrent_count}</b>, на паузе <b>{stats.paused_torrent_count}</b>, всего <b>{stats.torrent_count}</b>\n\n"
-        f"Трафик (сессия): ⇣ <b>{fmt_bytes(cur.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cur.uploaded_bytes)}</b>\n"
-        f"Трафик (всего): ⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>\n"
-        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+
+async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+
+    try:
+        stats = await tr_call(lambda c: c.session_stats())
+    except (TransmissionError, TRCallError) as exc:
+        await query.edit_message_text(
+            text=f"❌ Ошибка Transmission: {html.escape(str(exc))}",
+            reply_markup=_status_keyboard(),
+        )
+        return
+
+    await query.edit_message_text(
+        text=_build_status_text(stats),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_status_keyboard(),
     )
-    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=KB_MAIN)
 
 
 def _is_active(status: str) -> bool:
@@ -629,9 +712,11 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await add_torrent_file(update)
         set_menu(ctx, MENU_ADD)
         set_wait(ctx, WAIT_NONE)
+        await _delete_user_message(update, ctx)
         return
 
-    await reply_chunks(update, "Я жду команду из меню 🙂", reply_markup=KB_MAIN)
+    await send_ephemeral(update, ctx, "Я жду команду из меню 🙂", reply_markup=KB_MAIN)
+    await _delete_user_message(update, ctx)
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -647,115 +732,118 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
 
-    if text == "⬅️ Назад":
-        set_menu(ctx, MENU_MAIN)
-        set_wait(ctx, WAIT_NONE)
-        await reply_chunks(update, "Ок, назад в главное меню.", reply_markup=KB_MAIN)
-        return
-
-    menu = get_menu(ctx)
-    wait = get_wait(ctx)
-
-    if wait == WAIT_SEARCH:
-        set_wait(ctx, WAIT_NONE)
-        set_menu(ctx, MENU_TORRENTS)
-        await send_torrent_list(update, ctx, mode="all", query=text)
-        return
-
-    if wait == WAIT_ADD_MAGNET:
-        set_wait(ctx, WAIT_NONE)
-        set_menu(ctx, MENU_ADD)
-        await add_magnet_or_url(update, text)
-        return
-
-    if wait in {WAIT_CTRL_PAUSE, WAIT_CTRL_START, WAIT_CTRL_DEL_KEEP, WAIT_CTRL_DEL_DATA}:
-        torrent_id = parse_id(text)
-        if torrent_id is None:
-            await reply_chunks(update, "Пришли числовой ID торрента (например: 12).", reply_markup=KB_CTRL)
+    try:
+        if text == "⬅️ Назад":
+            set_menu(ctx, MENU_MAIN)
+            set_wait(ctx, WAIT_NONE)
+            await send_ephemeral(update, ctx, "Ок, назад в главное меню.", reply_markup=KB_MAIN)
             return
 
-        set_wait(ctx, WAIT_NONE)
-        set_menu(ctx, MENU_CTRL)
-        action_map = {
-            WAIT_CTRL_PAUSE: "pause",
-            WAIT_CTRL_START: "start",
-            WAIT_CTRL_DEL_KEEP: "del_keep",
-            WAIT_CTRL_DEL_DATA: "del_data",
-        }
-        await ctrl_action(update, action_map[wait], torrent_id=torrent_id)
-        return
+        menu = get_menu(ctx)
+        wait = get_wait(ctx)
 
-    if text == "ℹ️ Помощь":
-        await cmd_help(update, ctx)
-        return
-    if text == "📊 Статус":
-        set_menu(ctx, MENU_MAIN)
-        set_wait(ctx, WAIT_NONE)
-        await send_status(update, ctx)
-        return
-    if text == "📋 Торренты":
-        set_menu(ctx, MENU_TORRENTS)
-        set_wait(ctx, WAIT_NONE)
-        await reply_chunks(update, "Меню торрентов:", reply_markup=KB_TORRENTS)
-        return
-    if text == "➕ Добавить":
-        set_menu(ctx, MENU_ADD)
-        set_wait(ctx, WAIT_NONE)
-        await reply_chunks(update, "Как будем добавлять?", reply_markup=KB_ADD)
-        return
-    if text == "⚙️ Управление":
-        set_menu(ctx, MENU_CTRL)
-        set_wait(ctx, WAIT_NONE)
-        await reply_chunks(update, "Выбери действие:", reply_markup=KB_CTRL)
-        return
-
-    if menu == MENU_TORRENTS:
-        if text == "📋 Все":
-            await send_torrent_list(update, ctx, mode="all")
-            return
-        if text == "▶️ Активные":
-            await send_torrent_list(update, ctx, mode="active")
-            return
-        if text == "⏹️ Остановл.":
-            await send_torrent_list(update, ctx, mode="stopped")
-            return
-        if text == "✅ Завершённые":
-            await send_torrent_list(update, ctx, mode="done")
-            return
-        if text == "🔎 Поиск":
-            set_wait(ctx, WAIT_SEARCH)
-            await reply_chunks(update, "Введи часть названия для поиска:", reply_markup=KB_TORRENTS)
+        if wait == WAIT_SEARCH:
+            set_wait(ctx, WAIT_NONE)
+            set_menu(ctx, MENU_TORRENTS)
+            await send_torrent_list(update, ctx, mode="all", query=text)
             return
 
-    if menu == MENU_ADD:
-        if text == "🧲 Магнет/URL":
-            set_wait(ctx, WAIT_ADD_MAGNET)
-            await reply_chunks(update, "Пришли magnet-ссылку или URL на .torrent:", reply_markup=KB_ADD)
-            return
-        if text == "📄 .torrent файл":
-            set_wait(ctx, WAIT_ADD_TORRENT_FILE)
-            await reply_chunks(update, "Ок, пришли .torrent файлом сюда в чат.", reply_markup=KB_ADD)
+        if wait == WAIT_ADD_MAGNET:
+            set_wait(ctx, WAIT_NONE)
+            set_menu(ctx, MENU_ADD)
+            await add_magnet_or_url(update, text)
             return
 
-    if menu == MENU_CTRL:
-        if text == "⏸️ Пауза":
-            set_wait(ctx, WAIT_CTRL_PAUSE)
-            await reply_chunks(update, "Пришли ID торрента для остановки:", reply_markup=KB_CTRL)
-            return
-        if text == "▶️ Старт":
-            set_wait(ctx, WAIT_CTRL_START)
-            await reply_chunks(update, "Пришли ID торрента для запуска:", reply_markup=KB_CTRL)
-            return
-        if text == "🗑️ Удалить (оставить данные)":
-            set_wait(ctx, WAIT_CTRL_DEL_KEEP)
-            await reply_chunks(update, "Пришли ID торрента для удаления (данные останутся на диске):", reply_markup=KB_CTRL)
-            return
-        if text == "💥 Удалить (с данными)":
-            set_wait(ctx, WAIT_CTRL_DEL_DATA)
-            await reply_chunks(update, "⚠️ Пришли ID торрента для удаления вместе с данными:", reply_markup=KB_CTRL)
+        if wait in {WAIT_CTRL_PAUSE, WAIT_CTRL_START, WAIT_CTRL_DEL_KEEP, WAIT_CTRL_DEL_DATA}:
+            torrent_id = parse_id(text)
+            if torrent_id is None:
+                await send_ephemeral(update, ctx, "Пришли числовой ID торрента (например: 12).", reply_markup=KB_CTRL)
+                return
+
+            set_wait(ctx, WAIT_NONE)
+            set_menu(ctx, MENU_CTRL)
+            action_map = {
+                WAIT_CTRL_PAUSE: "pause",
+                WAIT_CTRL_START: "start",
+                WAIT_CTRL_DEL_KEEP: "del_keep",
+                WAIT_CTRL_DEL_DATA: "del_data",
+            }
+            await ctrl_action(update, action_map[wait], torrent_id=torrent_id)
             return
 
-    await reply_chunks(update, "Не понял. Выбери пункт меню 🙂", reply_markup=KB_MAIN)
+        if text == "ℹ️ Помощь":
+            await cmd_help(update, ctx)
+            return
+        if text == "📊 Статус":
+            set_menu(ctx, MENU_MAIN)
+            set_wait(ctx, WAIT_NONE)
+            await send_status(update, ctx)
+            return
+        if text == "📋 Торренты":
+            set_menu(ctx, MENU_TORRENTS)
+            set_wait(ctx, WAIT_NONE)
+            await send_ephemeral(update, ctx, "Меню торрентов:", reply_markup=KB_TORRENTS)
+            return
+        if text == "➕ Добавить":
+            set_menu(ctx, MENU_ADD)
+            set_wait(ctx, WAIT_NONE)
+            await send_ephemeral(update, ctx, "Как будем добавлять?", reply_markup=KB_ADD)
+            return
+        if text == "⚙️ Управление":
+            set_menu(ctx, MENU_CTRL)
+            set_wait(ctx, WAIT_NONE)
+            await send_ephemeral(update, ctx, "Выбери действие:", reply_markup=KB_CTRL)
+            return
+
+        if menu == MENU_TORRENTS:
+            if text == "📋 Все":
+                await send_torrent_list(update, ctx, mode="all")
+                return
+            if text == "▶️ Активные":
+                await send_torrent_list(update, ctx, mode="active")
+                return
+            if text == "⏹️ Остановл.":
+                await send_torrent_list(update, ctx, mode="stopped")
+                return
+            if text == "✅ Завершённые":
+                await send_torrent_list(update, ctx, mode="done")
+                return
+            if text == "🔎 Поиск":
+                set_wait(ctx, WAIT_SEARCH)
+                await send_ephemeral(update, ctx, "Введи часть названия для поиска:", reply_markup=KB_TORRENTS)
+                return
+
+        if menu == MENU_ADD:
+            if text == "🧲 Магнет/URL":
+                set_wait(ctx, WAIT_ADD_MAGNET)
+                await send_ephemeral(update, ctx, "Пришли magnet-ссылку или URL на .torrent:", reply_markup=KB_ADD)
+                return
+            if text == "📄 .torrent файл":
+                set_wait(ctx, WAIT_ADD_TORRENT_FILE)
+                await send_ephemeral(update, ctx, "Ок, пришли .torrent файлом сюда в чат.", reply_markup=KB_ADD)
+                return
+
+        if menu == MENU_CTRL:
+            if text == "⏸️ Пауза":
+                set_wait(ctx, WAIT_CTRL_PAUSE)
+                await send_ephemeral(update, ctx, "Пришли ID торрента для остановки:", reply_markup=KB_CTRL)
+                return
+            if text == "▶️ Старт":
+                set_wait(ctx, WAIT_CTRL_START)
+                await send_ephemeral(update, ctx, "Пришли ID торрента для запуска:", reply_markup=KB_CTRL)
+                return
+            if text == "🗑️ Удалить (оставить данные)":
+                set_wait(ctx, WAIT_CTRL_DEL_KEEP)
+                await send_ephemeral(update, ctx, "Пришли ID торрента для удаления (данные останутся на диске):", reply_markup=KB_CTRL)
+                return
+            if text == "💥 Удалить (с данными)":
+                set_wait(ctx, WAIT_CTRL_DEL_DATA)
+                await send_ephemeral(update, ctx, "⚠️ Пришли ID торрента для удаления вместе с данными:", reply_markup=KB_CTRL)
+                return
+
+        await send_ephemeral(update, ctx, "Не понял. Выбери пункт меню 🙂", reply_markup=KB_MAIN)
+    finally:
+        await _delete_user_message(update, ctx)
 
 
 def main() -> None:
@@ -764,6 +852,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
 
+    app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
