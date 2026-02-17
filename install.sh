@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/your-user/transmission_telegram-bot.git}"
+REPO_URL="${REPO_URL:-https://github.com/AlexeysM14/transmission_telegram-bot.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/transmission3-bot}"
 SERVICE_NAME="transmission3-bot"
 
