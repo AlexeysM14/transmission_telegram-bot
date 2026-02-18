@@ -1065,7 +1065,17 @@ def main() -> None:
                 except TelegramError:
                     log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
 
-    app.job_queue.run_repeating(notify_completed_torrents, interval=NOTIFY_POLL_INTERVAL_SEC, first=NOTIFY_POLL_INTERVAL_SEC)
+    if app.job_queue is None:
+        log.warning(
+            "Job queue is unavailable; completion notifications are disabled. "
+            "Install python-telegram-bot with the 'job-queue' extra to enable them."
+        )
+    else:
+        app.job_queue.run_repeating(
+            notify_completed_torrents,
+            interval=NOTIFY_POLL_INTERVAL_SEC,
+            first=NOTIFY_POLL_INTERVAL_SEC,
+        )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
