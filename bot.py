@@ -215,12 +215,14 @@ def kb_add() -> ReplyKeyboardMarkup:
     return kb([["🧲 Магнет/URL", "📄 .torrent файл"], ["⬅️ Назад"]])
 
 
-def kb_ctrl() -> ReplyKeyboardMarkup:
+def kb_ctrl(notify_enabled: bool = False) -> ReplyKeyboardMarkup:
+    notify_label = "🔔 Уведомления: ВКЛ" if notify_enabled else "🔕 Уведомления: ВЫКЛ"
     return kb(
         [
             ["⏸️ Пауза", "▶️ Старт"],
             ["🗑️ Удалить (оставить данные)"],
             ["💥 Удалить (с данными)"],
+            [notify_label],
             ["⬅️ Назад"],
         ]
     )
@@ -229,10 +231,16 @@ def kb_ctrl() -> ReplyKeyboardMarkup:
 KB_MAIN = kb_main()
 KB_TORRENTS = kb_torrents()
 KB_ADD = kb_add()
-KB_CTRL = kb_ctrl()
+KB_CTRL = kb_ctrl(False)
 
 STATUS_REFRESH_CB = "status_refresh"
+LIST_REFRESH_CB_PREFIX = "list_refresh:"
 LAST_EPHEMERAL_MESSAGE_KEY = "last_ephemeral_message_id"
+NOTIFY_ENABLED_CHATS_KEY = "notify_enabled_chat_ids"
+NOTIFY_COMPLETED_CACHE_KEY = "notify_completed_cache"
+NOTIFY_INITIALIZED_KEY = "notify_initialized"
+
+NOTIFY_POLL_INTERVAL_SEC = 60
 
 
 def set_menu(ctx: ContextTypes.DEFAULT_TYPE, menu: str) -> None:
@@ -406,6 +414,27 @@ def _status_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить статус", callback_data=STATUS_REFRESH_CB)]])
 
 
+def _torrent_list_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("▶️ Активные", callback_data=f"{LIST_REFRESH_CB_PREFIX}active"),
+            InlineKeyboardButton("📋 Все", callback_data=f"{LIST_REFRESH_CB_PREFIX}all"),
+            InlineKeyboardButton("✅ Завершённые", callback_data=f"{LIST_REFRESH_CB_PREFIX}done"),
+        ]]
+    )
+
+
+def _notifications_enabled(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    enabled_chats = ctx.application.bot_data.setdefault(NOTIFY_ENABLED_CHATS_KEY, set())
+    return chat_id in enabled_chats
+
+
+def _ctrl_keyboard_for_chat(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> ReplyKeyboardMarkup:
+    if chat_id is None:
+        return KB_CTRL
+    return kb_ctrl(_notifications_enabled(ctx, chat_id))
+
+
 def _format_session_duration(seconds: int | float) -> str:
     total_seconds = max(0, int(seconds))
     days, rem = divmod(total_seconds, 24 * 3600)
@@ -502,6 +531,25 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    if not data.startswith(LIST_REFRESH_CB_PREFIX):
+        await query.answer()
+        return
+
+    mode = data[len(LIST_REFRESH_CB_PREFIX) :]
+    if mode not in {"all", "active", "done"}:
+        await query.answer("Неизвестный тип списка", show_alert=True)
+        return
+
+    await query.answer("Обновляю список…")
+    await send_torrent_list(update, ctx, mode=mode)
+
+
 def _is_active(status: str) -> bool:
     return status in (
         "downloading",
@@ -522,7 +570,7 @@ async def send_torrent_list(
     try:
         torrents = await tr_call(lambda c: c.get_torrents())
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_TORRENTS)
+        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=_torrent_list_keyboard())
         return
 
     items = torrents
@@ -546,7 +594,7 @@ async def send_torrent_list(
     items = items[: CFG.list_limit]
 
     if total == 0:
-        await reply_chunks(update, "Пусто.", reply_markup=KB_TORRENTS)
+        await reply_chunks(update, "Пусто.", reply_markup=_torrent_list_keyboard())
         return
 
     lines = []
@@ -575,7 +623,7 @@ async def send_torrent_list(
             update,
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=KB_TORRENTS if idx == len(messages) - 1 else None,
+            reply_markup=_torrent_list_keyboard() if idx == len(messages) - 1 else None,
         )
 
 
@@ -641,7 +689,7 @@ async def add_torrent_file(update: Update) -> None:
     )
 
 
-async def ctrl_action(update: Update, action: str, torrent_id: int) -> None:
+async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str, torrent_id: int) -> None:
     try:
         if action == "pause":
             await tr_call(lambda c: c.stop_torrent(torrent_id))
@@ -658,10 +706,10 @@ async def ctrl_action(update: Update, action: str, torrent_id: int) -> None:
         else:
             msg = "❌ Неизвестное действие"
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_CTRL)
+        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
         return
 
-    await reply_chunks(update, msg, reply_markup=KB_CTRL)
+    await reply_chunks(update, msg, reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -732,6 +780,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
 
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+
     try:
         if text == "⬅️ Назад":
             set_menu(ctx, MENU_MAIN)
@@ -768,7 +819,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 WAIT_CTRL_DEL_KEEP: "del_keep",
                 WAIT_CTRL_DEL_DATA: "del_data",
             }
-            await ctrl_action(update, action_map[wait], torrent_id=torrent_id)
+            await ctrl_action(update, ctx, action_map[wait], torrent_id=torrent_id)
             return
 
         if text == "ℹ️ Помощь":
@@ -792,7 +843,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if text == "⚙️ Управление":
             set_menu(ctx, MENU_CTRL)
             set_wait(ctx, WAIT_NONE)
-            await send_ephemeral(update, ctx, "Выбери действие:", reply_markup=KB_CTRL)
+            await send_ephemeral(update, ctx, "Выбери действие:", reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id))
             return
 
         if menu == MENU_TORRENTS:
@@ -840,6 +891,21 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 set_wait(ctx, WAIT_CTRL_DEL_DATA)
                 await send_ephemeral(update, ctx, "⚠️ Пришли ID торрента для удаления вместе с данными:", reply_markup=KB_CTRL)
                 return
+            if text.startswith("🔔 Уведомления:") or text.startswith("🔕 Уведомления:"):
+                if chat_id is None:
+                    await send_ephemeral(update, ctx, "❌ Не удалось определить чат для настройки уведомлений.", reply_markup=KB_CTRL)
+                    return
+
+                enabled_chats = ctx.application.bot_data.setdefault(NOTIFY_ENABLED_CHATS_KEY, set())
+                if chat_id in enabled_chats:
+                    enabled_chats.remove(chat_id)
+                    status_text = "🔕 Уведомления о завершении торрентов выключены."
+                else:
+                    enabled_chats.add(chat_id)
+                    status_text = "🔔 Уведомления о завершении торрентов включены."
+
+                await send_ephemeral(update, ctx, status_text, reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id))
+                return
 
         await send_ephemeral(update, ctx, "Не понял. Выбери пункт меню 🙂", reply_markup=KB_MAIN)
     finally:
@@ -849,10 +915,55 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     app: Application = ApplicationBuilder().token(CFG.tg_token).build()
 
+    async def notify_completed_torrents(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
+        if not isinstance(enabled_chats, set) or not enabled_chats:
+            return
+
+        try:
+            torrents = await tr_call(lambda c: c.get_torrents())
+        except (TransmissionError, TRCallError):
+            log.warning("Skipping completion notifications due to Transmission error", exc_info=True)
+            return
+
+        completed_now = {
+            int(t.id): (t.name or "<без названия>")
+            for t in torrents
+            if float(getattr(t, "percent_done", 0.0)) >= 1.0
+        }
+
+        initialized = bool(ctx.application.bot_data.get(NOTIFY_INITIALIZED_KEY))
+        prev_completed = ctx.application.bot_data.get(NOTIFY_COMPLETED_CACHE_KEY, {})
+        if not isinstance(prev_completed, dict):
+            prev_completed = {}
+
+        if not initialized:
+            ctx.application.bot_data[NOTIFY_COMPLETED_CACHE_KEY] = completed_now
+            ctx.application.bot_data[NOTIFY_INITIALIZED_KEY] = True
+            return
+
+        new_ids = sorted(set(completed_now) - set(prev_completed))
+        ctx.application.bot_data[NOTIFY_COMPLETED_CACHE_KEY] = completed_now
+
+        if not new_ids:
+            return
+
+        for torrent_id in new_ids:
+            name = html.escape(completed_now.get(torrent_id, "<без названия>"))
+            text = f"✅ Торрент завершён: <b>{name}</b>\nID: <b>{torrent_id}</b>"
+            for chat_id in list(enabled_chats):
+                try:
+                    await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+                except TelegramError:
+                    log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
+
+    app.job_queue.run_repeating(notify_completed_torrents, interval=NOTIFY_POLL_INTERVAL_SEC, first=NOTIFY_POLL_INTERVAL_SEC)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
+    app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|active|done)$"))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
