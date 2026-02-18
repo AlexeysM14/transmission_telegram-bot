@@ -1,2 +1,2 @@
-python-telegram-bot>=20,<22
+python-telegram-bot[job-queue]>=20,<22
 transmission-rpc>=7,<8
