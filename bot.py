@@ -456,6 +456,24 @@ def _format_session_duration(seconds: int | float) -> str:
     return f"{minutes}m"
 
 
+async def _get_download_dir_free_space() -> Optional[int]:
+    try:
+        session = await tr_call(lambda c: c.get_session())
+    except (TransmissionError, TRCallError):
+        return None
+
+    free_space = getattr(session, "download_dir_free_space", None)
+    if isinstance(free_space, (int, float)):
+        return int(max(0, free_space))
+    return None
+
+
+def _build_free_space_text(free_space: Optional[int]) -> str:
+    if free_space is None:
+        return "💾 Свободное место в download-dir: <i>не удалось получить</i>."
+    return f"💾 Свободное место в download-dir: <b>{fmt_bytes(free_space)}</b>."
+
+
 async def _delete_message_safe(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
     try:
         await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -636,6 +654,8 @@ async def add_magnet_or_url(update: Update, text: str) -> None:
         await reply_chunks(update, "❌ Нужна magnet-ссылка или http(s) URL на .torrent.", reply_markup=KB_ADD)
         return
 
+    free_space_before = await _get_download_dir_free_space()
+
     try:
         torrent = await tr_call(lambda c: c.add_torrent(link))
     except (TransmissionError, TRCallError) as exc:
@@ -644,7 +664,11 @@ async def add_magnet_or_url(update: Update, text: str) -> None:
 
     await reply_chunks(
         update,
-        f"✅ Добавлено: <b>{html.escape(torrent.name)}</b>\nID: <b>{torrent.id}</b>",
+        (
+            f"✅ Добавлено: <b>{html.escape(torrent.name)}</b>\n"
+            f"ID: <b>{torrent.id}</b>\n"
+            f"{_build_free_space_text(free_space_before)}"
+        ),
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
     )
@@ -662,6 +686,7 @@ async def add_torrent_file(update: Update) -> None:
         return
 
     tg_file = await doc.get_file()
+    free_space_before = await _get_download_dir_free_space()
     tmp_path: Optional[Path] = None
 
     try:
@@ -686,7 +711,11 @@ async def add_torrent_file(update: Update) -> None:
 
     await reply_chunks(
         update,
-        f"✅ Добавлено из файла: <b>{html.escape(torrent.name)}</b>\nID: <b>{torrent.id}</b>",
+        (
+            f"✅ Добавлено из файла: <b>{html.escape(torrent.name)}</b>\n"
+            f"ID: <b>{torrent.id}</b>\n"
+            f"{_build_free_space_text(free_space_before)}"
+        ),
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
     )
@@ -833,7 +862,13 @@ async def _handle_global_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     async def _open_add() -> None:
         set_menu(ctx, MENU_ADD)
         set_wait(ctx, WAIT_NONE)
-        await send_ephemeral(update, ctx, "Как будем добавлять?", reply_markup=KB_ADD)
+        free_space = await _get_download_dir_free_space()
+        await send_ephemeral(
+            update,
+            ctx,
+            f"Как будем добавлять?\n{_build_free_space_text(free_space)}",
+            reply_markup=KB_ADD,
+        )
 
     async def _open_ctrl() -> None:
         set_menu(ctx, MENU_CTRL)
@@ -881,11 +916,23 @@ async def _handle_menu_command(
 
     async def _ask_add_magnet() -> None:
         set_wait(ctx, WAIT_ADD_MAGNET)
-        await send_ephemeral(update, ctx, "Пришли magnet-ссылку или URL на .torrent:", reply_markup=KB_ADD)
+        free_space = await _get_download_dir_free_space()
+        await send_ephemeral(
+            update,
+            ctx,
+            f"Пришли magnet-ссылку или URL на .torrent:\n{_build_free_space_text(free_space)}",
+            reply_markup=KB_ADD,
+        )
 
     async def _ask_add_file() -> None:
         set_wait(ctx, WAIT_ADD_TORRENT_FILE)
-        await send_ephemeral(update, ctx, "Ок, пришли .torrent файлом сюда в чат.", reply_markup=KB_ADD)
+        free_space = await _get_download_dir_free_space()
+        await send_ephemeral(
+            update,
+            ctx,
+            f"Ок, пришли .torrent файлом сюда в чат.\n{_build_free_space_text(free_space)}",
+            reply_markup=KB_ADD,
+        )
 
     async def _ask_pause() -> None:
         set_wait(ctx, WAIT_CTRL_PAUSE)
