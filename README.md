@@ -35,7 +35,8 @@ transmission3-bot update
 - `2` — задать токен Telegram-бота (`TG_TOKEN`);
 - `3` — задать Telegram user id (`ALLOWED_USER_IDS`);
 - `4` — задать URL Transmission RPC (`TR_URL`, например: `http://127.0.0.1:9091/transmission/rpc`);
-- `5` — перезапустить systemd-сервис бота (`transmission3-bot`).
+- `5` — перезапустить systemd-сервис бота (`transmission3-bot`);
+- `6` — вывести последние 10 строк файла логов ошибок бота.
 
 5) После настройки запустите сервис:
 
@@ -90,5 +91,6 @@ curl -s "https://api.telegram.org/bot<TG_TOKEN>/getUpdates"
 - `TR_USER` / `TR_PASS` — логин/пароль RPC.
 - `TR_TIMEOUT` — таймаут RPC в секундах (по умолчанию `10`).
 - `LIST_LIMIT` — сколько торрентов показывать в одном списке (по умолчанию `25`).
-- `LOG_LEVEL` — уровень логирования (`INFO`, `DEBUG` и т.п.).
+- `LOG_LEVEL` — уровень логирования в консоль (`INFO`, `DEBUG` и т.п.).
+- `LOG_FILE` — путь к файлу логов предупреждений/ошибок (по умолчанию `bot-errors.log`, ротация 1 MiB × 3 файла).
 
