@@ -106,7 +106,7 @@ def menu() -> None:
             "3) Set Telegram allowed user id(s) (ALLOWED_USER_IDS)\n"
             "4) Set Transmission RPC URL (TR_URL, example: http://127.0.0.1:9091/transmission/rpc)\n"
             "5) Restart bot service\n"
-            "6) Show last 10 lines from bot error log\n"
+            "6) Show last 10 lines from bot error log (показать последние 10 строк логов)\n"
             "0) Exit\n"
         )
 
