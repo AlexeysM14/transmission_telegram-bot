@@ -349,6 +349,14 @@ def fmt_rate(bps: int | float) -> str:
     return f"{fmt_bytes(bps)}/s"
 
 
+def torrent_total_size(torrent: Any) -> int:
+    for attr in ("total_size", "size_when_done"):
+        value = getattr(torrent, attr, None)
+        if isinstance(value, (int, float)) and value > 0:
+            return int(value)
+    return 0
+
+
 def status_icon(status: str) -> str:
     return STATUS_ICONS.get(status, "❔")
 
@@ -655,9 +663,10 @@ async def send_torrent_list(
     for t in items:
         st = str(t.status)
         safe_name = html.escape(t.name or "<без названия>")
+        size_text = fmt_bytes(torrent_total_size(t))
         lines.append(
             f"<b>{t.id}</b> {status_icon(st)} {safe_name} — <b>{t.progress:.2f}%</b>\n"
-            f"   ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
+            f"   Размер {size_text} | ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
         )
 
     header = {
