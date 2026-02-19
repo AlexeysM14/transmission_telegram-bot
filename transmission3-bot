@@ -75,6 +75,28 @@ def set_env_key(key: str, prompt: str) -> None:
     save_env(data)
 
 
+def get_log_file_path() -> Path:
+    env = load_env()
+    raw = env.get("LOG_FILE", "bot-errors.log").strip()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def print_last_log_lines(*, lines: int = 10) -> None:
+    log_file = get_log_file_path()
+    if not log_file.exists():
+        print(f"⚠️ Log file does not exist yet: {log_file}")
+        return
+
+    content = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    tail = content[-lines:]
+    print(f"\n=== Last {len(tail)} lines of {log_file} ===")
+    for row in tail:
+        print(row)
+
+
 def menu() -> None:
     while True:
         print(
@@ -84,6 +106,7 @@ def menu() -> None:
             "3) Set Telegram allowed user id(s) (ALLOWED_USER_IDS)\n"
             "4) Set Transmission RPC URL (TR_URL, example: http://127.0.0.1:9091/transmission/rpc)\n"
             "5) Restart bot service\n"
+            "6) Show last 10 lines from bot error log\n"
             "0) Exit\n"
         )
 
@@ -103,6 +126,8 @@ def menu() -> None:
                 )
             elif choice == "5":
                 restart_bot_service()
+            elif choice == "6":
+                print_last_log_lines(lines=10)
             elif choice == "0":
                 print("Bye")
                 return

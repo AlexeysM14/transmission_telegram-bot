@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import heapq
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import tempfile
@@ -14,6 +16,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
@@ -33,14 +36,6 @@ from transmission_rpc import Client, from_url
 from transmission_rpc.error import TransmissionError
 
 
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("tg-transmission-bot")
-
-
-
 def load_dotenv_file(path: Path) -> None:
     if not path.exists():
         return
@@ -56,7 +51,45 @@ def load_dotenv_file(path: Path) -> None:
         os.environ[key] = value.strip().strip('"').strip("'")
 
 
+
 load_dotenv_file(Path(__file__).resolve().with_name(".env"))
+
+
+def configure_logging() -> logging.Logger:
+    log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.handlers.clear()
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(logging.Formatter(log_format))
+    root_logger.addHandler(console_handler)
+
+    log_file_path = Path(os.environ.get("LOG_FILE", "bot-errors.log")).expanduser()
+    if not log_file_path.is_absolute():
+        log_file_path = Path(__file__).resolve().parent / log_file_path
+
+    file_handler = RotatingFileHandler(
+        filename=log_file_path,
+        maxBytes=1_048_576,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.WARNING)
+    file_handler.setFormatter(logging.Formatter(log_format))
+    root_logger.addHandler(file_handler)
+
+    logger = logging.getLogger("tg-transmission-bot")
+    logger.info("Error logs will be written to %s", log_file_path)
+    return logger
+
+
+log = configure_logging()
+
 
 TG_MAX_MESSAGE = 4096
 TORRENT_ID_RE = re.compile(r"\b(\d{1,9})\b")
@@ -1021,8 +1054,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    app: Application = ApplicationBuilder().token(CFG.tg_token).build()
-
     async def notify_completed_torrents(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
         if not isinstance(enabled_chats, set) or not enabled_chats:
@@ -1065,11 +1096,37 @@ def main() -> None:
                 except TelegramError:
                     log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
 
+    async def notify_completed_torrents_fallback(app: Application) -> None:
+        while True:
+            fake_ctx = SimpleNamespace(application=app, bot=app.bot)
+            await notify_completed_torrents(fake_ctx)
+            await asyncio.sleep(NOTIFY_POLL_INTERVAL_SEC)
+
+    async def on_post_init(app: Application) -> None:
+        if app.job_queue is None:
+            app.bot_data["notify_poll_task"] = asyncio.create_task(notify_completed_torrents_fallback(app))
+            log.warning(
+                "python-telegram-bot job queue is unavailable; using fallback polling task "
+                "for completion notifications."
+            )
+
+    async def on_post_shutdown(app: Application) -> None:
+        task = app.bot_data.pop("notify_poll_task", None)
+        if isinstance(task, asyncio.Task):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app: Application = (
+        ApplicationBuilder()
+        .token(CFG.tg_token)
+        .post_init(on_post_init)
+        .post_shutdown(on_post_shutdown)
+        .build()
+    )
+
     if app.job_queue is None:
-        log.warning(
-            "Job queue is unavailable; completion notifications are disabled. "
-            "Install python-telegram-bot with the 'job-queue' extra to enable them."
-        )
+        log.info("Job queue is unavailable; fallback polling task will be used.")
     else:
         app.job_queue.run_repeating(
             notify_completed_torrents,
