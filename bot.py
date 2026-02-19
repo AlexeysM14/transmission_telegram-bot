@@ -665,8 +665,8 @@ async def send_torrent_list(
         safe_name = html.escape(t.name or "<без названия>")
         size_text = fmt_bytes(torrent_total_size(t))
         lines.append(
-            f"<b>{t.id}</b> {status_icon(st)} {safe_name} — <b>{t.progress:.2f}%</b>\n"
-            f"   Размер {size_text} | ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
+            f"<b>{t.id}</b> {status_icon(st)} {safe_name} — <b>{t.progress:.2f}%</b> • <b>{size_text}</b>\n"
+            f"   ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
         )
 
     header = {
@@ -772,11 +772,13 @@ async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: st
             await tr_call(lambda c: c.start_torrent(torrent_id))
             msg = f"▶️ Запущено: ID {torrent_id}"
         elif action == "del_keep":
+            torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
             await tr_call(lambda c: c.remove_torrent(torrent_id, delete_data=False))
-            msg = f"🗑️ Удалено (данные сохранены): ID {torrent_id}"
+            msg = f"🗑️ Удалено (данные сохранены): ID {torrent_id} | {torrent.name}"
         elif action == "del_data":
+            torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
             await tr_call(lambda c: c.remove_torrent(torrent_id, delete_data=True))
-            msg = f"💥 Удалено вместе с данными: ID {torrent_id}"
+            msg = f"💥 Удалено вместе с данными: ID {torrent_id} | {torrent.name}"
         else:
             msg = "❌ Неизвестное действие"
     except (TransmissionError, TRCallError) as exc:
