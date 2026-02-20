@@ -444,6 +444,30 @@ def _build_torrent_messages(header: str, lines: Sequence[str], tail: str) -> lis
     messages.append(current)
     return messages
 
+
+def _build_single_torrent_message(header: str, lines: Sequence[str], tail: str) -> str:
+    message = f"{header}\n\n"
+    rendered_count = 0
+
+    for line in lines:
+        separator = "" if message.endswith("\n\n") else "\n\n"
+        candidate = f"{message}{separator}{line}"
+        if len(candidate) > TG_MAX_MESSAGE:
+            break
+        message = candidate
+        rendered_count += 1
+
+    suffix = tail
+    if rendered_count < len(lines):
+        hidden_count = len(lines) - rendered_count
+        suffix = f"\n\n⚠️ Список не поместился в одно сообщение. Скрыто элементов: {hidden_count}."
+        if tail:
+            suffix = f"{suffix}{tail}"
+
+    if suffix and len(f"{message}{suffix}") <= TG_MAX_MESSAGE:
+        return f"{message}{suffix}"
+    return message
+
 async def reply_chunks(
     update: Update,
     text: str,
@@ -614,7 +638,7 @@ async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await query.answer("Обновляю список…")
-    await send_torrent_list(update, ctx, mode=mode)
+    await send_torrent_list(update, ctx, mode=mode, edit_existing=True)
 
 
 def _is_active(status: str) -> bool:
@@ -626,6 +650,7 @@ async def send_torrent_list(
     ctx: ContextTypes.DEFAULT_TYPE,
     mode: str,
     query: Optional[str] = None,
+    edit_existing: bool = False,
 ) -> None:
     try:
         torrents = await tr_call(lambda c: c.get_torrents())
@@ -679,6 +704,14 @@ async def send_torrent_list(
     tail = ""
     if total > max_items:
         tail = f"\n\nПоказано: {len(items)} из {total}."
+
+    if edit_existing and update.callback_query is not None:
+        await update.callback_query.edit_message_text(
+            text=_build_single_torrent_message(header, lines, tail),
+            parse_mode=ParseMode.HTML,
+            reply_markup=TORRENT_LIST_KEYBOARD,
+        )
+        return
 
     messages = _build_torrent_messages(header, lines, tail)
     for idx, text in enumerate(messages):
