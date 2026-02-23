@@ -249,7 +249,7 @@ def kb_add() -> ReplyKeyboardMarkup:
     return kb([["🧲 Магнет/URL", "📄 .torrent файл"], ["⬅️ Назад"]])
 
 
-def kb_ctrl(notify_enabled: bool = False) -> ReplyKeyboardMarkup:
+def kb_ctrl(notify_enabled: bool = True) -> ReplyKeyboardMarkup:
     notify_label = "🔔 Уведомления: ВКЛ" if notify_enabled else "🔕 Уведомления: ВЫКЛ"
     return kb(
         [
