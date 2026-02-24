@@ -535,8 +535,8 @@ async def _get_download_dir_free_space() -> Optional[int]:
 
 def _build_free_space_text(free_space: Optional[int]) -> str:
     if free_space is None:
-        return "💾 Свободное место в download-dir: <i>не удалось получить</i>."
-    return f"💾 Свободное место в download-dir: <b>{fmt_bytes(free_space)}</b>."
+        return "💾 Свободно на диске: <i>не удалось получить</i>."
+    return f"💾 Свободно на диске: <b>{fmt_bytes(free_space)}</b>."
 
 
 async def _delete_message_safe(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
@@ -574,14 +574,16 @@ async def _delete_user_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     await _delete_message_safe(ctx, chat.id, message.message_id)
 
 
-def _build_status_text(stats: Any) -> str:
+def _build_status_text(stats: Any, free_space: Optional[int]) -> str:
     cur = stats.current_stats
     cum = stats.cumulative_stats
     session_duration = _format_session_duration(getattr(cur, "seconds_active", 0))
+    free_space_text = _build_free_space_text(free_space)
     return (
         "📊 <b>Transmission — статус</b>\n"
         f"Скорость: ⇣ <b>{fmt_rate(stats.download_speed)}</b> | ⇡ <b>{fmt_rate(stats.upload_speed)}</b>\n"
         f"Торренты: активных <b>{stats.active_torrent_count}</b>, на паузе <b>{stats.paused_torrent_count}</b>, всего <b>{stats.torrent_count}</b>\n\n"
+        f"{free_space_text}\n"
         f"Трафик (сессия - {session_duration}): ⇣ <b>{fmt_bytes(cur.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cur.uploaded_bytes)}</b>\n"
         f"Трафик (всего): ⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>\n"
         f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -590,12 +592,15 @@ def _build_status_text(stats: Any) -> str:
 
 async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        stats = await tr_call(lambda c: c.session_stats())
+        stats, free_space = await asyncio.gather(
+            tr_call(lambda c: c.session_stats()),
+            _get_download_dir_free_space(),
+        )
     except (TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_MAIN)
         return
 
-    text = _build_status_text(stats)
+    text = _build_status_text(stats, free_space)
     await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=STATUS_KEYBOARD)
 
 
@@ -607,7 +612,10 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
 
     try:
-        stats = await tr_call(lambda c: c.session_stats())
+        stats, free_space = await asyncio.gather(
+            tr_call(lambda c: c.session_stats()),
+            _get_download_dir_free_space(),
+        )
     except (TransmissionError, TRCallError) as exc:
         await query.edit_message_text(
             text=f"❌ Ошибка Transmission: {html.escape(str(exc))}",
@@ -616,7 +624,7 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await query.edit_message_text(
-        text=_build_status_text(stats),
+        text=_build_status_text(stats, free_space),
         parse_mode=ParseMode.HTML,
         reply_markup=STATUS_KEYBOARD,
     )
