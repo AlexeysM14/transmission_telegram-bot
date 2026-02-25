@@ -265,12 +265,13 @@ def kb_ctrl(notify_enabled: bool = True) -> ReplyKeyboardMarkup:
 KB_MAIN = kb_main()
 KB_TORRENTS = kb_torrents()
 KB_ADD = kb_add()
-KB_CTRL = kb_ctrl(False)
+KB_CTRL = kb_ctrl(True)
 
 STATUS_REFRESH_CB = "status_refresh"
 LIST_REFRESH_CB_PREFIX = "list_refresh:"
 LAST_EPHEMERAL_MESSAGE_KEY = "last_ephemeral_message_id"
 NOTIFY_ENABLED_CHATS_KEY = "notify_enabled_chat_ids"
+NOTIFY_KNOWN_CHATS_KEY = "notify_known_chat_ids"
 NOTIFY_COMPLETED_CACHE_KEY = "notify_completed_cache"
 NOTIFY_INITIALIZED_KEY = "notify_initialized"
 
@@ -500,6 +501,19 @@ TORRENT_LIST_KEYBOARD = InlineKeyboardMarkup(
 def _notifications_enabled(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
     enabled_chats = ctx.application.bot_data.setdefault(NOTIFY_ENABLED_CHATS_KEY, set())
     return chat_id in enabled_chats
+
+
+def _ensure_chat_notifications_initialized(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
+    if chat_id is None:
+        return
+
+    known_chats = ctx.application.bot_data.setdefault(NOTIFY_KNOWN_CHATS_KEY, set())
+    enabled_chats = ctx.application.bot_data.setdefault(NOTIFY_ENABLED_CHATS_KEY, set())
+    if chat_id in known_chats:
+        return
+
+    known_chats.add(chat_id)
+    enabled_chats.add(chat_id)
 
 
 def _ctrl_keyboard_for_chat(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> ReplyKeyboardMarkup:
@@ -837,6 +851,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_chunks(update, "⛔️ Доступ запрещён.")
         return
 
+    _ensure_chat_notifications_initialized(ctx, update.effective_chat.id if update.effective_chat else None)
+
     set_menu(ctx, MENU_MAIN)
     set_wait(ctx, WAIT_NONE)
     await reply_chunks(update, "Привет! Я бот для управления Transmission.\nВыбирай пункт меню ниже 👇", reply_markup=KB_MAIN)
@@ -1080,6 +1096,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     chat = update.effective_chat
     chat_id = chat.id if chat else None
+    _ensure_chat_notifications_initialized(ctx, chat_id)
 
     try:
         if text == "⬅️ Назад":
