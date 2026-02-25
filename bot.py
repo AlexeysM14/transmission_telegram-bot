@@ -342,7 +342,7 @@ def fmt_bytes(n: int | float) -> str:
     while x >= 1024 and i < len(units) - 1:
         x /= 1024
         i += 1
-    return f"{int(x)} {units[i]}" if i == 0 else f"{x:.2f} {units[i]}"
+    return f"{int(x)} {units[i]}" if i == 0 else f"{x:.3f} {units[i]}"
 
 
 def fmt_rate(bps: int | float) -> str:
