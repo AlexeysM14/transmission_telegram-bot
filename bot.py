@@ -553,6 +553,20 @@ def _build_free_space_text(free_space: Optional[int]) -> str:
     return f"💾 Свободно на диске: <b>{fmt_bytes(free_space)}</b>."
 
 
+def _build_projected_free_space_text(free_space_before: Optional[int], torrent: Any) -> str:
+    if free_space_before is None:
+        return "💾 После полной скачки: <i>не удалось рассчитать</i>."
+
+    required_space = getattr(torrent, "left_until_done", None)
+    if not isinstance(required_space, (int, float)):
+        required_space = getattr(torrent, "total_size", None)
+    if not isinstance(required_space, (int, float)):
+        return "💾 После полной скачки: <i>не удалось рассчитать</i>."
+
+    projected_free_space = max(0, int(free_space_before - max(0, int(required_space))))
+    return f"💾 После полной скачки: <b>{fmt_bytes(projected_free_space)}</b>."
+
+
 async def _delete_message_safe(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int) -> None:
     try:
         await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
@@ -764,7 +778,7 @@ async def add_magnet_or_url(update: Update, text: str) -> None:
         (
             f"✅ Добавлено: <b>{html.escape(torrent.name)}</b>\n"
             f"ID: <b>{torrent.id}</b>\n"
-            f"{_build_free_space_text(free_space_before)}"
+            f"{_build_projected_free_space_text(free_space_before, torrent)}"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
@@ -811,7 +825,7 @@ async def add_torrent_file(update: Update) -> None:
         (
             f"✅ Добавлено из файла: <b>{html.escape(torrent.name)}</b>\n"
             f"ID: <b>{torrent.id}</b>\n"
-            f"{_build_free_space_text(free_space_before)}"
+            f"{_build_projected_free_space_text(free_space_before, torrent)}"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
