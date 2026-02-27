@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import html
 import heapq
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
@@ -14,7 +15,7 @@ import re
 import tempfile
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional, Sequence
@@ -230,7 +231,7 @@ def kb_main() -> ReplyKeyboardMarkup:
         [
             ["📊 Статус", "📋 Торренты"],
             ["➕ Добавить", "⚙️ Управление"],
-            ["ℹ️ Помощь"],
+            ["📈 Статистика"],
         ]
     )
 
@@ -274,8 +275,10 @@ NOTIFY_ENABLED_CHATS_KEY = "notify_enabled_chat_ids"
 NOTIFY_KNOWN_CHATS_KEY = "notify_known_chat_ids"
 NOTIFY_COMPLETED_CACHE_KEY = "notify_completed_cache"
 NOTIFY_INITIALIZED_KEY = "notify_initialized"
+TRAFFIC_LAST_SNAPSHOT_DAY_KEY = "traffic_last_snapshot_day"
 
 NOTIFY_POLL_INTERVAL_SEC = 60
+TRAFFIC_ANCHORS_PATH = Path(__file__).resolve().with_name("traffic_anchors.json")
 ACTIVE_STATUSES = frozenset(
     {
         "downloading",
@@ -618,6 +621,118 @@ def _build_status_text(stats: Any, free_space: Optional[int]) -> str:
     )
 
 
+def _read_traffic_anchors() -> dict[str, dict[str, int | str]]:
+    try:
+        data = json.loads(TRAFFIC_ANCHORS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    anchors: dict[str, dict[str, int | str]] = {}
+    for period in ("day", "week", "month"):
+        row = data.get(period)
+        if not isinstance(row, dict):
+            continue
+        key = row.get("key")
+        downloaded = row.get("downloaded")
+        uploaded = row.get("uploaded")
+        if isinstance(key, str) and isinstance(downloaded, int) and isinstance(uploaded, int):
+            anchors[period] = {
+                "key": key,
+                "downloaded": max(0, downloaded),
+                "uploaded": max(0, uploaded),
+            }
+    return anchors
+
+
+def _write_traffic_anchors(anchors: dict[str, dict[str, int | str]]) -> None:
+    payload = json.dumps(anchors, ensure_ascii=False, separators=(",", ":"))
+    tmp_path = TRAFFIC_ANCHORS_PATH.with_suffix(".tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    tmp_path.replace(TRAFFIC_ANCHORS_PATH)
+
+
+def _period_keys(now: datetime) -> dict[str, str]:
+    iso_year, iso_week, _ = now.isocalendar()
+    return {
+        "day": now.strftime("%Y-%m-%d"),
+        "week": f"{iso_year}-W{iso_week:02d}",
+        "month": now.strftime("%Y-%m"),
+    }
+
+
+def _ensure_traffic_anchors(now: datetime, downloaded: int, uploaded: int) -> dict[str, dict[str, int | str]]:
+    anchors = _read_traffic_anchors()
+    keys = _period_keys(now)
+    changed = False
+
+    for period, period_key in keys.items():
+        current = anchors.get(period)
+        if not isinstance(current, dict):
+            current = None
+
+        base_downloaded = int(current["downloaded"]) if current and isinstance(current.get("downloaded"), int) else 0
+        base_uploaded = int(current["uploaded"]) if current and isinstance(current.get("uploaded"), int) else 0
+        key_changed = not current or current.get("key") != period_key
+        counter_reset = downloaded < base_downloaded or uploaded < base_uploaded
+
+        if key_changed or counter_reset:
+            anchors[period] = {
+                "key": period_key,
+                "downloaded": downloaded,
+                "uploaded": uploaded,
+            }
+            changed = True
+
+    if changed:
+        try:
+            _write_traffic_anchors(anchors)
+        except OSError:
+            log.warning("Failed to persist traffic anchors", exc_info=True)
+
+    return anchors
+
+
+def _traffic_delta(current: int, anchor: dict[str, int | str], field: str) -> int:
+    base = anchor.get(field)
+    if not isinstance(base, int):
+        return 0
+    return max(0, current - base)
+
+
+def _build_traffic_stats_text(now: datetime, downloaded: int, uploaded: int, anchors: dict[str, dict[str, int | str]]) -> str:
+    labels = (("day", "За день"), ("week", "За неделю"), ("month", "За месяц"))
+    lines = ["📈 <b>Статистика трафика</b>"]
+
+    for period, label in labels:
+        anchor = anchors.get(period, {"downloaded": downloaded, "uploaded": uploaded})
+        down = _traffic_delta(downloaded, anchor, "downloaded")
+        up = _traffic_delta(uploaded, anchor, "uploaded")
+        lines.append(f"{label}: ⇣ <b>{fmt_bytes(down)}</b> | ⇡ <b>{fmt_bytes(up)}</b>")
+
+    lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    return "\n".join(lines)
+
+
+async def send_traffic_stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        stats = await tr_call(lambda c: c.session_stats())
+    except (TransmissionError, TRCallError) as exc:
+        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_MAIN)
+        return
+
+    now = datetime.now()
+    downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
+    uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
+    anchors = _ensure_traffic_anchors(now, downloaded, uploaded)
+    text = _build_traffic_stats_text(now, downloaded, uploaded, anchors)
+    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=KB_MAIN)
+
+
 async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         stats, free_space = await asyncio.gather(
@@ -885,7 +1000,8 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "/start — показать меню\n"
         "/help — помощь\n\n"
         "<b>Как пользоваться</b>\n"
-        "• 📊 Статус — скорость и трафик\n"
+        "• 📊 Статус — скорость и текущая активность\n"
+        "• 📈 Статистика — трафик за день/неделю/месяц\n"
         "• 📋 Торренты — списки + поиск\n"
         "• ➕ Добавить — magnet/URL или .torrent файл\n"
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"
@@ -991,8 +1107,8 @@ async def _handle_global_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await send_ephemeral(update, ctx, "Выбери действие:", reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id))
 
     handlers: dict[str, Callable[[], Awaitable[None]]] = {
-        "ℹ️ Помощь": lambda: cmd_help(update, ctx),
         "📊 Статус": _open_main_status,
+        "📈 Статистика": lambda: send_traffic_stats(update, ctx),
         "📋 Торренты": _open_torrents,
         "➕ Добавить": _open_add,
         "⚙️ Управление": _open_ctrl,
@@ -1179,10 +1295,29 @@ def main() -> None:
                 except TelegramError:
                     log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
 
+    async def snapshot_traffic_anchors(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        now = datetime.now()
+        day_key = now.strftime("%Y-%m-%d")
+        last_snapshot_day = ctx.application.bot_data.get(TRAFFIC_LAST_SNAPSHOT_DAY_KEY)
+        if last_snapshot_day == day_key:
+            return
+
+        try:
+            stats = await tr_call(lambda c: c.session_stats())
+        except (TransmissionError, TRCallError):
+            log.warning("Skipping traffic anchor snapshot due to Transmission error", exc_info=True)
+            return
+
+        downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
+        uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
+        _ensure_traffic_anchors(now, downloaded, uploaded)
+        ctx.application.bot_data[TRAFFIC_LAST_SNAPSHOT_DAY_KEY] = day_key
+
     async def notify_completed_torrents_fallback(app: Application) -> None:
         while True:
             fake_ctx = SimpleNamespace(application=app, bot=app.bot)
             await notify_completed_torrents(fake_ctx)
+            await snapshot_traffic_anchors(fake_ctx)
             await asyncio.sleep(NOTIFY_POLL_INTERVAL_SEC)
 
     async def on_post_init(app: Application) -> None:
@@ -1190,7 +1325,7 @@ def main() -> None:
             app.bot_data["notify_poll_task"] = asyncio.create_task(notify_completed_torrents_fallback(app))
             log.warning(
                 "python-telegram-bot job queue is unavailable; using fallback polling task "
-                "for completion notifications."
+                "for completion notifications and traffic snapshots."
             )
 
     async def on_post_shutdown(app: Application) -> None:
@@ -1216,6 +1351,7 @@ def main() -> None:
             interval=NOTIFY_POLL_INTERVAL_SEC,
             first=NOTIFY_POLL_INTERVAL_SEC,
         )
+        app.job_queue.run_daily(snapshot_traffic_anchors, time=time(hour=0, minute=0, second=0))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
