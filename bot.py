@@ -275,9 +275,11 @@ NOTIFY_ENABLED_CHATS_KEY = "notify_enabled_chat_ids"
 NOTIFY_KNOWN_CHATS_KEY = "notify_known_chat_ids"
 NOTIFY_COMPLETED_CACHE_KEY = "notify_completed_cache"
 NOTIFY_INITIALIZED_KEY = "notify_initialized"
+NOTIFY_START_PENDING_KEY = "notify_start_pending"
 TRAFFIC_LAST_SNAPSHOT_DAY_KEY = "traffic_last_snapshot_day"
 
 NOTIFY_POLL_INTERVAL_SEC = 60
+NOTIFY_NO_PEERS_DELAY_SEC = 10 * 60
 TRAFFIC_ANCHORS_PATH = Path(__file__).resolve().with_name("traffic_anchors.json")
 ACTIVE_STATUSES = frozenset(
     {
@@ -504,6 +506,42 @@ TORRENT_LIST_KEYBOARD = InlineKeyboardMarkup(
 def _notifications_enabled(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
     enabled_chats = ctx.application.bot_data.setdefault(NOTIFY_ENABLED_CHATS_KEY, set())
     return chat_id in enabled_chats
+
+
+def _register_torrent_start_watch(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    torrent: Any,
+    *,
+    now_ts: Optional[float] = None,
+) -> None:
+    if chat_id is None:
+        return
+
+    pending = ctx.application.bot_data.setdefault(NOTIFY_START_PENDING_KEY, {})
+    if not isinstance(pending, dict):
+        pending = {}
+        ctx.application.bot_data[NOTIFY_START_PENDING_KEY] = pending
+
+    torrent_id = int(getattr(torrent, "id", 0))
+    if torrent_id <= 0:
+        return
+
+    now_value = now_ts if now_ts is not None else asyncio.get_running_loop().time()
+    state = pending.get(torrent_id)
+    if not isinstance(state, dict):
+        pending[torrent_id] = {
+            "added_at": now_value,
+            "name": str(getattr(torrent, "name", "") or "<без названия>"),
+            "chat_ids": {chat_id},
+        }
+        return
+
+    chat_ids = state.get("chat_ids")
+    if not isinstance(chat_ids, set):
+        chat_ids = set()
+        state["chat_ids"] = chat_ids
+    chat_ids.add(chat_id)
 
 
 def _ensure_chat_notifications_initialized(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
@@ -874,7 +912,7 @@ async def send_torrent_list(
         )
 
 
-async def add_magnet_or_url(update: Update, text: str) -> None:
+async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     link = text.strip()
     if not (link.startswith("magnet:") or link.startswith("http://") or link.startswith("https://")):
         await reply_chunks(update, "❌ Нужна magnet-ссылка или http(s) URL на .torrent.", reply_markup=KB_ADD)
@@ -888,6 +926,8 @@ async def add_magnet_or_url(update: Update, text: str) -> None:
         await reply_chunks(update, f"❌ Не удалось добавить: {html.escape(str(exc))}", reply_markup=KB_ADD)
         return
 
+    _register_torrent_start_watch(ctx, update.effective_chat.id if update.effective_chat else None, torrent)
+
     await reply_chunks(
         update,
         (
@@ -900,7 +940,7 @@ async def add_magnet_or_url(update: Update, text: str) -> None:
     )
 
 
-async def add_torrent_file(update: Update) -> None:
+async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None or message.document is None:
         await reply_chunks(update, "Пришли .torrent файлом.", reply_markup=KB_ADD)
@@ -934,6 +974,8 @@ async def add_torrent_file(update: Update) -> None:
     finally:
         if tmp_path and tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
+
+    _register_torrent_start_watch(ctx, update.effective_chat.id if update.effective_chat else None, torrent)
 
     await reply_chunks(
         update,
@@ -1020,7 +1062,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     wait = get_wait(ctx)
     menu = get_menu(ctx)
     if wait == WAIT_ADD_TORRENT_FILE or menu == MENU_ADD:
-        await add_torrent_file(update)
+        await add_torrent_file(update, ctx)
         set_menu(ctx, MENU_ADD)
         set_wait(ctx, WAIT_NONE)
         await _delete_user_message(update, ctx)
@@ -1040,7 +1082,7 @@ async def _handle_wait_state(update: Update, ctx: ContextTypes.DEFAULT_TYPE, wai
     if wait == WAIT_ADD_MAGNET:
         set_wait(ctx, WAIT_NONE)
         set_menu(ctx, MENU_ADD)
-        await add_magnet_or_url(update, text)
+        await add_magnet_or_url(update, ctx, text)
         return True
 
     if wait in {WAIT_CTRL_PAUSE, WAIT_CTRL_START, WAIT_CTRL_DEL_KEEP, WAIT_CTRL_DEL_DATA}:
@@ -1258,6 +1300,8 @@ def main() -> None:
         if not isinstance(enabled_chats, set) or not enabled_chats:
             return
 
+        now_ts = asyncio.get_running_loop().time()
+
         try:
             torrents = await tr_call(lambda c: c.get_torrents())
         except (TransmissionError, TRCallError):
@@ -1284,16 +1328,73 @@ def main() -> None:
         ctx.application.bot_data[NOTIFY_COMPLETED_CACHE_KEY] = completed_now
 
         if not new_ids:
+            pass
+        else:
+            for torrent_id in new_ids:
+                name = html.escape(completed_now.get(torrent_id, "<без названия>"))
+                text = f"✅ Торрент завершён: <b>{name}</b>\nID: <b>{torrent_id}</b>"
+                for chat_id in list(enabled_chats):
+                    try:
+                        await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+                    except TelegramError:
+                        log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
+
+        pending_start = ctx.application.bot_data.get(NOTIFY_START_PENDING_KEY)
+        if not isinstance(pending_start, dict) or not pending_start:
             return
 
-        for torrent_id in new_ids:
-            name = html.escape(completed_now.get(torrent_id, "<без названия>"))
-            text = f"✅ Торрент завершён: <b>{name}</b>\nID: <b>{torrent_id}</b>"
-            for chat_id in list(enabled_chats):
+        torrents_by_id = {int(t.id): t for t in torrents}
+        expired_ids: list[int] = []
+
+        for torrent_id, state in list(pending_start.items()):
+            if not isinstance(state, dict):
+                expired_ids.append(torrent_id)
+                continue
+
+            torrent = torrents_by_id.get(torrent_id)
+            if torrent is None:
+                expired_ids.append(torrent_id)
+                continue
+
+            downloaded_ever = float(max(0.0, getattr(torrent, "downloaded_ever", 0.0)))
+            percent_done = float(max(0.0, getattr(torrent, "percent_done", 0.0)))
+            if downloaded_ever > 0.0 or percent_done > 0.0:
+                expired_ids.append(torrent_id)
+                continue
+
+            added_at = state.get("added_at")
+            if not isinstance(added_at, (int, float)):
+                expired_ids.append(torrent_id)
+                continue
+
+            if now_ts - float(added_at) < NOTIFY_NO_PEERS_DELAY_SEC:
+                continue
+
+            chat_ids = state.get("chat_ids")
+            if not isinstance(chat_ids, set) or not chat_ids:
+                expired_ids.append(torrent_id)
+                continue
+
+            safe_name = html.escape(str(state.get("name") or getattr(torrent, "name", "<без названия>")))
+            text = (
+                "⚠️ <b>Торрент не начал скачиваться за 10 минут</b>\n"
+                f"Возможно, сейчас нет раздающих.\n"
+                f"Торрент: <b>{safe_name}</b>\n"
+                f"ID: <b>{torrent_id}</b>"
+            )
+
+            for chat_id in list(chat_ids):
+                if chat_id not in enabled_chats:
+                    continue
                 try:
                     await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
                 except TelegramError:
-                    log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
+                    log.warning("Failed to send no-peers notification to chat %s", chat_id, exc_info=True)
+
+            expired_ids.append(torrent_id)
+
+        for torrent_id in expired_ids:
+            pending_start.pop(torrent_id, None)
 
     async def snapshot_traffic_anchors(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         now = datetime.now()
