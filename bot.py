@@ -270,6 +270,7 @@ KB_CTRL = kb_ctrl(True)
 
 STATUS_REFRESH_CB = "status_refresh"
 LIST_REFRESH_CB_PREFIX = "list_refresh:"
+TRAFFIC_VIEW_CB_PREFIX = "traffic_view:"
 LAST_EPHEMERAL_MESSAGE_KEY = "last_ephemeral_message_id"
 NOTIFY_ENABLED_CHATS_KEY = "notify_enabled_chat_ids"
 NOTIFY_KNOWN_CHATS_KEY = "notify_known_chat_ids"
@@ -502,6 +503,13 @@ TORRENT_LIST_KEYBOARD = InlineKeyboardMarkup(
     ]]
 )
 
+TRAFFIC_OVERVIEW_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [InlineKeyboardButton("📅 Последние 7 дней", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}7d")],
+        [InlineKeyboardButton("🗓️ По неделям (4)", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}4w")],
+    ]
+)
+
 
 def _notifications_enabled(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
     enabled_chats = ctx.application.bot_data.setdefault(NOTIFY_ENABLED_CHATS_KEY, set())
@@ -687,8 +695,45 @@ def _read_traffic_anchors() -> dict[str, dict[str, int | str]]:
     return anchors
 
 
+def _read_traffic_history() -> list[dict[str, int | str]]:
+    try:
+        data = json.loads(TRAFFIC_ANCHORS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, TypeError):
+        return []
+
+    raw_history = data.get("history") if isinstance(data, dict) else None
+    days = raw_history.get("days") if isinstance(raw_history, dict) else None
+    if not isinstance(days, list):
+        return []
+
+    history: list[dict[str, int | str]] = []
+    for item in days:
+        if not isinstance(item, dict):
+            continue
+        date = item.get("date")
+        downloaded = item.get("downloaded")
+        uploaded = item.get("uploaded")
+        if isinstance(date, str) and isinstance(downloaded, int) and isinstance(uploaded, int):
+            history.append({
+                "date": date,
+                "downloaded": max(0, downloaded),
+                "uploaded": max(0, uploaded),
+            })
+    return history
+
+
 def _write_traffic_anchors(anchors: dict[str, dict[str, int | str]]) -> None:
-    payload = json.dumps(anchors, ensure_ascii=False, separators=(",", ":"))
+    history = _read_traffic_history()
+    payload = json.dumps({**anchors, "history": {"days": history}}, ensure_ascii=False, separators=(",", ":"))
+    tmp_path = TRAFFIC_ANCHORS_PATH.with_suffix(".tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    tmp_path.replace(TRAFFIC_ANCHORS_PATH)
+
+
+def _persist_traffic_state(anchors: dict[str, dict[str, int | str]], history: list[dict[str, int | str]]) -> None:
+    payload = json.dumps({**anchors, "history": {"days": history}}, ensure_ascii=False, separators=(",", ":"))
     tmp_path = TRAFFIC_ANCHORS_PATH.with_suffix(".tmp")
     tmp_path.write_text(payload, encoding="utf-8")
     tmp_path.replace(TRAFFIC_ANCHORS_PATH)
@@ -735,6 +780,100 @@ def _ensure_traffic_anchors(now: datetime, downloaded: int, uploaded: int) -> di
     return anchors
 
 
+def _ensure_daily_traffic_history(now: datetime, downloaded: int, uploaded: int) -> list[dict[str, int | str]]:
+    history = _read_traffic_history()
+    day_key = now.strftime("%Y-%m-%d")
+
+    if history and history[-1].get("date") == day_key:
+        return history
+
+    history.append({"date": day_key, "downloaded": downloaded, "uploaded": uploaded})
+    # Храним небольшой хвост: достаточно для 4 недель + запас.
+    if len(history) > 45:
+        history = history[-45:]
+    return history
+
+
+def _weekday_short_ru(date_value: datetime) -> str:
+    labels = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+    return labels[date_value.weekday()]
+
+
+def _build_last_7_days_text(now: datetime, downloaded: int, history: list[dict[str, int | str]]) -> str:
+    lines = ["📅 <b>Трафик за последние 7 дней (скачано)</b>"]
+    points = history[-8:]
+
+    if len(points) < 2:
+        lines.append("Недостаточно данных. История начнёт заполняться автоматически раз в день.")
+        lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        return "\n".join(lines)
+
+    for idx in range(1, len(points)):
+        prev_point = points[idx - 1]
+        current_point = points[idx]
+        date_raw = str(prev_point.get("date", ""))
+        try:
+            date_value = datetime.strptime(date_raw, "%Y-%m-%d")
+        except ValueError:
+            continue
+
+        prev_downloaded = int(prev_point.get("downloaded", 0))
+        current_downloaded = int(current_point.get("downloaded", 0))
+        day_delta = max(0, current_downloaded - prev_downloaded)
+        lines.append(f"{_weekday_short_ru(date_value)} {date_value.strftime('%d.%m')}: <b>{fmt_bytes(day_delta)}</b>")
+
+    today_anchor = points[-1]
+    today_downloaded = max(0, downloaded - int(today_anchor.get("downloaded", downloaded)))
+    lines.append(f"Сегодня {now.strftime('%d.%m')}: <b>{fmt_bytes(today_downloaded)}</b>")
+    lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    return "\n".join(lines)
+
+
+def _build_last_4_weeks_text(now: datetime, downloaded: int, history: list[dict[str, int | str]]) -> str:
+    lines = ["🗓️ <b>Скачано по неделям (последние 4)</b>"]
+    points = history[-32:]
+
+    if len(points) < 2:
+        lines.append("Недостаточно данных. История начнёт заполняться автоматически раз в день.")
+        lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        return "\n".join(lines)
+
+    weekly_totals: dict[str, int] = {}
+    week_order: list[str] = []
+
+    for idx in range(1, len(points)):
+        prev_point = points[idx - 1]
+        current_point = points[idx]
+        try:
+            date_value = datetime.strptime(str(prev_point.get("date", "")), "%Y-%m-%d")
+        except ValueError:
+            continue
+
+        iso_year, iso_week, _ = date_value.isocalendar()
+        week_key = f"{iso_year}-W{iso_week:02d}"
+        delta = max(0, int(current_point.get("downloaded", 0)) - int(prev_point.get("downloaded", 0)))
+        if week_key not in weekly_totals:
+            weekly_totals[week_key] = 0
+            week_order.append(week_key)
+        weekly_totals[week_key] += delta
+
+    today_date = now.strftime("%Y-%m-%d")
+    if points and points[-1].get("date") == today_date:
+        iso_year, iso_week, _ = now.isocalendar()
+        week_key = f"{iso_year}-W{iso_week:02d}"
+        today_delta = max(0, downloaded - int(points[-1].get("downloaded", downloaded)))
+        if week_key not in weekly_totals:
+            weekly_totals[week_key] = 0
+            week_order.append(week_key)
+        weekly_totals[week_key] += today_delta
+
+    for week_key in week_order[-4:]:
+        lines.append(f"{week_key}: <b>{fmt_bytes(weekly_totals[week_key])}</b>")
+
+    lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    return "\n".join(lines)
+
+
 def _traffic_delta(current: int, anchor: dict[str, int | str], field: str) -> int:
     base = anchor.get(field)
     if not isinstance(base, int):
@@ -766,9 +905,18 @@ async def send_traffic_stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
     now = datetime.now()
     downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
     uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
+
     anchors = _ensure_traffic_anchors(now, downloaded, uploaded)
+    history_before = _read_traffic_history()
+    history = _ensure_daily_traffic_history(now, downloaded, uploaded)
+    if history != history_before:
+        try:
+            _persist_traffic_state(anchors, history)
+        except OSError:
+            log.warning("Failed to persist traffic history", exc_info=True)
+
     text = _build_traffic_stats_text(now, downloaded, uploaded, anchors)
-    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=KB_MAIN)
+    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
 
 
 async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -828,6 +976,48 @@ async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     await query.answer("Обновляю список…")
     await send_torrent_list(update, ctx, mode=mode, edit_existing=True)
+
+
+async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    if not data.startswith(TRAFFIC_VIEW_CB_PREFIX):
+        await query.answer()
+        return
+
+    mode = data[len(TRAFFIC_VIEW_CB_PREFIX) :]
+    if mode not in {"7d", "4w"}:
+        await query.answer("Неизвестный режим", show_alert=True)
+        return
+
+    await query.answer("Обновляю статистику…")
+
+    try:
+        stats = await tr_call(lambda c: c.session_stats())
+    except (TransmissionError, TRCallError) as exc:
+        await query.edit_message_text(
+            text=f"❌ Ошибка Transmission: {html.escape(str(exc))}",
+            reply_markup=TRAFFIC_OVERVIEW_KEYBOARD,
+        )
+        return
+
+    now = datetime.now()
+    downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
+    uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
+    anchors = _ensure_traffic_anchors(now, downloaded, uploaded)
+    history_before = _read_traffic_history()
+    history = _ensure_daily_traffic_history(now, downloaded, uploaded)
+    if history != history_before:
+        try:
+            _persist_traffic_state(anchors, history)
+        except OSError:
+            log.warning("Failed to persist traffic history", exc_info=True)
+
+    text = _build_last_7_days_text(now, downloaded, history) if mode == "7d" else _build_last_4_weeks_text(now, downloaded, history)
+    await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
 
 
 def _is_active(status: str) -> bool:
@@ -1043,7 +1233,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — помощь\n\n"
         "<b>Как пользоваться</b>\n"
         "• 📊 Статус — скорость и текущая активность\n"
-        "• 📈 Статистика — трафик за день/неделю/месяц\n"
+        "• 📈 Статистика — сводка + детально за 7 дней и по неделям\n"
         "• 📋 Торренты — списки + поиск\n"
         "• ➕ Добавить — magnet/URL или .torrent файл\n"
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"
@@ -1411,7 +1601,14 @@ def main() -> None:
 
         downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
         uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
-        _ensure_traffic_anchors(now, downloaded, uploaded)
+        anchors = _ensure_traffic_anchors(now, downloaded, uploaded)
+        history_before = _read_traffic_history()
+        history = _ensure_daily_traffic_history(now, downloaded, uploaded)
+        if history != history_before:
+            try:
+                _persist_traffic_state(anchors, history)
+            except OSError:
+                log.warning("Failed to persist traffic history", exc_info=True)
         ctx.application.bot_data[TRAFFIC_LAST_SNAPSHOT_DAY_KEY] = day_key
 
     async def notify_completed_torrents_fallback(app: Application) -> None:
@@ -1459,6 +1656,7 @@ def main() -> None:
 
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
     app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|done)$"))
+    app.add_handler(CallbackQueryHandler(on_traffic_view, pattern=f"^{TRAFFIC_VIEW_CB_PREFIX}(7d|4w)$"))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
