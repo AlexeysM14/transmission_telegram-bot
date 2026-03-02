@@ -239,7 +239,7 @@ def kb_main() -> ReplyKeyboardMarkup:
 def kb_torrents() -> ReplyKeyboardMarkup:
     return kb(
         [
-            ["📋 Все", "▶️ Активные"],
+            ["📋 Все", "⬇️ Скачиваются"],
             ["⏹️ Остановл.", "✅ Завершённые"],
             ["🔎 Поиск", "⬅️ Назад"],
         ]
@@ -496,7 +496,7 @@ async def reply_chunks(
 STATUS_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить статус", callback_data=STATUS_REFRESH_CB)]])
 TORRENT_LIST_KEYBOARD = InlineKeyboardMarkup(
     [[
-        InlineKeyboardButton("▶️ Активные", callback_data=f"{LIST_REFRESH_CB_PREFIX}active"),
+        InlineKeyboardButton("⬇️ Скачиваются", callback_data=f"{LIST_REFRESH_CB_PREFIX}downloading"),
         InlineKeyboardButton("📋 Все", callback_data=f"{LIST_REFRESH_CB_PREFIX}all"),
         InlineKeyboardButton("✅ Завершённые", callback_data=f"{LIST_REFRESH_CB_PREFIX}done"),
     ]]
@@ -822,7 +822,7 @@ async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     mode = data[len(LIST_REFRESH_CB_PREFIX) :]
-    if mode not in {"all", "active", "done"}:
+    if mode not in {"all", "downloading", "done"}:
         await query.answer("Неизвестный тип списка", show_alert=True)
         return
 
@@ -848,8 +848,8 @@ async def send_torrent_list(
         return
 
     items = torrents
-    if mode == "active":
-        items = [t for t in items if _is_active(str(t.status))]
+    if mode == "downloading":
+        items = [t for t in items if float(t.percent_done) < 1.0]
     elif mode == "stopped":
         items = [t for t in items if str(t.status) == "stopped"]
     elif mode == "done":
@@ -885,7 +885,7 @@ async def send_torrent_list(
 
     header = {
         "all": "📋 <b>Все торренты</b>",
-        "active": "▶️ <b>Активные</b>",
+        "downloading": "⬇️ <b>Скачиваются</b>",
         "stopped": "⏹️ <b>Остановленные</b>",
         "done": "✅ <b>Завершённые</b>",
     }.get(mode, "📋 <b>Список</b>")
@@ -1174,8 +1174,8 @@ async def _handle_menu_command(
     async def _list_all() -> None:
         await send_torrent_list(update, ctx, mode="all")
 
-    async def _list_active() -> None:
-        await send_torrent_list(update, ctx, mode="active")
+    async def _list_downloading() -> None:
+        await send_torrent_list(update, ctx, mode="downloading")
 
     async def _list_stopped() -> None:
         await send_torrent_list(update, ctx, mode="stopped")
@@ -1226,7 +1226,7 @@ async def _handle_menu_command(
     menu_handlers: dict[str, dict[str, Callable[[], Awaitable[None]]]] = {
         MENU_TORRENTS: {
             "📋 Все": _list_all,
-            "▶️ Активные": _list_active,
+            "⬇️ Скачиваются": _list_downloading,
             "⏹️ Остановл.": _list_stopped,
             "✅ Завершённые": _list_done,
             "🔎 Поиск": _ask_search,
@@ -1458,7 +1458,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
-    app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|active|done)$"))
+    app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|done)$"))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
