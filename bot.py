@@ -829,6 +829,92 @@ def _build_last_7_days_text(now: datetime, downloaded: int, history: list[dict[s
     return "\n".join(lines)
 
 
+def _traffic_points_last_7_days(
+    now: datetime,
+    downloaded: int,
+    uploaded: int,
+    history: list[dict[str, int | str]],
+) -> list[dict[str, int | str]]:
+    points = history[-8:]
+    if len(points) < 2:
+        return []
+
+    result: list[dict[str, int | str]] = []
+    for idx in range(1, len(points)):
+        prev_point = points[idx - 1]
+        current_point = points[idx]
+        date_raw = str(prev_point.get("date", ""))
+        try:
+            date_value = datetime.strptime(date_raw, "%Y-%m-%d")
+        except ValueError:
+            continue
+
+        day_downloaded = max(0, int(current_point.get("downloaded", 0)) - int(prev_point.get("downloaded", 0)))
+        day_uploaded = max(0, int(current_point.get("uploaded", 0)) - int(prev_point.get("uploaded", 0)))
+        result.append(
+            {
+                "date": date_value.strftime("%d.%m"),
+                "downloaded": day_downloaded,
+                "uploaded": day_uploaded,
+            }
+        )
+
+    latest_day = points[-1]
+    if str(latest_day.get("date", "")) == now.strftime("%Y-%m-%d"):
+        result.append(
+            {
+                "date": now.strftime("%d.%m"),
+                "downloaded": max(0, downloaded - int(latest_day.get("downloaded", downloaded))),
+                "uploaded": max(0, uploaded - int(latest_day.get("uploaded", uploaded))),
+            }
+        )
+
+    return result[-7:]
+
+
+def _build_traffic_chart_last_7_days(
+    now: datetime,
+    downloaded: int,
+    uploaded: int,
+    history: list[dict[str, int | str]],
+) -> tuple[Optional[Path], Optional[str]]:
+    points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
+    if len(points) < 2:
+        return None, "Недостаточно данных для графика. История заполняется раз в день."
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from matplotlib import pyplot as plt
+    except ImportError:
+        return None, "Графики недоступны: установите optional-зависимость matplotlib."
+
+    labels = [str(item["date"]) for item in points]
+    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
+    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+
+    with tempfile.NamedTemporaryFile(prefix="traffic_7d_", suffix=".png", delete=False) as temp_file:
+        image_path = Path(temp_file.name)
+
+    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
+    try:
+        ax.plot(labels, down_values, marker="o", linewidth=2, color="#1f77b4", label="Скачано")
+        ax.plot(labels, up_values, marker="o", linewidth=2, color="#ff7f0e", label="Отдано")
+        ax.fill_between(labels, down_values, alpha=0.12, color="#1f77b4")
+        ax.fill_between(labels, up_values, alpha=0.12, color="#ff7f0e")
+        ax.set_title("Трафик за последние 7 дней")
+        ax.set_ylabel("GiB / день")
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+        fig.savefig(image_path, format="png")
+    finally:
+        plt.close(fig)
+
+    return image_path, None
+
+
 def _build_last_4_weeks_text(now: datetime, downloaded: int, history: list[dict[str, int | str]]) -> str:
     lines = ["🗓️ <b>Скачано по неделям (последние 4)</b>"]
     points = history[-32:]
@@ -1016,8 +1102,35 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         except OSError:
             log.warning("Failed to persist traffic history", exc_info=True)
 
-    text = _build_last_7_days_text(now, downloaded, history) if mode == "7d" else _build_last_4_weeks_text(now, downloaded, history)
-    await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+    if mode == "4w":
+        text = _build_last_4_weeks_text(now, downloaded, history)
+        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+        return
+
+    chart_points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
+    chart_path, chart_error = await asyncio.to_thread(_build_traffic_chart_last_7_days, now, downloaded, uploaded, history)
+    if chart_path is None:
+        text = _build_last_7_days_text(now, downloaded, history)
+        if chart_error:
+            text = f"{text}\n\n⚠️ {chart_error}"
+        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+        return
+
+    caption = (
+        "📅 <b>Трафик за последние 7 дней</b>\n"
+        f"Сумма: ⇣ <b>{fmt_bytes(sum(int(item['downloaded']) for item in chart_points))}</b> "
+        f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in chart_points))}</b>"
+    )
+
+    try:
+        if query.message is None:
+            await query.answer("Не удалось отправить график", show_alert=True)
+            return
+        with chart_path.open("rb") as image_file:
+            await query.message.reply_photo(photo=image_file, caption=caption, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+        await query.answer("График отправлен")
+    finally:
+        chart_path.unlink(missing_ok=True)
 
 
 def _is_active(status: str) -> bool:
@@ -1233,7 +1346,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — помощь\n\n"
         "<b>Как пользоваться</b>\n"
         "• 📊 Статус — скорость и текущая активность\n"
-        "• 📈 Статистика — сводка + детально за 7 дней и по неделям\n"
+        "• 📈 Статистика — сводка + график/детально за 7 дней и по неделям\n"
         "• 📋 Торренты — списки + поиск\n"
         "• ➕ Добавить — magnet/URL или .torrent файл\n"
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"

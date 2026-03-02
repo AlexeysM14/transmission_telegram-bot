@@ -51,6 +51,13 @@ sudo systemctl status transmission3-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+
+> Опционально: для отправки графика трафика за 7 дней в виде изображения установите `matplotlib`:
+>
+> ```bash
+> pip install matplotlib
+> ```
 export TG_TOKEN="<telegram-bot-token>"
 python bot.py
 ```
