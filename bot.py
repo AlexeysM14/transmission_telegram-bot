@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import html
 import heapq
+import io
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -20,7 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -887,7 +888,7 @@ def _build_traffic_chart_last_7_days(
     downloaded: int,
     uploaded: int,
     history: list[dict[str, int | str]],
-) -> tuple[Optional[Path], Optional[str]]:
+) -> tuple[Optional[bytes], Optional[str]]:
     points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
     if len(points) < 2:
         return None, "Недостаточно данных для графика. История заполняется раз в день."
@@ -904,9 +905,6 @@ def _build_traffic_chart_last_7_days(
     down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
     up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
 
-    with tempfile.NamedTemporaryFile(prefix="traffic_7d_", suffix=".png", delete=False) as temp_file:
-        image_path = Path(temp_file.name)
-
     fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
     try:
         ax.plot(labels, down_values, marker="o", linewidth=2, color="#1f77b4", label="Скачано")
@@ -918,21 +916,24 @@ def _build_traffic_chart_last_7_days(
         ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
         ax.legend(loc="upper left")
         fig.tight_layout()
-        fig.savefig(image_path, format="png")
+        image_buffer = io.BytesIO()
+        fig.savefig(image_buffer, format="png")
+        image_buffer.seek(0)
     finally:
         plt.close(fig)
 
-    return image_path, None
+    return image_buffer.getvalue(), None
 
 
-def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, history: list[dict[str, int | str]]) -> str:
-    lines = ["🗓️ <b>Трафик по неделям (последние 4)</b>"]
+def _weekly_totals_last_4_weeks(
+    now: datetime,
+    downloaded: int,
+    uploaded: int,
+    history: list[dict[str, int | str]],
+) -> list[dict[str, int | str]]:
     points = history[-32:]
-
     if len(points) < 2:
-        lines.append("Недостаточно данных. История начнёт заполняться автоматически раз в день.")
-        lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        return "\n".join(lines)
+        return []
 
     weekly_totals: dict[str, dict[str, int]] = {}
     week_order: list[str] = []
@@ -967,11 +968,71 @@ def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, hist
         weekly_totals[week_key]["downloaded"] += today_delta_downloaded
         weekly_totals[week_key]["uploaded"] += today_delta_uploaded
 
-    for week_key in week_order[-4:]:
-        totals = weekly_totals[week_key]
+    return [
+        {
+            "week": week_key,
+            "downloaded": weekly_totals[week_key]["downloaded"],
+            "uploaded": weekly_totals[week_key]["uploaded"],
+        }
+        for week_key in week_order[-4:]
+    ]
+
+
+def _build_traffic_chart_last_4_weeks(
+    now: datetime,
+    downloaded: int,
+    uploaded: int,
+    history: list[dict[str, int | str]],
+) -> tuple[Optional[list[dict[str, int | str]]], Optional[bytes], Optional[str]]:
+    points = _weekly_totals_last_4_weeks(now, downloaded, uploaded, history)
+    if len(points) < 2:
+        return None, None, "Недостаточно данных для графика. История заполняется раз в день."
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        from matplotlib import pyplot as plt
+    except ImportError:
+        return None, None, "Графики недоступны: установите optional-зависимость matplotlib."
+
+    labels = [str(item["week"]) for item in points]
+    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
+    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+
+    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
+    try:
+        ax.plot(labels, down_values, marker="o", linewidth=2, color="#1f77b4", label="Скачано")
+        ax.plot(labels, up_values, marker="o", linewidth=2, color="#ff7f0e", label="Отдано")
+        ax.fill_between(labels, down_values, alpha=0.12, color="#1f77b4")
+        ax.fill_between(labels, up_values, alpha=0.12, color="#ff7f0e")
+        ax.set_title("Трафик по неделям (последние 4)")
+        ax.set_ylabel("GiB / неделя")
+        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+        image_buffer = io.BytesIO()
+        fig.savefig(image_buffer, format="png")
+        image_buffer.seek(0)
+    finally:
+        plt.close(fig)
+
+    return points, image_buffer.getvalue(), None
+
+
+def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, history: list[dict[str, int | str]]) -> str:
+    lines = ["🗓️ <b>Трафик по неделям (последние 4)</b>"]
+    points = _weekly_totals_last_4_weeks(now, downloaded, uploaded, history)
+
+    if len(points) < 2:
+        lines.append("Недостаточно данных. История начнёт заполняться автоматически раз в день.")
+        lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
+        return "\n".join(lines)
+
+    for week in points:
         lines.append(
-            f"{week_key}: ⇣ <b>{fmt_bytes(totals['downloaded'])}</b> "
-            f"| ⇡ <b>{fmt_bytes(totals['uploaded'])}</b>"
+            f"{week['week']}: ⇣ <b>{fmt_bytes(int(week['downloaded']))}</b> "
+            f"| ⇡ <b>{fmt_bytes(int(week['uploaded']))}</b>"
         )
 
     lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1121,13 +1182,43 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("Failed to persist traffic history", exc_info=True)
 
     if mode == "4w":
-        text = _build_last_4_weeks_text(now, downloaded, uploaded, history)
-        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+        week_points, chart_payload, chart_error = await asyncio.to_thread(
+            _build_traffic_chart_last_4_weeks,
+            now,
+            downloaded,
+            uploaded,
+            history,
+        )
+        if chart_payload is None or week_points is None:
+            text = _build_last_4_weeks_text(now, downloaded, uploaded, history)
+            if chart_error:
+                text = f"{text}\n\n⚠️ {chart_error}"
+            await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+            return
+
+        caption = (
+            "🗓️ <b>Трафик по неделям (последние 4)</b>\n"
+            f"Сумма: ⇣ <b>{fmt_bytes(sum(int(item['downloaded']) for item in week_points))}</b> "
+            f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in week_points))}</b>"
+        )
+
+        if query.message is None:
+            await query.answer("Не удалось отправить график", show_alert=True)
+            return
+
+        image_file = InputFile(io.BytesIO(chart_payload), filename="traffic_4w.png")
+        await query.message.reply_photo(
+            photo=image_file,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=TRAFFIC_OVERVIEW_KEYBOARD,
+        )
+        await query.answer("График отправлен")
         return
 
     chart_points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
-    chart_path, chart_error = await asyncio.to_thread(_build_traffic_chart_last_7_days, now, downloaded, uploaded, history)
-    if chart_path is None:
+    chart_payload, chart_error = await asyncio.to_thread(_build_traffic_chart_last_7_days, now, downloaded, uploaded, history)
+    if chart_payload is None:
         text = _build_last_7_days_text(now, downloaded, uploaded, history)
         if chart_error:
             text = f"{text}\n\n⚠️ {chart_error}"
@@ -1140,15 +1231,13 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in chart_points))}</b>"
     )
 
-    try:
-        if query.message is None:
-            await query.answer("Не удалось отправить график", show_alert=True)
-            return
-        with chart_path.open("rb") as image_file:
-            await query.message.reply_photo(photo=image_file, caption=caption, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
-        await query.answer("График отправлен")
-    finally:
-        chart_path.unlink(missing_ok=True)
+    if query.message is None:
+        await query.answer("Не удалось отправить график", show_alert=True)
+        return
+
+    image_file = InputFile(io.BytesIO(chart_payload), filename="traffic_7d.png")
+    await query.message.reply_photo(photo=image_file, caption=caption, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+    await query.answer("График отправлен")
 
 
 def _is_active(status: str) -> bool:
