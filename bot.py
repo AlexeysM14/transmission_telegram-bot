@@ -506,6 +506,7 @@ TORRENT_LIST_KEYBOARD = InlineKeyboardMarkup(
 
 TRAFFIC_OVERVIEW_KEYBOARD = InlineKeyboardMarkup(
     [
+        [InlineKeyboardButton("🔄 Обновить статистику", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}refresh")],
         [InlineKeyboardButton("📅 Последние 7 дней", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}7d")],
         [InlineKeyboardButton("🗓️ По неделям (4)", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}4w")],
     ]
@@ -1046,8 +1047,28 @@ def _traffic_delta(current: int, anchor: dict[str, int | str], field: str) -> in
     return max(0, current - base)
 
 
-def _build_traffic_stats_text(now: datetime, downloaded: int, uploaded: int, anchors: dict[str, dict[str, int | str]]) -> str:
-    labels = (("day", "За день"), ("week", "За неделю"), ("month", "За месяц"))
+def _traffic_last_7_days_delta(
+    now: datetime,
+    downloaded: int,
+    uploaded: int,
+    history: list[dict[str, int | str]],
+) -> tuple[int, int]:
+    points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
+    if not points:
+        return 0, 0
+    total_downloaded = sum(int(item.get("downloaded", 0)) for item in points)
+    total_uploaded = sum(int(item.get("uploaded", 0)) for item in points)
+    return max(0, total_downloaded), max(0, total_uploaded)
+
+
+def _build_traffic_stats_text(
+    now: datetime,
+    downloaded: int,
+    uploaded: int,
+    anchors: dict[str, dict[str, int | str]],
+    history: list[dict[str, int | str]],
+) -> str:
+    labels = (("day", "За день"), ("month", "За месяц"))
     lines = ["📈 <b>Статистика трафика</b>"]
 
     for period, label in labels:
@@ -1055,6 +1076,9 @@ def _build_traffic_stats_text(now: datetime, downloaded: int, uploaded: int, anc
         down = _traffic_delta(downloaded, anchor, "downloaded")
         up = _traffic_delta(uploaded, anchor, "uploaded")
         lines.append(f"{label}: ⇣ <b>{fmt_bytes(down)}</b> | ⇡ <b>{fmt_bytes(up)}</b>")
+
+    last_7d_down, last_7d_up = _traffic_last_7_days_delta(now, downloaded, uploaded, history)
+    lines.insert(2, f"За последние 7 дней: ⇣ <b>{fmt_bytes(last_7d_down)}</b> | ⇡ <b>{fmt_bytes(last_7d_up)}</b>")
 
     lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
     return "\n".join(lines)
@@ -1080,7 +1104,7 @@ async def send_traffic_stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
         except OSError:
             log.warning("Failed to persist traffic history", exc_info=True)
 
-    text = _build_traffic_stats_text(now, downloaded, uploaded, anchors)
+    text = _build_traffic_stats_text(now, downloaded, uploaded, anchors, history)
     await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
 
 
@@ -1154,7 +1178,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     mode = data[len(TRAFFIC_VIEW_CB_PREFIX) :]
-    if mode not in {"7d", "4w"}:
+    if mode not in {"refresh", "7d", "4w"}:
         await query.answer("Неизвестный режим", show_alert=True)
         return
 
@@ -1180,6 +1204,11 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             _persist_traffic_state(anchors, history)
         except OSError:
             log.warning("Failed to persist traffic history", exc_info=True)
+
+    if mode == "refresh":
+        text = _build_traffic_stats_text(now, downloaded, uploaded, anchors, history)
+        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+        return
 
     if mode == "4w":
         week_points, chart_payload, chart_error = await asyncio.to_thread(
@@ -1876,7 +1905,7 @@ def main() -> None:
 
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
     app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|done)$"))
-    app.add_handler(CallbackQueryHandler(on_traffic_view, pattern=f"^{TRAFFIC_VIEW_CB_PREFIX}(7d|4w)$"))
+    app.add_handler(CallbackQueryHandler(on_traffic_view, pattern=f"^{TRAFFIC_VIEW_CB_PREFIX}(refresh|7d|4w)$"))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
