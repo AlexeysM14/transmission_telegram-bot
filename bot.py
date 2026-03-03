@@ -799,8 +799,8 @@ def _weekday_short_ru(date_value: datetime) -> str:
     return labels[date_value.weekday()]
 
 
-def _build_last_7_days_text(now: datetime, downloaded: int, history: list[dict[str, int | str]]) -> str:
-    lines = ["📅 <b>Трафик за последние 7 дней (скачано)</b>"]
+def _build_last_7_days_text(now: datetime, downloaded: int, uploaded: int, history: list[dict[str, int | str]]) -> str:
+    lines = ["📅 <b>Трафик за последние 7 дней</b>"]
     points = history[-8:]
 
     if len(points) < 2:
@@ -819,12 +819,22 @@ def _build_last_7_days_text(now: datetime, downloaded: int, history: list[dict[s
 
         prev_downloaded = int(prev_point.get("downloaded", 0))
         current_downloaded = int(current_point.get("downloaded", 0))
-        day_delta = max(0, current_downloaded - prev_downloaded)
-        lines.append(f"{_weekday_short_ru(date_value)} {date_value.strftime('%d.%m')}: <b>{fmt_bytes(day_delta)}</b>")
+        prev_uploaded = int(prev_point.get("uploaded", 0))
+        current_uploaded = int(current_point.get("uploaded", 0))
+        day_downloaded = max(0, current_downloaded - prev_downloaded)
+        day_uploaded = max(0, current_uploaded - prev_uploaded)
+        lines.append(
+            f"{_weekday_short_ru(date_value)} {date_value.strftime('%d.%m')}: "
+            f"⇣ <b>{fmt_bytes(day_downloaded)}</b> | ⇡ <b>{fmt_bytes(day_uploaded)}</b>"
+        )
 
     today_anchor = points[-1]
     today_downloaded = max(0, downloaded - int(today_anchor.get("downloaded", downloaded)))
-    lines.append(f"Сегодня {now.strftime('%d.%m')}: <b>{fmt_bytes(today_downloaded)}</b>")
+    today_uploaded = max(0, uploaded - int(today_anchor.get("uploaded", uploaded)))
+    lines.append(
+        f"Сегодня {now.strftime('%d.%m')}: "
+        f"⇣ <b>{fmt_bytes(today_downloaded)}</b> | ⇡ <b>{fmt_bytes(today_uploaded)}</b>"
+    )
     lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
     return "\n".join(lines)
 
@@ -915,8 +925,8 @@ def _build_traffic_chart_last_7_days(
     return image_path, None
 
 
-def _build_last_4_weeks_text(now: datetime, downloaded: int, history: list[dict[str, int | str]]) -> str:
-    lines = ["🗓️ <b>Скачано по неделям (последние 4)</b>"]
+def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, history: list[dict[str, int | str]]) -> str:
+    lines = ["🗓️ <b>Трафик по неделям (последние 4)</b>"]
     points = history[-32:]
 
     if len(points) < 2:
@@ -924,7 +934,7 @@ def _build_last_4_weeks_text(now: datetime, downloaded: int, history: list[dict[
         lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
         return "\n".join(lines)
 
-    weekly_totals: dict[str, int] = {}
+    weekly_totals: dict[str, dict[str, int]] = {}
     week_order: list[str] = []
 
     for idx in range(1, len(points)):
@@ -937,24 +947,32 @@ def _build_last_4_weeks_text(now: datetime, downloaded: int, history: list[dict[
 
         iso_year, iso_week, _ = date_value.isocalendar()
         week_key = f"{iso_year}-W{iso_week:02d}"
-        delta = max(0, int(current_point.get("downloaded", 0)) - int(prev_point.get("downloaded", 0)))
+        delta_downloaded = max(0, int(current_point.get("downloaded", 0)) - int(prev_point.get("downloaded", 0)))
+        delta_uploaded = max(0, int(current_point.get("uploaded", 0)) - int(prev_point.get("uploaded", 0)))
         if week_key not in weekly_totals:
-            weekly_totals[week_key] = 0
+            weekly_totals[week_key] = {"downloaded": 0, "uploaded": 0}
             week_order.append(week_key)
-        weekly_totals[week_key] += delta
+        weekly_totals[week_key]["downloaded"] += delta_downloaded
+        weekly_totals[week_key]["uploaded"] += delta_uploaded
 
     today_date = now.strftime("%Y-%m-%d")
     if points and points[-1].get("date") == today_date:
         iso_year, iso_week, _ = now.isocalendar()
         week_key = f"{iso_year}-W{iso_week:02d}"
-        today_delta = max(0, downloaded - int(points[-1].get("downloaded", downloaded)))
+        today_delta_downloaded = max(0, downloaded - int(points[-1].get("downloaded", downloaded)))
+        today_delta_uploaded = max(0, uploaded - int(points[-1].get("uploaded", uploaded)))
         if week_key not in weekly_totals:
-            weekly_totals[week_key] = 0
+            weekly_totals[week_key] = {"downloaded": 0, "uploaded": 0}
             week_order.append(week_key)
-        weekly_totals[week_key] += today_delta
+        weekly_totals[week_key]["downloaded"] += today_delta_downloaded
+        weekly_totals[week_key]["uploaded"] += today_delta_uploaded
 
     for week_key in week_order[-4:]:
-        lines.append(f"{week_key}: <b>{fmt_bytes(weekly_totals[week_key])}</b>")
+        totals = weekly_totals[week_key]
+        lines.append(
+            f"{week_key}: ⇣ <b>{fmt_bytes(totals['downloaded'])}</b> "
+            f"| ⇡ <b>{fmt_bytes(totals['uploaded'])}</b>"
+        )
 
     lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
     return "\n".join(lines)
@@ -1103,14 +1121,14 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             log.warning("Failed to persist traffic history", exc_info=True)
 
     if mode == "4w":
-        text = _build_last_4_weeks_text(now, downloaded, history)
+        text = _build_last_4_weeks_text(now, downloaded, uploaded, history)
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
         return
 
     chart_points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
     chart_path, chart_error = await asyncio.to_thread(_build_traffic_chart_last_7_days, now, downloaded, uploaded, history)
     if chart_path is None:
-        text = _build_last_7_days_text(now, downloaded, history)
+        text = _build_last_7_days_text(now, downloaded, uploaded, history)
         if chart_error:
             text = f"{text}\n\n⚠️ {chart_error}"
         await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
