@@ -908,14 +908,14 @@ def _build_traffic_chart_last_7_days(
 
     fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
     try:
-        ax.plot(labels, down_values, marker="o", linewidth=2, color="#1f77b4", label="Скачано")
-        ax.plot(labels, up_values, marker="o", linewidth=2, color="#ff7f0e", label="Отдано")
-        ax.fill_between(labels, down_values, alpha=0.12, color="#1f77b4")
-        ax.fill_between(labels, up_values, alpha=0.12, color="#ff7f0e")
-        ax.set_title("Трафик за последние 7 дней")
-        ax.set_ylabel("GiB / день")
-        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-        ax.legend(loc="upper left")
+        _draw_traffic_chart(
+            ax=ax,
+            labels=labels,
+            down_values=down_values,
+            up_values=up_values,
+            title="Трафик за последние 7 дней",
+            y_label="GiB / день",
+        )
         fig.tight_layout()
         image_buffer = io.BytesIO()
         fig.savefig(image_buffer, format="png")
@@ -1003,14 +1003,14 @@ def _build_traffic_chart_last_4_weeks(
 
     fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
     try:
-        ax.plot(labels, down_values, marker="o", linewidth=2, color="#1f77b4", label="Скачано")
-        ax.plot(labels, up_values, marker="o", linewidth=2, color="#ff7f0e", label="Отдано")
-        ax.fill_between(labels, down_values, alpha=0.12, color="#1f77b4")
-        ax.fill_between(labels, up_values, alpha=0.12, color="#ff7f0e")
-        ax.set_title("Трафик по неделям (последние 4)")
-        ax.set_ylabel("GiB / неделя")
-        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-        ax.legend(loc="upper left")
+        _draw_traffic_chart(
+            ax=ax,
+            labels=labels,
+            down_values=down_values,
+            up_values=up_values,
+            title="Трафик по неделям (последние 4)",
+            y_label="GiB / неделя",
+        )
         fig.tight_layout()
         image_buffer = io.BytesIO()
         fig.savefig(image_buffer, format="png")
@@ -1038,6 +1038,74 @@ def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, hist
 
     lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
     return "\n".join(lines)
+
+
+def _draw_traffic_chart(
+    ax: Any,
+    labels: list[str],
+    down_values: list[float],
+    up_values: list[float],
+    title: str,
+    y_label: str,
+) -> None:
+    down_color = "#2B7DE9"
+    up_color = "#FF8A33"
+
+    ax.set_facecolor("#F7FAFF")
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.spines["left"].set_color("#CAD7E6")
+    ax.spines["bottom"].set_color("#CAD7E6")
+
+    ax.plot(
+        labels,
+        down_values,
+        marker="o",
+        linewidth=2.3,
+        markersize=5,
+        color=down_color,
+        label="Скачано",
+    )
+    ax.plot(
+        labels,
+        up_values,
+        marker="o",
+        linewidth=2.3,
+        markersize=5,
+        color=up_color,
+        label="Отдано",
+    )
+
+    ax.fill_between(labels, down_values, alpha=0.16, color=down_color)
+    ax.fill_between(labels, up_values, alpha=0.16, color=up_color)
+
+    if labels:
+        ax.annotate(
+            f"{down_values[-1]:.2f}",
+            xy=(labels[-1], down_values[-1]),
+            xytext=(8, 8),
+            textcoords="offset points",
+            color=down_color,
+            fontsize=9,
+            weight="bold",
+        )
+        ax.annotate(
+            f"{up_values[-1]:.2f}",
+            xy=(labels[-1], up_values[-1]),
+            xytext=(8, -12),
+            textcoords="offset points",
+            color=up_color,
+            fontsize=9,
+            weight="bold",
+        )
+
+    ax.set_title(title, fontsize=12, weight="bold", pad=12)
+    ax.set_ylabel(y_label)
+    ax.tick_params(axis="x", rotation=0, labelsize=9)
+    ax.tick_params(axis="y", labelsize=9)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.55)
+    ax.grid(False, axis="x")
+    ax.legend(loc="upper left", frameon=False)
 
 
 def _traffic_delta(current: int, anchor: dict[str, int | str], field: str) -> int:
