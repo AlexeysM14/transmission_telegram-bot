@@ -1235,6 +1235,16 @@ async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     await send_torrent_list(update, ctx, mode=mode, edit_existing=True)
 
 
+async def _edit_traffic_message(query: Any, text: str) -> None:
+    """Edit callback message text/caption depending on message type."""
+    message = query.message
+    if message is not None and message.text is None and message.caption is not None:
+        await query.edit_message_caption(text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+        return
+
+    await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+
+
 async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -1255,10 +1265,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         stats = await tr_call(lambda c: c.session_stats())
     except (TransmissionError, TRCallError) as exc:
-        await query.edit_message_text(
-            text=f"❌ Ошибка Transmission: {html.escape(str(exc))}",
-            reply_markup=TRAFFIC_OVERVIEW_KEYBOARD,
-        )
+        await _edit_traffic_message(query, f"❌ Ошибка Transmission: {html.escape(str(exc))}")
         return
 
     now = datetime.now()
@@ -1275,7 +1282,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
     if mode == "refresh":
         text = _build_traffic_stats_text(now, downloaded, uploaded, anchors, history)
-        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+        await _edit_traffic_message(query, text)
         return
 
     if mode == "4w":
@@ -1290,7 +1297,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             text = _build_last_4_weeks_text(now, downloaded, uploaded, history)
             if chart_error:
                 text = f"{text}\n\n⚠️ {chart_error}"
-            await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+            await _edit_traffic_message(query, text)
             return
 
         caption = (
@@ -1319,7 +1326,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         text = _build_last_7_days_text(now, downloaded, uploaded, history)
         if chart_error:
             text = f"{text}\n\n⚠️ {chart_error}"
-        await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+        await _edit_traffic_message(query, text)
         return
 
     caption = (
