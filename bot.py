@@ -669,16 +669,16 @@ def _build_status_text(stats: Any, free_space: Optional[int]) -> str:
     )
 
 
-def _read_traffic_anchors() -> dict[str, dict[str, int | str]]:
+def _read_traffic_state() -> tuple[dict[str, dict[str, int | str]], list[dict[str, int | str]]]:
     try:
         data = json.loads(TRAFFIC_ANCHORS_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {}
+        return {}, []
     except (OSError, ValueError, TypeError):
-        return {}
+        return {}, []
 
     if not isinstance(data, dict):
-        return {}
+        return {}, []
 
     anchors: dict[str, dict[str, int | str]] = {}
     for period in ("day", "week", "month"):
@@ -694,21 +694,11 @@ def _read_traffic_anchors() -> dict[str, dict[str, int | str]]:
                 "downloaded": max(0, downloaded),
                 "uploaded": max(0, uploaded),
             }
-    return anchors
-
-
-def _read_traffic_history() -> list[dict[str, int | str]]:
-    try:
-        data = json.loads(TRAFFIC_ANCHORS_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError, TypeError):
-        return []
 
     raw_history = data.get("history") if isinstance(data, dict) else None
     days = raw_history.get("days") if isinstance(raw_history, dict) else None
     if not isinstance(days, list):
-        return []
+        return anchors, []
 
     history: list[dict[str, int | str]] = []
     for item in days:
@@ -723,15 +713,7 @@ def _read_traffic_history() -> list[dict[str, int | str]]:
                 "downloaded": max(0, downloaded),
                 "uploaded": max(0, uploaded),
             })
-    return history
-
-
-def _write_traffic_anchors(anchors: dict[str, dict[str, int | str]]) -> None:
-    history = _read_traffic_history()
-    payload = json.dumps({**anchors, "history": {"days": history}}, ensure_ascii=False, separators=(",", ":"))
-    tmp_path = TRAFFIC_ANCHORS_PATH.with_suffix(".tmp")
-    tmp_path.write_text(payload, encoding="utf-8")
-    tmp_path.replace(TRAFFIC_ANCHORS_PATH)
+    return anchors, history
 
 
 def _persist_traffic_state(anchors: dict[str, dict[str, int | str]], history: list[dict[str, int | str]]) -> None:
@@ -750,8 +732,12 @@ def _period_keys(now: datetime) -> dict[str, str]:
     }
 
 
-def _ensure_traffic_anchors(now: datetime, downloaded: int, uploaded: int) -> dict[str, dict[str, int | str]]:
-    anchors = _read_traffic_anchors()
+def _ensure_traffic_anchors(
+    anchors: dict[str, dict[str, int | str]],
+    now: datetime,
+    downloaded: int,
+    uploaded: int,
+) -> bool:
     keys = _period_keys(now)
     changed = False
 
@@ -772,28 +758,22 @@ def _ensure_traffic_anchors(now: datetime, downloaded: int, uploaded: int) -> di
                 "uploaded": uploaded,
             }
             changed = True
-
-    if changed:
-        try:
-            _write_traffic_anchors(anchors)
-        except OSError:
-            log.warning("Failed to persist traffic anchors", exc_info=True)
-
-    return anchors
+    return changed
 
 
-def _ensure_daily_traffic_history(now: datetime, downloaded: int, uploaded: int) -> list[dict[str, int | str]]:
-    history = _read_traffic_history()
+def _ensure_daily_traffic_history(
+    history: list[dict[str, int | str]], now: datetime, downloaded: int, uploaded: int
+) -> bool:
     day_key = now.strftime("%Y-%m-%d")
 
     if history and history[-1].get("date") == day_key:
-        return history
+        return False
 
     history.append({"date": day_key, "downloaded": downloaded, "uploaded": uploaded})
     # Храним небольшой хвост: достаточно для 4 недель + запас.
     if len(history) > 45:
-        history = history[-45:]
-    return history
+        del history[:-45]
+    return True
 
 
 def _weekday_short_ru(date_value: datetime) -> str:
@@ -1163,14 +1143,14 @@ async def send_traffic_stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
     downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
     uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
 
-    anchors = _ensure_traffic_anchors(now, downloaded, uploaded)
-    history_before = _read_traffic_history()
-    history = _ensure_daily_traffic_history(now, downloaded, uploaded)
-    if history != history_before:
+    anchors, history = _read_traffic_state()
+    anchors_changed = _ensure_traffic_anchors(anchors, now, downloaded, uploaded)
+    history_changed = _ensure_daily_traffic_history(history, now, downloaded, uploaded)
+    if anchors_changed or history_changed:
         try:
             _persist_traffic_state(anchors, history)
         except OSError:
-            log.warning("Failed to persist traffic history", exc_info=True)
+            log.warning("Failed to persist traffic state", exc_info=True)
 
     text = _build_traffic_stats_text(now, downloaded, uploaded, anchors, history)
     await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
@@ -1271,14 +1251,14 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now()
     downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
     uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
-    anchors = _ensure_traffic_anchors(now, downloaded, uploaded)
-    history_before = _read_traffic_history()
-    history = _ensure_daily_traffic_history(now, downloaded, uploaded)
-    if history != history_before:
+    anchors, history = _read_traffic_state()
+    anchors_changed = _ensure_traffic_anchors(anchors, now, downloaded, uploaded)
+    history_changed = _ensure_daily_traffic_history(history, now, downloaded, uploaded)
+    if anchors_changed or history_changed:
         try:
             _persist_traffic_state(anchors, history)
         except OSError:
-            log.warning("Failed to persist traffic history", exc_info=True)
+            log.warning("Failed to persist traffic state", exc_info=True)
 
     if mode == "refresh":
         text = _build_traffic_stats_text(now, downloaded, uploaded, anchors, history)
@@ -1925,14 +1905,14 @@ def main() -> None:
 
         downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
         uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
-        anchors = _ensure_traffic_anchors(now, downloaded, uploaded)
-        history_before = _read_traffic_history()
-        history = _ensure_daily_traffic_history(now, downloaded, uploaded)
-        if history != history_before:
+        anchors, history = _read_traffic_state()
+        anchors_changed = _ensure_traffic_anchors(anchors, now, downloaded, uploaded)
+        history_changed = _ensure_daily_traffic_history(history, now, downloaded, uploaded)
+        if anchors_changed or history_changed:
             try:
                 _persist_traffic_state(anchors, history)
             except OSError:
-                log.warning("Failed to persist traffic history", exc_info=True)
+                log.warning("Failed to persist traffic state", exc_info=True)
         ctx.application.bot_data[TRAFFIC_LAST_SNAPSHOT_DAY_KEY] = day_key
 
     async def notify_completed_torrents_fallback(app: Application) -> None:
