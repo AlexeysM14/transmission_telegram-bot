@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import contextlib
 import html
 import heapq
@@ -508,7 +509,7 @@ TRAFFIC_OVERVIEW_KEYBOARD = InlineKeyboardMarkup(
     [
         [InlineKeyboardButton("🔄 Обновить статистику", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}refresh")],
         [InlineKeyboardButton("📅 Последние 7 дней", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}7d")],
-        [InlineKeyboardButton("🗓️ По неделям (4)", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}4w")],
+        [InlineKeyboardButton("🗓️ По дням (месяц)", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}4w")],
     ]
 )
 
@@ -770,7 +771,7 @@ def _ensure_daily_traffic_history(
         return False
 
     history.append({"date": day_key, "downloaded": downloaded, "uploaded": uploaded})
-    # Храним небольшой хвост: достаточно для 4 недель + запас.
+    # Храним небольшой хвост: достаточно для текущего месяца + запас.
     if len(history) > 45:
         del history[:-45]
     return True
@@ -906,18 +907,14 @@ def _build_traffic_chart_last_7_days(
     return image_buffer.getvalue(), None
 
 
-def _weekly_totals_last_4_weeks(
+def _daily_totals_current_month(
     now: datetime,
     downloaded: int,
     uploaded: int,
     history: list[dict[str, int | str]],
 ) -> list[dict[str, int | str]]:
-    points = history[-32:]
-    if len(points) < 2:
-        return []
-
-    weekly_totals: dict[str, dict[str, int]] = {}
-    week_order: list[str] = []
+    points = history[-45:]
+    daily_totals: dict[str, dict[str, int]] = {}
 
     for idx in range(1, len(points)):
         prev_point = points[idx - 1]
@@ -927,47 +924,44 @@ def _weekly_totals_last_4_weeks(
         except ValueError:
             continue
 
-        iso_year, iso_week, _ = date_value.isocalendar()
-        week_key = f"{iso_year}-W{iso_week:02d}"
+        if date_value.year != now.year or date_value.month != now.month:
+            continue
+
+        day_key = date_value.strftime("%Y-%m-%d")
         delta_downloaded = max(0, int(current_point.get("downloaded", 0)) - int(prev_point.get("downloaded", 0)))
         delta_uploaded = max(0, int(current_point.get("uploaded", 0)) - int(prev_point.get("uploaded", 0)))
-        if week_key not in weekly_totals:
-            weekly_totals[week_key] = {"downloaded": 0, "uploaded": 0}
-            week_order.append(week_key)
-        weekly_totals[week_key]["downloaded"] += delta_downloaded
-        weekly_totals[week_key]["uploaded"] += delta_uploaded
+        daily_totals[day_key] = {"downloaded": delta_downloaded, "uploaded": delta_uploaded}
 
     today_date = now.strftime("%Y-%m-%d")
     if points and points[-1].get("date") == today_date:
-        iso_year, iso_week, _ = now.isocalendar()
-        week_key = f"{iso_year}-W{iso_week:02d}"
         today_delta_downloaded = max(0, downloaded - int(points[-1].get("downloaded", downloaded)))
         today_delta_uploaded = max(0, uploaded - int(points[-1].get("uploaded", uploaded)))
-        if week_key not in weekly_totals:
-            weekly_totals[week_key] = {"downloaded": 0, "uploaded": 0}
-            week_order.append(week_key)
-        weekly_totals[week_key]["downloaded"] += today_delta_downloaded
-        weekly_totals[week_key]["uploaded"] += today_delta_uploaded
+        daily_totals[today_date] = {"downloaded": today_delta_downloaded, "uploaded": today_delta_uploaded}
 
-    return [
-        {
-            "week": week_key,
-            "downloaded": weekly_totals[week_key]["downloaded"],
-            "uploaded": weekly_totals[week_key]["uploaded"],
-        }
-        for week_key in week_order[-4:]
-    ]
+    month_days = calendar.monthrange(now.year, now.month)[1]
+    result: list[dict[str, int | str]] = []
+    for day in range(1, month_days + 1):
+        date_value = now.replace(day=day)
+        day_key = date_value.strftime("%Y-%m-%d")
+        totals = daily_totals.get(day_key)
+        result.append(
+            {
+                "date": date_value.strftime("%d.%m"),
+                "downloaded": int(totals["downloaded"]) if totals else 0,
+                "uploaded": int(totals["uploaded"]) if totals else 0,
+            }
+        )
+
+    return result
 
 
-def _build_traffic_chart_last_4_weeks(
+def _build_traffic_chart_current_month(
     now: datetime,
     downloaded: int,
     uploaded: int,
     history: list[dict[str, int | str]],
 ) -> tuple[Optional[list[dict[str, int | str]]], Optional[bytes], Optional[str]]:
-    points = _weekly_totals_last_4_weeks(now, downloaded, uploaded, history)
-    if len(points) < 2:
-        return None, None, "Недостаточно данных для графика. История заполняется раз в день."
+    points = _daily_totals_current_month(now, downloaded, uploaded, history)
 
     try:
         import matplotlib
@@ -977,7 +971,7 @@ def _build_traffic_chart_last_4_weeks(
     except ImportError:
         return None, None, "Графики недоступны: установите optional-зависимость matplotlib."
 
-    labels = [str(item["week"]) for item in points]
+    labels = [str(item["date"]) for item in points]
     down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
     up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
 
@@ -988,8 +982,8 @@ def _build_traffic_chart_last_4_weeks(
             labels=labels,
             down_values=down_values,
             up_values=up_values,
-            title="Трафик по неделям (последние 4)",
-            y_label="GiB / неделя",
+            title="Трафик по дням (текущий месяц)",
+            y_label="GiB / день",
         )
         fig.tight_layout()
         image_buffer = io.BytesIO()
@@ -1002,18 +996,13 @@ def _build_traffic_chart_last_4_weeks(
 
 
 def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, history: list[dict[str, int | str]]) -> str:
-    lines = ["🗓️ <b>Трафик по неделям (последние 4)</b>"]
-    points = _weekly_totals_last_4_weeks(now, downloaded, uploaded, history)
+    lines = ["🗓️ <b>Трафик по дням (текущий месяц)</b>"]
+    points = _daily_totals_current_month(now, downloaded, uploaded, history)
 
-    if len(points) < 2:
-        lines.append("Недостаточно данных. История начнёт заполняться автоматически раз в день.")
-        lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
-        return "\n".join(lines)
-
-    for week in points:
+    for day in points:
         lines.append(
-            f"{week['week']}: ⇣ <b>{fmt_bytes(int(week['downloaded']))}</b> "
-            f"| ⇡ <b>{fmt_bytes(int(week['uploaded']))}</b>"
+            f"{day['date']}: ⇣ <b>{fmt_bytes(int(day['downloaded']))}</b> "
+            f"| ⇡ <b>{fmt_bytes(int(day['uploaded']))}</b>"
         )
 
     lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1266,14 +1255,14 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if mode == "4w":
-        week_points, chart_payload, chart_error = await asyncio.to_thread(
-            _build_traffic_chart_last_4_weeks,
+        day_points, chart_payload, chart_error = await asyncio.to_thread(
+            _build_traffic_chart_current_month,
             now,
             downloaded,
             uploaded,
             history,
         )
-        if chart_payload is None or week_points is None:
+        if chart_payload is None or day_points is None:
             text = _build_last_4_weeks_text(now, downloaded, uploaded, history)
             if chart_error:
                 text = f"{text}\n\n⚠️ {chart_error}"
@@ -1281,16 +1270,16 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         caption = (
-            "🗓️ <b>Трафик по неделям (последние 4)</b>\n"
-            f"Сумма: ⇣ <b>{fmt_bytes(sum(int(item['downloaded']) for item in week_points))}</b> "
-            f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in week_points))}</b>"
+            "🗓️ <b>Трафик по дням (текущий месяц)</b>\n"
+            f"Сумма: ⇣ <b>{fmt_bytes(sum(int(item['downloaded']) for item in day_points))}</b> "
+            f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in day_points))}</b>"
         )
 
         if query.message is None:
             await query.answer("Не удалось отправить график", show_alert=True)
             return
 
-        image_file = InputFile(io.BytesIO(chart_payload), filename="traffic_4w.png")
+        image_file = InputFile(io.BytesIO(chart_payload), filename="traffic_month.png")
         await query.message.reply_photo(
             photo=image_file,
             caption=caption,
@@ -1537,7 +1526,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "/help — помощь\n\n"
         "<b>Как пользоваться</b>\n"
         "• 📊 Статус — скорость и текущая активность\n"
-        "• 📈 Статистика — сводка + график/детально за 7 дней и по неделям\n"
+        "• 📈 Статистика — сводка + график/детально за 7 дней и по дням текущего месяца\n"
         "• 📋 Торренты — списки + поиск\n"
         "• ➕ Добавить — magnet/URL или .torrent файл\n"
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"
