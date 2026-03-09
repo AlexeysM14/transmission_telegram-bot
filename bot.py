@@ -587,6 +587,47 @@ def _format_session_duration(seconds: int | float) -> str:
     return f"{minutes}m"
 
 
+def _format_download_duration(seconds: int | float) -> str:
+    total_seconds = max(0, int(seconds))
+    days, rem = divmod(total_seconds, 24 * 3600)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    if days > 0:
+        return f"{days}д {hours}ч {minutes}м"
+    if hours > 0:
+        return f"{hours}ч {minutes}м"
+    if minutes > 0:
+        return f"{minutes}м {secs}с"
+    return f"{secs}с"
+
+
+def _torrent_timepoint_to_ts(value: Any) -> Optional[int]:
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    if isinstance(value, (int, float)):
+        as_int = int(value)
+        return as_int if as_int > 0 else None
+    return None
+
+
+def _extract_download_duration_seconds(torrent: Any) -> Optional[int]:
+    added_raw = getattr(torrent, "added_date", None)
+    if added_raw is None:
+        added_raw = getattr(torrent, "date_added", None)
+
+    done_raw = getattr(torrent, "done_date", None)
+    if done_raw is None:
+        done_raw = getattr(torrent, "date_done", None)
+
+    added_ts = _torrent_timepoint_to_ts(added_raw)
+    done_ts = _torrent_timepoint_to_ts(done_raw)
+    if added_ts is None or done_ts is None or done_ts < added_ts:
+        return None
+
+    return done_ts - added_ts
+
+
 async def _get_download_dir_free_space() -> Optional[int]:
     try:
         session = await tr_call(lambda c: c.get_session())
@@ -1414,7 +1455,7 @@ async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
     await reply_chunks(
         update,
         (
-            f"✅ Добавлено: <b>{html.escape(torrent.name)}</b>\n"
+            f"✅ Торрент добавлен: <b>{html.escape(torrent.name)}</b>\n"
             f"ID: <b>{torrent.id}</b>\n"
             f"{_build_projected_free_space_text(free_space_before, torrent)}"
         ),
@@ -1463,7 +1504,7 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     await reply_chunks(
         update,
         (
-            f"✅ Добавлено из файла: <b>{html.escape(torrent.name)}</b>\n"
+            f"✅ Торрент добавлен из файла: <b>{html.escape(torrent.name)}</b>\n"
             f"ID: <b>{torrent.id}</b>\n"
             f"{_build_projected_free_space_text(free_space_before, torrent)}"
         ),
@@ -1809,13 +1850,21 @@ def main() -> None:
 
         new_ids = sorted(set(completed_now) - set(prev_completed))
         ctx.application.bot_data[NOTIFY_COMPLETED_CACHE_KEY] = completed_now
+        torrents_by_id = {int(t.id): t for t in torrents}
 
         if not new_ids:
             pass
         else:
             for torrent_id in new_ids:
+                torrent = torrents_by_id.get(torrent_id)
                 name = html.escape(completed_now.get(torrent_id, "<без названия>"))
-                text = f"✅ Торрент завершён: <b>{name}</b>\nID: <b>{torrent_id}</b>"
+                duration_text = ""
+                if torrent is not None:
+                    duration_seconds = _extract_download_duration_seconds(torrent)
+                    if duration_seconds is not None:
+                        duration_text = f"\n⏱️ Время скачивания: <b>{_format_download_duration(duration_seconds)}</b>"
+
+                text = f"✅ Торрент завершён: <b>{name}</b>\nID: <b>{torrent_id}</b>{duration_text}"
                 for chat_id in list(enabled_chats):
                     try:
                         await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
@@ -1826,7 +1875,6 @@ def main() -> None:
         if not isinstance(pending_start, dict) or not pending_start:
             return
 
-        torrents_by_id = {int(t.id): t for t in torrents}
         expired_ids: list[int] = []
 
         for torrent_id, state in list(pending_start.items()):
