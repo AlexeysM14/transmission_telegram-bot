@@ -937,6 +937,7 @@ def _build_traffic_chart_last_7_days(
             up_values=up_values,
             title="Трафик за последние 7 дней",
             y_label="GiB / день",
+            annotate_last_points=2,
         )
         fig.tight_layout()
         image_buffer = io.BytesIO()
@@ -1057,6 +1058,7 @@ def _draw_traffic_chart(
     up_values: list[float],
     title: str,
     y_label: str,
+    annotate_last_points: int = 1,
 ) -> None:
     down_color = "#2B7DE9"
     up_color = "#FF8A33"
@@ -1089,20 +1091,23 @@ def _draw_traffic_chart(
     ax.fill_between(labels, down_values, alpha=0.16, color=down_color)
     ax.fill_between(labels, up_values, alpha=0.16, color=up_color)
 
-    if labels:
+    points_to_annotate = min(len(labels), max(annotate_last_points, 0))
+    for offset in range(points_to_annotate):
+        point_idx = len(labels) - points_to_annotate + offset
+        x_shift = 8
         ax.annotate(
-            f"{down_values[-1]:.2f}",
-            xy=(labels[-1], down_values[-1]),
-            xytext=(8, 8),
+            f"{down_values[point_idx]:.2f}",
+            xy=(labels[point_idx], down_values[point_idx]),
+            xytext=(x_shift, 8),
             textcoords="offset points",
             color=down_color,
             fontsize=9,
             weight="bold",
         )
         ax.annotate(
-            f"{up_values[-1]:.2f}",
-            xy=(labels[-1], up_values[-1]),
-            xytext=(8, -12),
+            f"{up_values[point_idx]:.2f}",
+            xy=(labels[point_idx], up_values[point_idx]),
+            xytext=(x_shift, -12),
             textcoords="offset points",
             color=up_color,
             fontsize=9,
