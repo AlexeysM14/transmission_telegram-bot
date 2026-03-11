@@ -989,6 +989,7 @@ def _daily_totals_current_month(
         result.append(
             {
                 "date": date_value.strftime("%d.%m"),
+                "day": day,
                 "downloaded": int(totals["downloaded"]) if totals else 0,
                 "uploaded": int(totals["uploaded"]) if totals else 0,
             }
@@ -1013,9 +1014,11 @@ def _build_traffic_chart_current_month(
     except ImportError:
         return None, None, "Графики недоступны: установите optional-зависимость matplotlib."
 
-    labels = [str(item["date"]) for item in points]
+    labels = [str(item["day"]) for item in points]
     down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
     up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+
+    month_title = f"{_month_name_ru(now.month)} {now.year}"
 
     fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
     try:
@@ -1024,8 +1027,10 @@ def _build_traffic_chart_current_month(
             labels=labels,
             down_values=down_values,
             up_values=up_values,
-            title="Трафик по дням (текущий месяц)",
+            title=month_title,
             y_label="GiB / день",
+            show_all_x_labels=True,
+            x_label_rotation=0,
         )
         fig.tight_layout()
         image_buffer = io.BytesIO()
@@ -1038,7 +1043,7 @@ def _build_traffic_chart_current_month(
 
 
 def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, history: list[dict[str, int | str]]) -> str:
-    lines = ["🗓️ <b>Трафик по дням (текущий месяц)</b>"]
+    lines = [f"🗓️ <b>{_month_name_ru(now.month)} {now.year}</b>"]
     points = _daily_totals_current_month(now, downloaded, uploaded, history)
 
     for day in points:
@@ -1059,6 +1064,8 @@ def _draw_traffic_chart(
     title: str,
     y_label: str,
     annotate_last_points: int = 1,
+    show_all_x_labels: bool = False,
+    x_label_rotation: Optional[int] = None,
 ) -> None:
     down_color = "#2B7DE9"
     up_color = "#FF8A33"
@@ -1069,8 +1076,10 @@ def _draw_traffic_chart(
     ax.spines["left"].set_color("#CAD7E6")
     ax.spines["bottom"].set_color("#CAD7E6")
 
+    x_values = list(range(len(labels)))
+
     ax.plot(
-        labels,
+        x_values,
         down_values,
         marker="o",
         linewidth=2.3,
@@ -1079,7 +1088,7 @@ def _draw_traffic_chart(
         label="Скачано",
     )
     ax.plot(
-        labels,
+        x_values,
         up_values,
         marker="o",
         linewidth=2.3,
@@ -1088,8 +1097,8 @@ def _draw_traffic_chart(
         label="Отдано",
     )
 
-    ax.fill_between(labels, down_values, alpha=0.16, color=down_color)
-    ax.fill_between(labels, up_values, alpha=0.16, color=up_color)
+    ax.fill_between(x_values, down_values, alpha=0.16, color=down_color)
+    ax.fill_between(x_values, up_values, alpha=0.16, color=up_color)
 
     points_to_annotate = min(len(labels), max(annotate_last_points, 0))
     for offset in range(points_to_annotate):
@@ -1097,7 +1106,7 @@ def _draw_traffic_chart(
         x_shift = 8
         ax.annotate(
             f"{down_values[point_idx]:.2f}",
-            xy=(labels[point_idx], down_values[point_idx]),
+            xy=(x_values[point_idx], down_values[point_idx]),
             xytext=(x_shift, 8),
             textcoords="offset points",
             color=down_color,
@@ -1106,7 +1115,7 @@ def _draw_traffic_chart(
         )
         ax.annotate(
             f"{up_values[point_idx]:.2f}",
-            xy=(labels[point_idx], up_values[point_idx]),
+            xy=(x_values[point_idx], up_values[point_idx]),
             xytext=(x_shift, -12),
             textcoords="offset points",
             color=up_color,
@@ -1116,11 +1125,44 @@ def _draw_traffic_chart(
 
     ax.set_title(title, fontsize=12, weight="bold", pad=12)
     ax.set_ylabel(y_label)
-    ax.tick_params(axis="x", rotation=0, labelsize=9)
+
+    if show_all_x_labels:
+        tick_indexes = x_values
+    else:
+        tick_step = max(1, len(labels) // 10)
+        tick_indexes = list(range(0, len(labels), tick_step))
+        if tick_indexes[-1] != len(labels) - 1:
+            tick_indexes.append(len(labels) - 1)
+
+    ax.set_xticks(tick_indexes)
+    ax.set_xticklabels([labels[idx] for idx in tick_indexes])
+
+    if x_label_rotation is None:
+        x_label_rotation = 45 if (not show_all_x_labels and len(labels) > 10) else 0
+    ax.tick_params(axis="x", rotation=x_label_rotation, labelsize=9)
     ax.tick_params(axis="y", labelsize=9)
     ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.55)
     ax.grid(False, axis="x")
     ax.legend(loc="upper left", frameon=False)
+
+
+def _month_name_ru(month: int) -> str:
+    months = (
+        "Январь",
+        "Февраль",
+        "Март",
+        "Апрель",
+        "Май",
+        "Июнь",
+        "Июль",
+        "Август",
+        "Сентябрь",
+        "Октябрь",
+        "Ноябрь",
+        "Декабрь",
+    )
+    month_index = max(1, min(month, 12)) - 1
+    return months[month_index]
 
 
 def _traffic_delta(current: int, anchor: dict[str, int | str], field: str) -> int:
@@ -1316,7 +1358,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         caption = (
-            "🗓️ <b>Трафик по дням (текущий месяц)</b>\n"
+            f"🗓️ <b>{_month_name_ru(now.month)} {now.year}</b>\n"
             f"Сумма: ⇣ <b>{fmt_bytes(sum(int(item['downloaded']) for item in day_points))}</b> "
             f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in day_points))}</b>"
         )
