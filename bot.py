@@ -989,6 +989,7 @@ def _daily_totals_current_month(
         result.append(
             {
                 "date": date_value.strftime("%d.%m"),
+                "day": day,
                 "downloaded": int(totals["downloaded"]) if totals else 0,
                 "uploaded": int(totals["uploaded"]) if totals else 0,
             }
@@ -1013,7 +1014,7 @@ def _build_traffic_chart_current_month(
     except ImportError:
         return None, None, "Графики недоступны: установите optional-зависимость matplotlib."
 
-    labels = [str(item["date"]) for item in points]
+    labels = [str(item["day"]) for item in points]
     down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
     up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
 
@@ -1027,7 +1028,7 @@ def _build_traffic_chart_current_month(
             labels=labels,
             down_values=down_values,
             up_values=up_values,
-            title="Трафик по дням (текущий месяц)",
+            title=month_title,
             y_label="GiB / день",
         )
         fig.tight_layout(rect=(0, 0, 1, 0.95))
@@ -1041,7 +1042,7 @@ def _build_traffic_chart_current_month(
 
 
 def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, history: list[dict[str, int | str]]) -> str:
-    lines = ["🗓️ <b>Трафик по дням (текущий месяц)</b>"]
+    lines = [f"🗓️ <b>{_month_name_ru(now.month)} {now.year}</b>"]
     points = _daily_totals_current_month(now, downloaded, uploaded, history)
 
     for day in points:
@@ -1349,7 +1350,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         caption = (
-            "🗓️ <b>Трафик по дням (текущий месяц)</b>\n"
+            f"🗓️ <b>{_month_name_ru(now.month)} {now.year}</b>\n"
             f"Сумма: ⇣ <b>{fmt_bytes(sum(int(item['downloaded']) for item in day_points))}</b> "
             f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in day_points))}</b>"
         )
