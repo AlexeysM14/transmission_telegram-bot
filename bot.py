@@ -284,6 +284,7 @@ TRAFFIC_LAST_SNAPSHOT_DAY_KEY = "traffic_last_snapshot_day"
 NOTIFY_POLL_INTERVAL_SEC = 60
 NOTIFY_NO_PEERS_DELAY_SEC = 10 * 60
 TRAFFIC_ANCHORS_PATH = Path(__file__).resolve().with_name("traffic_anchors.json")
+TRAFFIC_STATE_LOCK = asyncio.Lock()
 ACTIVE_STATUSES = frozenset(
     {
         "downloading",
@@ -818,6 +819,25 @@ def _ensure_daily_traffic_history(
     return True
 
 
+async def update_traffic_state(
+    now: datetime,
+    downloaded: int,
+    uploaded: int,
+) -> tuple[dict[str, dict[str, int | str]], list[dict[str, int | str]]]:
+    async with TRAFFIC_STATE_LOCK:
+        anchors, history = _read_traffic_state()
+        anchors_changed = _ensure_traffic_anchors(anchors, now, downloaded, uploaded)
+        history_changed = _ensure_daily_traffic_history(history, now, downloaded, uploaded)
+        if anchors_changed or history_changed:
+            try:
+                _persist_traffic_state(anchors, history)
+            except OSError:
+                log.warning("Failed to persist traffic state", exc_info=True)
+            else:
+                period_key = _period_keys(now)["day"]
+                log.debug("Traffic state persisted: period_key=%s history_size=%d", period_key, len(history))
+        return anchors, history
+
 def _weekday_short_ru(date_value: datetime) -> str:
     labels = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
     return labels[date_value.weekday()]
@@ -1212,14 +1232,7 @@ async def send_traffic_stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
     downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
     uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
 
-    anchors, history = _read_traffic_state()
-    anchors_changed = _ensure_traffic_anchors(anchors, now, downloaded, uploaded)
-    history_changed = _ensure_daily_traffic_history(history, now, downloaded, uploaded)
-    if anchors_changed or history_changed:
-        try:
-            _persist_traffic_state(anchors, history)
-        except OSError:
-            log.warning("Failed to persist traffic state", exc_info=True)
+    anchors, history = await update_traffic_state(now, downloaded, uploaded)
 
     text = _build_traffic_stats_text(now, downloaded, uploaded, anchors, history)
     await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
@@ -1320,14 +1333,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now()
     downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
     uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
-    anchors, history = _read_traffic_state()
-    anchors_changed = _ensure_traffic_anchors(anchors, now, downloaded, uploaded)
-    history_changed = _ensure_daily_traffic_history(history, now, downloaded, uploaded)
-    if anchors_changed or history_changed:
-        try:
-            _persist_traffic_state(anchors, history)
-        except OSError:
-            log.warning("Failed to persist traffic state", exc_info=True)
+    anchors, history = await update_traffic_state(now, downloaded, uploaded)
 
     if mode == "refresh":
         text = _build_traffic_stats_text(now, downloaded, uploaded, anchors, history)
@@ -1981,14 +1987,7 @@ def main() -> None:
 
         downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
         uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
-        anchors, history = _read_traffic_state()
-        anchors_changed = _ensure_traffic_anchors(anchors, now, downloaded, uploaded)
-        history_changed = _ensure_daily_traffic_history(history, now, downloaded, uploaded)
-        if anchors_changed or history_changed:
-            try:
-                _persist_traffic_state(anchors, history)
-            except OSError:
-                log.warning("Failed to persist traffic state", exc_info=True)
+        await update_traffic_state(now, downloaded, uploaded)
         ctx.application.bot_data[TRAFFIC_LAST_SNAPSHOT_DAY_KEY] = day_key
 
     async def notify_completed_torrents_fallback(app: Application) -> None:
