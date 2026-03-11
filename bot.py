@@ -1042,7 +1042,6 @@ def _build_traffic_chart_current_month(
 
     fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
     try:
-        fig.suptitle(month_title, fontsize=13, weight="bold", y=0.98)
         _draw_traffic_chart(
             ax=ax,
             labels=labels,
@@ -1051,7 +1050,7 @@ def _build_traffic_chart_current_month(
             title=month_title,
             y_label="GiB / день",
         )
-        fig.tight_layout(rect=(0, 0, 1, 0.95))
+        fig.tight_layout()
         image_buffer = io.BytesIO()
         fig.savefig(image_buffer, format="png")
         image_buffer.seek(0)
@@ -1143,15 +1142,11 @@ def _draw_traffic_chart(
     ax.set_title(title, fontsize=12, weight="bold", pad=12)
     ax.set_ylabel(y_label)
 
-    tick_step = max(1, len(labels) // 10)
-    tick_indexes = list(range(0, len(labels), tick_step))
-    if tick_indexes[-1] != len(labels) - 1:
-        tick_indexes.append(len(labels) - 1)
+    tick_indexes = list(range(len(labels)))
     ax.set_xticks(tick_indexes)
     ax.set_xticklabels([labels[idx] for idx in tick_indexes])
 
-    x_rotation = 45 if len(labels) > 10 else 0
-    ax.tick_params(axis="x", rotation=x_rotation, labelsize=9)
+    ax.tick_params(axis="x", rotation=0, labelsize=9)
     ax.tick_params(axis="y", labelsize=9)
     ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.55)
     ax.grid(False, axis="x")
