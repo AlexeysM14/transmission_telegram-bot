@@ -1017,8 +1017,11 @@ def _build_traffic_chart_current_month(
     down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
     up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
 
+    month_title = f"{_month_name_ru(now.month)} {now.year}"
+
     fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
     try:
+        fig.suptitle(month_title, fontsize=13, weight="bold", y=0.98)
         _draw_traffic_chart(
             ax=ax,
             labels=labels,
@@ -1027,7 +1030,7 @@ def _build_traffic_chart_current_month(
             title="Трафик по дням (текущий месяц)",
             y_label="GiB / день",
         )
-        fig.tight_layout()
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
         image_buffer = io.BytesIO()
         fig.savefig(image_buffer, format="png")
         image_buffer.seek(0)
@@ -1069,8 +1072,10 @@ def _draw_traffic_chart(
     ax.spines["left"].set_color("#CAD7E6")
     ax.spines["bottom"].set_color("#CAD7E6")
 
+    x_values = list(range(len(labels)))
+
     ax.plot(
-        labels,
+        x_values,
         down_values,
         marker="o",
         linewidth=2.3,
@@ -1079,7 +1084,7 @@ def _draw_traffic_chart(
         label="Скачано",
     )
     ax.plot(
-        labels,
+        x_values,
         up_values,
         marker="o",
         linewidth=2.3,
@@ -1088,8 +1093,8 @@ def _draw_traffic_chart(
         label="Отдано",
     )
 
-    ax.fill_between(labels, down_values, alpha=0.16, color=down_color)
-    ax.fill_between(labels, up_values, alpha=0.16, color=up_color)
+    ax.fill_between(x_values, down_values, alpha=0.16, color=down_color)
+    ax.fill_between(x_values, up_values, alpha=0.16, color=up_color)
 
     points_to_annotate = min(len(labels), max(annotate_last_points, 0))
     for offset in range(points_to_annotate):
@@ -1097,7 +1102,7 @@ def _draw_traffic_chart(
         x_shift = 8
         ax.annotate(
             f"{down_values[point_idx]:.2f}",
-            xy=(labels[point_idx], down_values[point_idx]),
+            xy=(x_values[point_idx], down_values[point_idx]),
             xytext=(x_shift, 8),
             textcoords="offset points",
             color=down_color,
@@ -1106,7 +1111,7 @@ def _draw_traffic_chart(
         )
         ax.annotate(
             f"{up_values[point_idx]:.2f}",
-            xy=(labels[point_idx], up_values[point_idx]),
+            xy=(x_values[point_idx], up_values[point_idx]),
             xytext=(x_shift, -12),
             textcoords="offset points",
             color=up_color,
@@ -1116,11 +1121,39 @@ def _draw_traffic_chart(
 
     ax.set_title(title, fontsize=12, weight="bold", pad=12)
     ax.set_ylabel(y_label)
-    ax.tick_params(axis="x", rotation=0, labelsize=9)
+
+    tick_step = max(1, len(labels) // 10)
+    tick_indexes = list(range(0, len(labels), tick_step))
+    if tick_indexes[-1] != len(labels) - 1:
+        tick_indexes.append(len(labels) - 1)
+    ax.set_xticks(tick_indexes)
+    ax.set_xticklabels([labels[idx] for idx in tick_indexes])
+
+    x_rotation = 45 if len(labels) > 10 else 0
+    ax.tick_params(axis="x", rotation=x_rotation, labelsize=9)
     ax.tick_params(axis="y", labelsize=9)
     ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.55)
     ax.grid(False, axis="x")
     ax.legend(loc="upper left", frameon=False)
+
+
+def _month_name_ru(month: int) -> str:
+    months = (
+        "Январь",
+        "Февраль",
+        "Март",
+        "Апрель",
+        "Май",
+        "Июнь",
+        "Июль",
+        "Август",
+        "Сентябрь",
+        "Октябрь",
+        "Ноябрь",
+        "Декабрь",
+    )
+    month_index = max(1, min(month, 12)) - 1
+    return months[month_index]
 
 
 def _traffic_delta(current: int, anchor: dict[str, int | str], field: str) -> int:
