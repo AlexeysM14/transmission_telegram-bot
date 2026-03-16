@@ -1336,13 +1336,19 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     if mode == "4w":
-        day_points, chart_payload, chart_error = await asyncio.to_thread(
-            _build_traffic_chart_current_month,
-            now,
-            downloaded,
-            uploaded,
-            history,
-        )
+        try:
+            day_points, chart_payload, chart_error = await asyncio.to_thread(
+                _build_traffic_chart_current_month,
+                now,
+                downloaded,
+                uploaded,
+                history,
+            )
+        except Exception:
+            log.exception("Failed to build monthly traffic chart")
+            await _edit_traffic_message(query, "❌ Не удалось построить график за месяц. Попробуйте позже.")
+            return
+
         if chart_payload is None or day_points is None:
             text = _build_last_4_weeks_text(now, downloaded, uploaded, history)
             if chart_error:
@@ -1361,17 +1367,29 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         image_file = InputFile(io.BytesIO(chart_payload), filename="traffic_month.png")
-        await query.message.reply_photo(
-            photo=image_file,
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            reply_markup=TRAFFIC_OVERVIEW_KEYBOARD,
-        )
+        try:
+            await query.message.reply_photo(
+                photo=image_file,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=TRAFFIC_OVERVIEW_KEYBOARD,
+            )
+        except TelegramError:
+            log.exception("Failed to send monthly traffic chart")
+            await _edit_traffic_message(query, "❌ Не удалось отправить график за месяц. Попробуйте позже.")
+            return
+
         await query.answer("График отправлен")
         return
 
     chart_points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
-    chart_payload, chart_error = await asyncio.to_thread(_build_traffic_chart_last_7_days, now, downloaded, uploaded, history)
+    try:
+        chart_payload, chart_error = await asyncio.to_thread(_build_traffic_chart_last_7_days, now, downloaded, uploaded, history)
+    except Exception:
+        log.exception("Failed to build 7-day traffic chart")
+        await _edit_traffic_message(query, "❌ Не удалось построить график за 7 дней. Попробуйте позже.")
+        return
+
     if chart_payload is None:
         text = _build_last_7_days_text(now, downloaded, uploaded, history)
         if chart_error:
@@ -1390,7 +1408,18 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     image_file = InputFile(io.BytesIO(chart_payload), filename="traffic_7d.png")
-    await query.message.reply_photo(photo=image_file, caption=caption, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
+    try:
+        await query.message.reply_photo(
+            photo=image_file,
+            caption=caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=TRAFFIC_OVERVIEW_KEYBOARD,
+        )
+    except TelegramError:
+        log.exception("Failed to send 7-day traffic chart")
+        await _edit_traffic_message(query, "❌ Не удалось отправить график за 7 дней. Попробуйте позже.")
+        return
+
     await query.answer("График отправлен")
 
 
