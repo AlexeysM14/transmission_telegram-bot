@@ -1,4 +1,4 @@
-python-telegram-bot[job-queue]>=20,<22
+python-telegram-bot[job-queue,socks]>=20,<22
 transmission-rpc>=7,<8
 
 # Optional dependency for traffic charts (7 days image in Telegram)

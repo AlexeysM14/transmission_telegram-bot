@@ -65,11 +65,19 @@ def restart_bot_service() -> None:
     print(f"✅ Service '{SERVICE_NAME}' restarted.")
 
 
-def set_env_key(key: str, prompt: str) -> None:
+def set_env_key(key: str, prompt: str, *, allow_empty_delete: bool = False) -> None:
     data = load_env()
     value = input(prompt).strip()
     if not value:
-        print("⚠️ Empty value, nothing changed")
+        if not allow_empty_delete:
+            print("⚠️ Empty value, nothing changed")
+            return
+        if key in data:
+            data.pop(key, None)
+            save_env(data)
+            print(f"✅ Removed {key} from {ENV_FILE}")
+        else:
+            print(f"⚠️ {key} is not set, nothing changed")
         return
     data[key] = value
     save_env(data)
@@ -104,9 +112,11 @@ def menu() -> None:
             "1) Download updates from GitHub\n"
             "2) Set Telegram bot token (TG_TOKEN)\n"
             "3) Set Telegram allowed user id(s) (ALLOWED_USER_IDS)\n"
-            "4) Set Transmission RPC URL (TR_URL, example: http://127.0.0.1:9091/transmission/rpc)\n"
-            "5) Restart bot service\n"
-            "6) Show last 10 lines from bot error log (показать последние 10 строк логов)\n"
+            "4) Set Telegram proxy URL (TG_PROXY, example: http://127.0.0.1:8080)\n"
+            "5) Set Telegram getUpdates proxy URL (TG_GET_UPDATES_PROXY, optional)\n"
+            "6) Set Transmission RPC URL (TR_URL, example: http://127.0.0.1:9091/transmission/rpc)\n"
+            "7) Restart bot service\n"
+            "8) Show last 10 lines from bot error log (показать последние 10 строк логов)\n"
             "0) Exit\n"
         )
 
@@ -118,15 +128,32 @@ def menu() -> None:
             elif choice == "2":
                 set_env_key("TG_TOKEN", "Enter Telegram token: ")
             elif choice == "3":
-                set_env_key("ALLOWED_USER_IDS", "Enter user id(s), comma-separated: ")
+                set_env_key(
+                    "ALLOWED_USER_IDS",
+                    "Enter user id(s), comma-separated (leave empty to remove restriction): ",
+                    allow_empty_delete=True,
+                )
             elif choice == "4":
                 set_env_key(
-                    "TR_URL",
-                    "Enter Transmission RPC URL (for example: http://127.0.0.1:9091/transmission/rpc): ",
+                    "TG_PROXY",
+                    "Enter Telegram proxy URL (leave empty to disable proxy): ",
+                    allow_empty_delete=True,
                 )
             elif choice == "5":
-                restart_bot_service()
+                set_env_key(
+                    "TG_GET_UPDATES_PROXY",
+                    "Enter Telegram getUpdates proxy URL (leave empty to reuse TG_PROXY): ",
+                    allow_empty_delete=True,
+                )
             elif choice == "6":
+                set_env_key(
+                    "TR_URL",
+                    "Enter Transmission RPC URL (leave empty to use TR_PROTOCOL/TR_HOST/TR_PORT/TR_PATH): ",
+                    allow_empty_delete=True,
+                )
+            elif choice == "7":
+                restart_bot_service()
+            elif choice == "8":
                 print_last_log_lines(lines=10)
             elif choice == "0":
                 print("Bye")

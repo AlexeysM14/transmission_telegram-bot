@@ -34,6 +34,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from transmission_rpc import Client, from_url
 from transmission_rpc.error import TransmissionError
@@ -108,6 +109,8 @@ class TRCallError(Exception):
 class Config:
     tg_token: str
     allowed_user_ids: Optional[set[int]]
+    tg_proxy: Optional[str]
+    tg_get_updates_proxy: Optional[str]
 
     tr_url: Optional[str]
     tr_protocol: str
@@ -190,6 +193,8 @@ def load_config() -> Config:
     return Config(
         tg_token=tg_token,
         allowed_user_ids=_parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", "")),
+        tg_proxy=os.environ.get("TG_PROXY", "").strip() or None,
+        tg_get_updates_proxy=os.environ.get("TG_GET_UPDATES_PROXY", "").strip() or None,
         tr_url=os.environ.get("TR_URL", "").strip() or None,
         tr_protocol=tr_protocol,
         tr_host=os.environ.get("TR_HOST", "127.0.0.1").strip(),
@@ -423,6 +428,45 @@ async def tr_call(fn: Callable[[Client], Any]) -> Any:
             raise TRCallError("Transmission RPC connection failed") from exc
 
     return await asyncio.to_thread(_call)
+
+
+def build_telegram_application(
+    *,
+    post_init: Callable[[Application], Awaitable[None]],
+    post_shutdown: Callable[[Application], Awaitable[None]],
+) -> Application:
+    builder = (
+        ApplicationBuilder()
+        .token(CFG.tg_token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+    )
+
+    tg_proxy = CFG.tg_proxy
+    tg_get_updates_proxy = CFG.tg_get_updates_proxy or tg_proxy
+
+    if not tg_proxy and not tg_get_updates_proxy:
+        log.info("Telegram proxy is not configured; using direct connection")
+        return builder.build()
+
+    if hasattr(builder, "proxy") and hasattr(builder, "get_updates_proxy"):
+        if tg_proxy:
+            builder = builder.proxy(tg_proxy)
+        if tg_get_updates_proxy:
+            builder = builder.get_updates_proxy(tg_get_updates_proxy)
+    else:
+        if tg_proxy:
+            builder = builder.request(HTTPXRequest(proxy_url=tg_proxy))
+        if tg_get_updates_proxy:
+            builder = builder.get_updates_request(HTTPXRequest(proxy_url=tg_get_updates_proxy))
+
+    log.info(
+        "Telegram proxy enabled (bot=%s, get_updates=%s)",
+        tg_proxy or "direct",
+        tg_get_updates_proxy or "direct",
+    )
+
+    return builder.build()
 
 
 def _chunk_text(text: str, *, max_len: int) -> list[str]:
@@ -2036,13 +2080,7 @@ def main() -> None:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    app: Application = (
-        ApplicationBuilder()
-        .token(CFG.tg_token)
-        .post_init(on_post_init)
-        .post_shutdown(on_post_shutdown)
-        .build()
-    )
+    app = build_telegram_application(post_init=on_post_init, post_shutdown=on_post_shutdown)
 
     if app.job_queue is None:
         log.info("Job queue is unavailable; fallback polling task will be used.")
