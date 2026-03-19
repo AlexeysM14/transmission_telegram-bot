@@ -2003,6 +2003,23 @@ def main() -> None:
             downloaded_ever = float(max(0.0, getattr(torrent, "downloaded_ever", 0.0)))
             percent_done = float(max(0.0, getattr(torrent, "percent_done", 0.0)))
             if downloaded_ever > 0.0 or percent_done > 0.0:
+                chat_ids = state.get("chat_ids")
+                if isinstance(chat_ids, set) and chat_ids:
+                    safe_name = html.escape(str(state.get("name") or getattr(torrent, "name", "<без названия>")))
+                    text = (
+                        "▶️ <b>Скачивание началось</b>\n"
+                        f"Торрент: <b>{safe_name}</b>\n"
+                        f"ID: <b>{torrent_id}</b>"
+                    )
+
+                    for chat_id in list(chat_ids):
+                        if chat_id not in enabled_chats:
+                            continue
+                        try:
+                            await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+                        except TelegramError:
+                            log.warning("Failed to send start notification to chat %s", chat_id, exc_info=True)
+
                 expired_ids.append(torrent_id)
                 continue
 
