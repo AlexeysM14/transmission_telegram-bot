@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
+import json
 import os
+import socket
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 SERVICE_NAME = "transmission3-bot"
+TELEGRAM_API_BASE = "https://api.telegram.org"
 
 
 def run(cmd: list[str], *, check: bool = True) -> int:
@@ -17,6 +26,11 @@ def run(cmd: list[str], *, check: bool = True) -> int:
     if check and proc.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
     return proc.returncode
+
+
+def run_capture(cmd: list[str]) -> tuple[int, str, str]:
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
 def load_env() -> dict[str, str]:
@@ -105,6 +119,239 @@ def print_last_log_lines(*, lines: int = 10) -> None:
         print(row)
 
 
+def mask_proxy_url(raw_url: Optional[str]) -> str:
+    if not raw_url:
+        return "direct"
+
+    parts = urlsplit(raw_url)
+    if "@" not in parts.netloc:
+        return raw_url
+
+    _, _, hostinfo = parts.netloc.rpartition("@")
+    return urlunsplit((parts.scheme, f"***:***@{hostinfo}", parts.path, parts.query, parts.fragment))
+
+
+def format_bool(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def format_dt(value: float) -> str:
+    return datetime.fromtimestamp(value, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def build_proxy_handler(proxy_url: Optional[str]) -> ProxyHandler:
+    if not proxy_url:
+        return ProxyHandler({})
+    return ProxyHandler({"http": proxy_url, "https": proxy_url})
+
+
+def open_url(url: str, *, proxy_url: Optional[str], timeout: float, headers: Optional[dict[str, str]] = None, data: bytes | None = None) -> bytes:
+    opener = build_opener(build_proxy_handler(proxy_url))
+    request = Request(url, data=data, headers=headers or {})
+    with opener.open(request, timeout=timeout) as response:
+        return response.read()
+
+
+def parse_timeout(raw: str) -> float:
+    try:
+        timeout = float((raw or "10").strip())
+    except ValueError:
+        return 10.0
+    return timeout if timeout > 0 else 10.0
+
+
+def build_transmission_url(env: dict[str, str]) -> str:
+    explicit = env.get("TR_URL", "").strip()
+    if explicit:
+        return explicit
+
+    protocol = env.get("TR_PROTOCOL", "http").strip() or "http"
+    host = env.get("TR_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = env.get("TR_PORT", "9091").strip() or "9091"
+    path = env.get("TR_PATH", "/transmission/rpc").strip() or "/transmission/rpc"
+    if not path.startswith("/"):
+        path = f"/{path}"
+    return f"{protocol}://{host}:{port}{path}"
+
+
+def build_basic_auth(user: Optional[str], password: Optional[str]) -> Optional[str]:
+    if not user:
+        return None
+    token = base64.b64encode(f"{user}:{password or ''}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+def check_transmission_rpc(env: dict[str, str]) -> tuple[bool, str]:
+    url = build_transmission_url(env)
+    timeout = parse_timeout(env.get("TR_TIMEOUT", "10"))
+    headers = {"Content-Type": "application/json"}
+    auth = build_basic_auth(env.get("TR_USER"), env.get("TR_PASS"))
+    if auth:
+        headers["Authorization"] = auth
+
+    payload = json.dumps({"method": "session-stats"}).encode("utf-8")
+    try:
+        open_url(url, proxy_url=None, timeout=timeout, headers=headers, data=payload)
+    except HTTPError as exc:
+        if exc.code != 409:
+            return False, f"error: HTTP {exc.code}"
+        session_id = exc.headers.get("X-Transmission-Session-Id", "").strip()
+        if not session_id:
+            return False, "error: missing X-Transmission-Session-Id"
+        headers["X-Transmission-Session-Id"] = session_id
+        try:
+            response = open_url(url, proxy_url=None, timeout=timeout, headers=headers, data=payload)
+        except HTTPError as retry_exc:
+            return False, f"error: HTTP {retry_exc.code}"
+        except URLError as retry_exc:
+            return False, f"error: {retry_exc.reason}"
+    except URLError as exc:
+        return False, f"error: {exc.reason}"
+    except OSError as exc:
+        return False, f"error: {exc}"
+    else:
+        return False, "error: unexpected response without session handshake"
+
+    try:
+        body = json.loads(response.decode("utf-8"))
+        arguments = body.get("arguments", {})
+        active = arguments.get("activeTorrentCount", 0)
+        paused = arguments.get("pausedTorrentCount", 0)
+        total = arguments.get("torrentCount", 0)
+        down = arguments.get("downloadSpeed", 0)
+        up = arguments.get("uploadSpeed", 0)
+        return True, f"ok: torrents={total}, active={active}, paused={paused}, down={down} B/s, up={up} B/s"
+    except (ValueError, TypeError, AttributeError) as exc:
+        return False, f"error: invalid JSON response ({exc})"
+
+
+def check_telegram_api(token: str, *, proxy_url: Optional[str], timeout: float, label: str) -> tuple[bool, str]:
+    target = f"{TELEGRAM_API_BASE}/bot{token}/getMe"
+    try:
+        body = open_url(target, proxy_url=proxy_url, timeout=timeout)
+        payload = json.loads(body.decode("utf-8"))
+    except HTTPError as exc:
+        return False, f"{label}: HTTP {exc.code}"
+    except URLError as exc:
+        return False, f"{label}: {exc.reason}"
+    except OSError as exc:
+        return False, f"{label}: {exc}"
+    except ValueError as exc:
+        return False, f"{label}: invalid JSON ({exc})"
+
+    if not payload.get("ok"):
+        description = str(payload.get("description", "unknown error"))
+        return False, f"{label}: API error: {description}"
+
+    result = payload.get("result") or {}
+    username = result.get("username") or "unknown"
+    return True, f"{label}: ok (@{username})"
+
+
+def check_tcp_target(raw_url: str, *, timeout: float, label: str) -> tuple[bool, str]:
+    parts = urlsplit(raw_url)
+    host = parts.hostname
+    port = parts.port
+    if not host or port is None:
+        return False, f"{label}: invalid URL"
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, f"{label}: tcp ok ({host}:{port})"
+    except OSError as exc:
+        return False, f"{label}: tcp error: {exc}"
+
+
+def print_status() -> int:
+    env = load_env()
+    timeout = parse_timeout(env.get("TR_TIMEOUT", "10"))
+    tg_token = env.get("TG_TOKEN", "").strip()
+    tg_proxy = env.get("TG_PROXY", "").strip() or None
+    tg_updates_proxy = env.get("TG_GET_UPDATES_PROXY", "").strip() or None
+    effective_updates_proxy = tg_updates_proxy or tg_proxy
+    log_file = get_log_file_path()
+    venv_python = ROOT / ".venv" / "bin" / "python"
+
+    print("=== transmission3-bot status ===")
+    print(f"root: {ROOT}")
+    print(f"env file: {ENV_FILE} ({'present' if ENV_FILE.exists() else 'missing'})")
+    print(f"venv python: {venv_python} ({'present' if venv_python.exists() else 'missing'})")
+    print(f"log file: {log_file} ({'present' if log_file.exists() else 'missing'})")
+    if log_file.exists():
+        stat = log_file.stat()
+        print(f"  size: {stat.st_size} bytes")
+        print(f"  modified: {format_dt(stat.st_mtime)}")
+
+    print("\n[configuration]")
+    print(f"TG_TOKEN configured: {format_bool(bool(tg_token))}")
+    print(f"TG_PROXY: {mask_proxy_url(tg_proxy)}")
+    print(f"TG_GET_UPDATES_PROXY: {mask_proxy_url(tg_updates_proxy)}")
+    print(f"effective getUpdates proxy: {mask_proxy_url(effective_updates_proxy)}")
+    print(f"Transmission RPC URL: {build_transmission_url(env)}")
+    print(f"TR_TIMEOUT: {timeout:g}s")
+
+    print("\n[systemd]")
+    service_ok = True
+    for field, command in (
+        ("active", ["systemctl", "is-active", SERVICE_NAME]),
+        ("enabled", ["systemctl", "is-enabled", SERVICE_NAME]),
+    ):
+        code, out, err = run_capture(command)
+        value = out or err or f"exit {code}"
+        print(f"{field}: {value}")
+        if code != 0 and field == "active":
+            service_ok = False
+
+    code, out, err = run_capture(["systemctl", "show", SERVICE_NAME, "--property=MainPID,ExecMainStatus,ExecMainStartTimestamp,FragmentPath"])
+    if code == 0:
+        for line in out.splitlines():
+            if line:
+                print(line)
+    else:
+        print(f"details: {err or out or f'exit {code}'}")
+        service_ok = False
+
+    print("\n[checks]")
+    overall_ok = service_ok
+
+    tr_ok, tr_message = check_transmission_rpc(env)
+    print(f"Transmission RPC: {tr_message}")
+    overall_ok = overall_ok and tr_ok
+
+    if tg_proxy:
+        tcp_ok, tcp_message = check_tcp_target(tg_proxy, timeout=timeout, label="TG_PROXY")
+        print(f"Proxy socket: {tcp_message}")
+        overall_ok = overall_ok and tcp_ok
+    else:
+        print("Proxy socket: TG_PROXY not configured (direct connection)")
+
+    if tg_updates_proxy and tg_updates_proxy != tg_proxy:
+        upd_tcp_ok, upd_tcp_message = check_tcp_target(tg_updates_proxy, timeout=timeout, label="TG_GET_UPDATES_PROXY")
+        print(f"Updates proxy socket: {upd_tcp_message}")
+        overall_ok = overall_ok and upd_tcp_ok
+
+    if tg_token:
+        bot_ok, bot_message = check_telegram_api(tg_token, proxy_url=tg_proxy, timeout=timeout, label="Telegram Bot API")
+        print(bot_message)
+        overall_ok = overall_ok and bot_ok
+
+        if effective_updates_proxy != tg_proxy:
+            upd_ok, upd_message = check_telegram_api(
+                tg_token,
+                proxy_url=effective_updates_proxy,
+                timeout=timeout,
+                label="Telegram getUpdates path",
+            )
+            print(upd_message)
+            overall_ok = overall_ok and upd_ok
+    else:
+        print("Telegram Bot API: skipped (TG_TOKEN is not configured)")
+
+    print("\n[result]")
+    print("overall status: OK" if overall_ok else "overall status: NEEDS ATTENTION")
+    return 0 if overall_ok else 1
+
+
 def menu() -> None:
     while True:
         print(
@@ -168,8 +415,10 @@ def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "update":
         menu()
         return 0
+    if len(sys.argv) == 2 and sys.argv[1] == "status":
+        return print_status()
 
-    print("Usage: transmission3-bot update")
+    print("Usage: transmission3-bot update|status")
     return 1
 
 
