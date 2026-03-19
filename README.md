@@ -30,6 +30,12 @@ sudo bash install.sh
 transmission3-bot update
 ```
 
+Проверить текущее состояние сервиса, прокси и ключевых интеграций можно командой:
+
+```bash
+transmission3-bot status
+```
+
 В меню доступны пункты:
 - `1` — скачать обновления бота из GitHub (`git pull` + обновление зависимостей);
 - `2` — задать токен Telegram-бота (`TG_TOKEN`);
@@ -39,6 +45,13 @@ transmission3-bot update
 - `6` — задать URL Transmission RPC (`TR_URL`, например: `http://127.0.0.1:9091/transmission/rpc`);
 - `7` — перезапустить systemd-сервис бота (`transmission3-bot`);
 - `8` — вывести последние 10 строк файла логов ошибок бота.
+
+Команда `transmission3-bot status` дополнительно показывает:
+- активен ли systemd-сервис `transmission3-bot`;
+- настроены ли `TG_PROXY` и `TG_GET_UPDATES_PROXY`;
+- доступен ли Telegram Bot API через указанный прокси;
+- доступен ли Transmission RPC и сколько сейчас активных/остановленных торрентов;
+- где находится файл логов и когда он обновлялся в последний раз.
 
 5) После настройки запустите сервис:
 
