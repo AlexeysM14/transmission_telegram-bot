@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import threading
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
@@ -175,6 +176,29 @@ def _parse_float_env(name: str, default: str, *, min_exclusive: float = 0.0) -> 
     if value <= min_exclusive:
         raise RuntimeError(f"{name} must be > {min_exclusive:g}")
     return value
+
+
+def _normalize_proxy_url(raw_url: Optional[str], *, env_name: str) -> Optional[str]:
+    if not raw_url:
+        return None
+
+    parts = urlsplit(raw_url)
+    if not parts.scheme or not parts.netloc:
+        raise RuntimeError(f"{env_name} must be a valid proxy URL")
+
+    return raw_url
+
+
+def _mask_proxy_url(raw_url: Optional[str]) -> str:
+    if not raw_url:
+        return "direct"
+
+    parts = urlsplit(raw_url)
+    if "@" not in parts.netloc:
+        return raw_url
+
+    _, _, hostinfo = parts.netloc.rpartition("@")
+    return urlunsplit((parts.scheme, f"***:***@{hostinfo}", parts.path, parts.query, parts.fragment))
 
 
 def load_config() -> Config:
@@ -442,8 +466,8 @@ def build_telegram_application(
         .post_shutdown(post_shutdown)
     )
 
-    tg_proxy = CFG.tg_proxy
-    tg_get_updates_proxy = CFG.tg_get_updates_proxy or tg_proxy
+    tg_proxy = _normalize_proxy_url(CFG.tg_proxy, env_name="TG_PROXY")
+    tg_get_updates_proxy = _normalize_proxy_url(CFG.tg_get_updates_proxy, env_name="TG_GET_UPDATES_PROXY") or tg_proxy
 
     if not tg_proxy and not tg_get_updates_proxy:
         log.info("Telegram proxy is not configured; using direct connection")
@@ -462,8 +486,8 @@ def build_telegram_application(
 
     log.info(
         "Telegram proxy enabled (bot=%s, get_updates=%s)",
-        tg_proxy or "direct",
-        tg_get_updates_proxy or "direct",
+        _mask_proxy_url(tg_proxy),
+        _mask_proxy_url(tg_get_updates_proxy),
     )
 
     return builder.build()

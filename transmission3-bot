@@ -112,7 +112,7 @@ def menu() -> None:
             "1) Download updates from GitHub\n"
             "2) Set Telegram bot token (TG_TOKEN)\n"
             "3) Set Telegram allowed user id(s) (ALLOWED_USER_IDS)\n"
-            "4) Set Telegram proxy URL (TG_PROXY, example: http://127.0.0.1:8080)\n"
+            "4) Set Telegram proxy URL (TG_PROXY, example: http://login:password@127.0.0.1:8080)\n"
             "5) Set Telegram getUpdates proxy URL (TG_GET_UPDATES_PROXY, optional)\n"
             "6) Set Transmission RPC URL (TR_URL, example: http://127.0.0.1:9091/transmission/rpc)\n"
             "7) Restart bot service\n"
@@ -136,13 +136,13 @@ def menu() -> None:
             elif choice == "4":
                 set_env_key(
                     "TG_PROXY",
-                    "Enter Telegram proxy URL (leave empty to disable proxy): ",
+                    "Enter Telegram proxy URL (leave empty to disable proxy; use http://login:password@host:port if auth is required): ",
                     allow_empty_delete=True,
                 )
             elif choice == "5":
                 set_env_key(
                     "TG_GET_UPDATES_PROXY",
-                    "Enter Telegram getUpdates proxy URL (leave empty to reuse TG_PROXY): ",
+                    "Enter Telegram getUpdates proxy URL (leave empty to reuse TG_PROXY; use scheme://login:password@host:port if auth is required): ",
                     allow_empty_delete=True,
                 )
             elif choice == "6":
