@@ -61,15 +61,16 @@ pip install -r requirements.txt
 > pip install matplotlib
 > ```
 export TG_TOKEN="<telegram-bot-token>"
-export TG_PROXY="http://127.0.0.1:8080"
+export TG_PROXY="http://proxy-login:proxy-password@127.0.0.1:8080"
 # optional: separate proxy only for getUpdates long polling
-# export TG_GET_UPDATES_PROXY="socks5://127.0.0.1:1080"
+# export TG_GET_UPDATES_PROXY="socks5://proxy-login:proxy-password@127.0.0.1:1080"
 python bot.py
 ```
 
 Если `TG_PROXY` и `TG_GET_UPDATES_PROXY` не заданы, бот работает как раньше — напрямую, без прокси.
 
 Для SOCKS-прокси зависимость уже включена в `requirements.txt`, поэтому достаточно указать URL вида `socks5://host:port`.
+Если у прокси требуется авторизация, добавьте логин и пароль прямо в URL, например: `http://login:password@host:port` или `socks5://login:password@host:port`.
 
 ## Как получить токен Telegram
 
@@ -101,8 +102,8 @@ curl -s "https://api.telegram.org/bot<TG_TOKEN>/getUpdates"
 
 - `TG_TOKEN` — **обязательно**.
 - `ALLOWED_USER_IDS` — список Telegram user id через запятую.
-- `TG_PROXY` — **опционально**: прокси для всех запросов Telegram Bot API, например `http://127.0.0.1:8080` или `socks5://127.0.0.1:1080`.
-- `TG_GET_UPDATES_PROXY` — **опционально**: отдельный прокси только для long polling (`getUpdates`); если не указан, используется `TG_PROXY`, а если и он не задан — бот работает без прокси.
+- `TG_PROXY` — **опционально**: прокси для всех запросов Telegram Bot API, например `http://127.0.0.1:8080`, `socks5://127.0.0.1:1080` или `http://login:password@127.0.0.1:8080`.
+- `TG_GET_UPDATES_PROXY` — **опционально**: отдельный прокси только для long polling (`getUpdates`); если не указан, используется `TG_PROXY`, а если и он не задан — бот работает без прокси. Формат тот же, включая вариант с `login:password@`.
 - `TR_URL` — полный URL подключения к Transmission RPC в явном виде, например: `http://127.0.0.1:9091/transmission/rpc` (если указан, перекрывает host/port/path).
 - `TR_PROTOCOL` — `http` или `https` (по умолчанию `http`).
 - `TR_HOST` — хост Transmission (по умолчанию `127.0.0.1`).
