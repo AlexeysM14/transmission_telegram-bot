@@ -246,6 +246,7 @@ WAIT_CTRL_PAUSE = "WAIT_CTRL_PAUSE"
 WAIT_CTRL_START = "WAIT_CTRL_START"
 WAIT_CTRL_DEL_KEEP = "WAIT_CTRL_DEL_KEEP"
 WAIT_CTRL_DEL_DATA = "WAIT_CTRL_DEL_DATA"
+CONFIRM_DEL_KEEP_FLOW = os.environ.get("CONFIRM_DEL_KEEP", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def kb(rows: Sequence[Sequence[str]]) -> ReplyKeyboardMarkup:
@@ -302,7 +303,12 @@ KB_CTRL = kb_ctrl(True)
 STATUS_REFRESH_CB = "status_refresh"
 LIST_REFRESH_CB_PREFIX = "list_refresh:"
 TRAFFIC_VIEW_CB_PREFIX = "traffic_view:"
+CONFIRM_DEL_DATA_CB_PREFIX = "confirm_del_data:"
+CANCEL_DEL_DATA_CB = "cancel_del_data"
+CONFIRM_DEL_KEEP_CB_PREFIX = "confirm_del_keep:"
+CANCEL_DEL_KEEP_CB = "cancel_del_keep"
 LAST_EPHEMERAL_MESSAGE_KEY = "last_ephemeral_message_id"
+PENDING_CTRL_ACTION_KEY = "pending_ctrl_action"
 NOTIFY_ENABLED_CHATS_KEY = "notify_enabled_chat_ids"
 NOTIFY_KNOWN_CHATS_KEY = "notify_known_chat_ids"
 NOTIFY_COMPLETED_CACHE_KEY = "notify_completed_cache"
@@ -1675,6 +1681,102 @@ async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: st
     await reply_chunks(update, msg, reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
 
 
+def _build_delete_confirm_keyboard(action: str, torrent_id: int) -> InlineKeyboardMarkup:
+    if action == "del_data":
+        confirm_cb = f"{CONFIRM_DEL_DATA_CB_PREFIX}{torrent_id}"
+        cancel_cb = CANCEL_DEL_DATA_CB
+        confirm_label = "✅ Да, удалить с данными"
+    else:
+        confirm_cb = f"{CONFIRM_DEL_KEEP_CB_PREFIX}{torrent_id}"
+        cancel_cb = CANCEL_DEL_KEEP_CB
+        confirm_label = "✅ Да, удалить"
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(confirm_label, callback_data=confirm_cb)],
+            [InlineKeyboardButton("↩️ Отмена", callback_data=cancel_cb)],
+        ]
+    )
+
+
+def _build_delete_confirm_text(torrent: Any, *, with_data: bool) -> str:
+    title = "⚠️ Подтверждение удаления (с данными)" if with_data else "⚠️ Подтверждение удаления"
+    progress = float(getattr(torrent, "progress", 0.0))
+    return (
+        f"{title}\n\n"
+        f"ID: <b>{torrent.id}</b>\n"
+        f"Название: <b>{html.escape(torrent.name or '<без названия>')}</b>\n"
+        f"Размер: <b>{fmt_bytes(torrent_total_size(torrent))}</b>\n"
+        f"Прогресс: <b>{progress:.2f}%</b>"
+    )
+
+
+async def _request_delete_confirmation(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    action: str,
+    torrent_id: int,
+) -> None:
+    try:
+        torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
+    except (TransmissionError, TRCallError) as exc:
+        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
+        return
+
+    set_wait(ctx, WAIT_NONE)
+    set_menu(ctx, MENU_CTRL)
+    ctx.user_data[PENDING_CTRL_ACTION_KEY] = {"action": action, "torrent_id": torrent_id}
+
+    await reply_chunks(
+        update,
+        _build_delete_confirm_text(torrent, with_data=(action == "del_data")),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_build_delete_confirm_keyboard(action, torrent_id),
+    )
+
+
+async def on_delete_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    data = query.data or ""
+    pending = ctx.user_data.get(PENDING_CTRL_ACTION_KEY)
+    set_menu(ctx, MENU_CTRL)
+    set_wait(ctx, WAIT_NONE)
+
+    if data == CANCEL_DEL_DATA_CB or data == CANCEL_DEL_KEEP_CB:
+        ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
+        await query.answer("Отменено")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await reply_chunks(update, "Ок, удаление отменено.", reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
+        return
+
+    action = "del_data" if data.startswith(CONFIRM_DEL_DATA_CB_PREFIX) else "del_keep"
+    prefix = CONFIRM_DEL_DATA_CB_PREFIX if action == "del_data" else CONFIRM_DEL_KEEP_CB_PREFIX
+    id_part = data[len(prefix) :]
+    if not id_part.isdigit():
+        await query.answer("Некорректный ID", show_alert=True)
+        return
+
+    torrent_id = int(id_part)
+    if not isinstance(pending, dict):
+        await query.answer("Запрос подтверждения устарел", show_alert=True)
+        return
+
+    pending_action = pending.get("action")
+    pending_id = pending.get("torrent_id")
+    if pending_action != action or pending_id != torrent_id:
+        await query.answer("Запрос подтверждения устарел", show_alert=True)
+        return
+
+    ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
+    await query.answer("Выполняю…")
+    await query.edit_message_reply_markup(reply_markup=None)
+    await ctrl_action(update, ctx, action, torrent_id=torrent_id)
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat and update.effective_chat.type != "private":
         return
@@ -1750,6 +1852,14 @@ async def _handle_wait_state(update: Update, ctx: ContextTypes.DEFAULT_TYPE, wai
         torrent_id = parse_id(text)
         if torrent_id is None:
             await send_ephemeral(update, ctx, "Пришли числовой ID торрента (например: 12).", reply_markup=KB_CTRL)
+            return True
+
+        if wait == WAIT_CTRL_DEL_DATA:
+            await _request_delete_confirmation(update, ctx, action="del_data", torrent_id=torrent_id)
+            return True
+
+        if wait == WAIT_CTRL_DEL_KEEP and CONFIRM_DEL_KEEP_FLOW:
+            await _request_delete_confirmation(update, ctx, action="del_keep", torrent_id=torrent_id)
             return True
 
         set_wait(ctx, WAIT_NONE)
@@ -1877,10 +1987,12 @@ async def _handle_menu_command(
         await send_ephemeral(update, ctx, "Пришли ID торрента для запуска:", reply_markup=KB_CTRL)
 
     async def _ask_del_keep() -> None:
+        ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
         set_wait(ctx, WAIT_CTRL_DEL_KEEP)
         await send_ephemeral(update, ctx, "Пришли ID торрента для удаления (данные останутся на диске):", reply_markup=KB_CTRL)
 
     async def _ask_del_data() -> None:
+        ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
         set_wait(ctx, WAIT_CTRL_DEL_DATA)
         await send_ephemeral(update, ctx, "⚠️ Пришли ID торрента для удаления вместе с данными:", reply_markup=KB_CTRL)
 
@@ -2139,6 +2251,15 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
     app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|done)$"))
     app.add_handler(CallbackQueryHandler(on_traffic_view, pattern=f"^{TRAFFIC_VIEW_CB_PREFIX}(refresh|7d|4w)$"))
+    app.add_handler(
+        CallbackQueryHandler(
+            on_delete_confirmation,
+            pattern=(
+                f"^({CONFIRM_DEL_DATA_CB_PREFIX}\\d+|{CANCEL_DEL_DATA_CB}|"
+                f"{CONFIRM_DEL_KEEP_CB_PREFIX}\\d+|{CANCEL_DEL_KEEP_CB})$"
+            ),
+        )
+    )
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
