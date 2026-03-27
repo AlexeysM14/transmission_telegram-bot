@@ -100,6 +100,7 @@ TG_MAX_MESSAGE = 4096
 TORRENT_ID_RE = re.compile(r"\b(\d{1,9})\b")
 _TR_CLIENT: Optional[Client] = None
 _TR_CLIENT_LOCK = threading.Lock()
+SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
 class TRCallError(Exception):
@@ -183,8 +184,18 @@ def _normalize_proxy_url(raw_url: Optional[str], *, env_name: str) -> Optional[s
         return None
 
     parts = urlsplit(raw_url)
-    if not parts.scheme or not parts.netloc:
+    scheme = parts.scheme.lower()
+    if not scheme or not parts.netloc:
         raise RuntimeError(f"{env_name} must be a valid proxy URL")
+
+    if scheme == "mtproto":
+        raise RuntimeError(
+            f"{env_name} does not support mtproto:// for Telegram Bot API; use http(s):// or socks5://"
+        )
+
+    if scheme not in SUPPORTED_PROXY_SCHEMES:
+        supported = ", ".join(sorted(SUPPORTED_PROXY_SCHEMES))
+        raise RuntimeError(f"{env_name} has unsupported proxy scheme '{scheme}', supported: {supported}")
 
     return raw_url
 

@@ -45,6 +45,8 @@ transmission3-bot status
 - `6` — задать URL Transmission RPC (`TR_URL`, например: `http://127.0.0.1:9091/transmission/rpc`);
 - `7` — перезапустить systemd-сервис бота (`transmission3-bot`);
 - `8` — вывести последние 10 строк файла логов ошибок бота.
+- `9` — отключить основной прокси Telegram (удалить `TG_PROXY`);
+- `10` — отключить отдельный прокси для `getUpdates` (удалить `TG_GET_UPDATES_PROXY`).
 
 Команда `transmission3-bot status` дополнительно показывает:
 - активен ли systemd-сервис `transmission3-bot`;
@@ -84,6 +86,7 @@ python bot.py
 
 Для SOCKS-прокси зависимость уже включена в `requirements.txt`, поэтому достаточно указать URL вида `socks5://host:port`.
 Если у прокси требуется авторизация, добавьте логин и пароль прямо в URL, например: `http://login:password@host:port` или `socks5://login:password@host:port`.
+`mtproto://` не поддерживается: MTProto-прокси работают в Telegram-клиентах, а бот использует Telegram Bot API (HTTP/SOCKS-прокси).
 
 ## Как получить токен Telegram
 

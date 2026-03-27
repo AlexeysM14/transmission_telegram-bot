@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 SERVICE_NAME = "transmission3-bot"
 TELEGRAM_API_BASE = "https://api.telegram.org"
+SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
 def run(cmd: list[str], *, check: bool = True) -> int:
@@ -95,6 +96,34 @@ def set_env_key(key: str, prompt: str, *, allow_empty_delete: bool = False) -> N
         return
     data[key] = value
     save_env(data)
+
+
+def normalize_proxy_url_or_raise(raw_url: str, *, env_name: str) -> str:
+    value = raw_url.strip()
+    parts = urlsplit(value)
+    scheme = parts.scheme.lower()
+    if not scheme or not parts.netloc:
+        raise ValueError(f"{env_name}: invalid proxy URL")
+
+    if scheme == "mtproto":
+        raise ValueError(
+            f"{env_name}: MTProto proxies are not supported for Telegram Bot API; use http(s):// or socks5://"
+        )
+
+    if scheme not in SUPPORTED_PROXY_SCHEMES:
+        supported = ", ".join(sorted(SUPPORTED_PROXY_SCHEMES))
+        raise ValueError(f"{env_name}: unsupported proxy scheme '{scheme}', supported: {supported}")
+    return value
+
+
+def unset_env_key(key: str) -> None:
+    data = load_env()
+    if key in data:
+        data.pop(key, None)
+        save_env(data)
+        print(f"✅ Removed {key} from {ENV_FILE}")
+        return
+    print(f"⚠️ {key} is not set, nothing changed")
 
 
 def get_log_file_path() -> Path:
@@ -364,6 +393,8 @@ def menu() -> None:
             "6) Set Transmission RPC URL (TR_URL, example: http://127.0.0.1:9091/transmission/rpc)\n"
             "7) Restart bot service\n"
             "8) Show last 10 lines from bot error log (показать последние 10 строк логов)\n"
+            "9) Disable Telegram proxy (remove TG_PROXY)\n"
+            "10) Disable Telegram getUpdates proxy override (remove TG_GET_UPDATES_PROXY)\n"
             "0) Exit\n"
         )
 
@@ -381,17 +412,29 @@ def menu() -> None:
                     allow_empty_delete=True,
                 )
             elif choice == "4":
-                set_env_key(
-                    "TG_PROXY",
-                    "Enter Telegram proxy URL (leave empty to disable proxy; use http://login:password@host:port if auth is required): ",
-                    allow_empty_delete=True,
-                )
+                data = load_env()
+                value = input(
+                    "Enter Telegram proxy URL (leave empty to disable proxy; supported: http(s):// or socks5://): "
+                ).strip()
+                if not value:
+                    data.pop("TG_PROXY", None)
+                    save_env(data)
+                    print(f"✅ Removed TG_PROXY from {ENV_FILE}")
+                else:
+                    data["TG_PROXY"] = normalize_proxy_url_or_raise(value, env_name="TG_PROXY")
+                    save_env(data)
             elif choice == "5":
-                set_env_key(
-                    "TG_GET_UPDATES_PROXY",
-                    "Enter Telegram getUpdates proxy URL (leave empty to reuse TG_PROXY; use scheme://login:password@host:port if auth is required): ",
-                    allow_empty_delete=True,
-                )
+                data = load_env()
+                value = input(
+                    "Enter Telegram getUpdates proxy URL (leave empty to reuse TG_PROXY; supported: http(s):// or socks5://): "
+                ).strip()
+                if not value:
+                    data.pop("TG_GET_UPDATES_PROXY", None)
+                    save_env(data)
+                    print(f"✅ Removed TG_GET_UPDATES_PROXY from {ENV_FILE}")
+                else:
+                    data["TG_GET_UPDATES_PROXY"] = normalize_proxy_url_or_raise(value, env_name="TG_GET_UPDATES_PROXY")
+                    save_env(data)
             elif choice == "6":
                 set_env_key(
                     "TR_URL",
@@ -402,6 +445,10 @@ def menu() -> None:
                 restart_bot_service()
             elif choice == "8":
                 print_last_log_lines(lines=10)
+            elif choice == "9":
+                unset_env_key("TG_PROXY")
+            elif choice == "10":
+                unset_env_key("TG_GET_UPDATES_PROXY")
             elif choice == "0":
                 print("Bye")
                 return
