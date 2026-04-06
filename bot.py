@@ -25,7 +25,7 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -579,7 +579,36 @@ async def reply_chunks(
         kwargs: dict[str, Any] = {"text": part, "parse_mode": parse_mode}
         if idx == len(chunks) - 1:
             kwargs["reply_markup"] = reply_markup
-        await message.reply_text(**kwargs)
+        await _send_with_timeout_retry(lambda: message.reply_text(**kwargs), op_name="reply_text")
+
+
+async def _send_with_timeout_retry(
+    sender: Callable[[], Awaitable[Any]],
+    *,
+    op_name: str,
+    attempts: int = 3,
+    base_delay_sec: float = 1.0,
+) -> Any:
+    last_error: Optional[TimedOut] = None
+
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            return await sender()
+        except TimedOut as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            delay = base_delay_sec * attempt
+            log.warning(
+                "Telegram request timed out during %s (attempt %d/%d), retrying in %.1fs",
+                op_name,
+                attempt,
+                attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    raise last_error if last_error is not None else RuntimeError(f"{op_name} failed without TimedOut exception")
 
 
 STATUS_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить статус", callback_data=STATUS_REFRESH_CB)]])
@@ -769,7 +798,10 @@ async def send_ephemeral(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: s
         return
 
     await _cleanup_previous_ephemeral(update, ctx)
-    sent = await message.reply_text(text=text, reply_markup=reply_markup)
+    sent = await _send_with_timeout_retry(
+        lambda: message.reply_text(text=text, reply_markup=reply_markup),
+        op_name="send_ephemeral.reply_text",
+    )
     ctx.user_data[LAST_EPHEMERAL_MESSAGE_KEY] = sent.message_id
 
 
@@ -2127,7 +2159,10 @@ def main() -> None:
                 text = f"✅ Торрент завершён: <b>{name}</b>\nID: <b>{torrent_id}</b>{duration_text}"
                 for chat_id in list(enabled_chats):
                     try:
-                        await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+                        await _send_with_timeout_retry(
+                            lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                            op_name="notify_completed.send_message",
+                        )
                     except TelegramError:
                         log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
 
@@ -2163,7 +2198,10 @@ def main() -> None:
                         if chat_id not in enabled_chats:
                             continue
                         try:
-                            await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+                            await _send_with_timeout_retry(
+                                lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                                op_name="notify_started.send_message",
+                            )
                         except TelegramError:
                             log.warning("Failed to send start notification to chat %s", chat_id, exc_info=True)
 
@@ -2195,7 +2233,10 @@ def main() -> None:
                 if chat_id not in enabled_chats:
                     continue
                 try:
-                    await ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+                    await _send_with_timeout_retry(
+                        lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                        op_name="notify_no_peers.send_message",
+                    )
                 except TelegramError:
                     log.warning("Failed to send no-peers notification to chat %s", chat_id, exc_info=True)
 
