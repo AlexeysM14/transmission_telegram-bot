@@ -16,7 +16,7 @@ import os
 import re
 import tempfile
 import threading
-import time
+import time as time_module
 from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, time
@@ -74,7 +74,7 @@ def configure_logging() -> logging.Logger:
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
     console_formatter = logging.Formatter(log_format, datefmt=log_date_format)
-    console_formatter.converter = time.gmtime
+    console_formatter.converter = time_module.gmtime
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
 
@@ -90,7 +90,7 @@ def configure_logging() -> logging.Logger:
     )
     file_handler.setLevel(logging.WARNING)
     file_formatter = logging.Formatter(log_format, datefmt=log_date_format)
-    file_formatter.converter = time.gmtime
+    file_formatter.converter = time_module.gmtime
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
 
