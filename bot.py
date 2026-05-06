@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, time
@@ -63,7 +64,8 @@ load_dotenv_file(Path(__file__).resolve().with_name(".env"))
 def configure_logging() -> logging.Logger:
     log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
-    log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    log_format = "%(asctime)s.%(msecs)03dZ | %(levelname)s | %(name)s | %(message)s"
+    log_date_format = "%Y-%m-%dT%H:%M:%S"
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
@@ -71,7 +73,9 @@ def configure_logging() -> logging.Logger:
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
-    console_handler.setFormatter(logging.Formatter(log_format))
+    console_formatter = logging.Formatter(log_format, datefmt=log_date_format)
+    console_formatter.converter = time.gmtime
+    console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
 
     log_file_path = Path(os.environ.get("LOG_FILE", "bot-errors.log")).expanduser()
@@ -85,7 +89,9 @@ def configure_logging() -> logging.Logger:
         encoding="utf-8",
     )
     file_handler.setLevel(logging.WARNING)
-    file_handler.setFormatter(logging.Formatter(log_format))
+    file_formatter = logging.Formatter(log_format, datefmt=log_date_format)
+    file_formatter.converter = time.gmtime
+    file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
 
     logger = logging.getLogger("tg-transmission-bot")
