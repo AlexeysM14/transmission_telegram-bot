@@ -1246,6 +1246,47 @@ def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, hist
     return "\n".join(lines)
 
 
+def _smooth_chart_points(
+    x_values: list[float],
+    y_values: list[float],
+    *,
+    samples_per_segment: int = 14,
+) -> tuple[list[float], list[float]]:
+    if len(x_values) < 3 or len(x_values) != len(y_values):
+        return x_values, y_values
+
+    smooth_x: list[float] = []
+    smooth_y: list[float] = []
+
+    for idx in range(len(x_values) - 1):
+        p0 = y_values[max(0, idx - 1)]
+        p1 = y_values[idx]
+        p2 = y_values[idx + 1]
+        p3 = y_values[min(len(y_values) - 1, idx + 2)]
+        x1 = x_values[idx]
+        x2 = x_values[idx + 1]
+        local_min = min(p0, p1, p2, p3)
+        local_max = max(p0, p1, p2, p3)
+
+        segment_samples = max(2, samples_per_segment)
+        for sample in range(segment_samples):
+            t = sample / segment_samples
+            t2 = t * t
+            t3 = t2 * t
+            y_value = 0.5 * (
+                (2 * p1)
+                + (-p0 + p2) * t
+                + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
+                + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+            )
+            smooth_x.append(x1 + (x2 - x1) * t)
+            smooth_y.append(max(0.0, min(local_max, max(local_min, y_value))))
+
+    smooth_x.append(x_values[-1])
+    smooth_y.append(max(0.0, y_values[-1]))
+    return smooth_x, smooth_y
+
+
 def _draw_traffic_chart(
     ax: Any,
     labels: list[str],
@@ -1255,38 +1296,44 @@ def _draw_traffic_chart(
     y_label: str,
     annotate_last_points: int = 1,
 ) -> None:
-    down_color = "#2B7DE9"
-    up_color = "#FF8A33"
+    down_color = "#2563EB"
+    up_color = "#F97316"
+    grid_color = "#CBD5E1"
+    text_color = "#111827"
 
-    ax.set_facecolor("#F7FAFF")
+    ax.set_facecolor("#F8FAFC")
+    ax.figure.set_facecolor("#FFFFFF")
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
-    ax.spines["left"].set_color("#CAD7E6")
-    ax.spines["bottom"].set_color("#CAD7E6")
+    ax.spines["left"].set_color("#D1D5DB")
+    ax.spines["bottom"].set_color("#D1D5DB")
 
-    x_values = list(range(len(labels)))
+    x_values = [float(idx) for idx in range(len(labels))]
+    smooth_down_x, smooth_down_y = _smooth_chart_points(x_values, down_values)
+    smooth_up_x, smooth_up_y = _smooth_chart_points(x_values, up_values)
+
+    ax.fill_between(smooth_down_x, smooth_down_y, alpha=0.10, color=down_color)
+    ax.fill_between(smooth_up_x, smooth_up_y, alpha=0.12, color=up_color)
 
     ax.plot(
-        x_values,
-        down_values,
-        marker="o",
-        linewidth=2.3,
-        markersize=5,
+        smooth_down_x,
+        smooth_down_y,
+        linewidth=2.8,
         color=down_color,
+        solid_capstyle="round",
         label="Скачано",
     )
     ax.plot(
-        x_values,
-        up_values,
-        marker="o",
-        linewidth=2.3,
-        markersize=5,
+        smooth_up_x,
+        smooth_up_y,
+        linewidth=2.8,
         color=up_color,
+        solid_capstyle="round",
         label="Отдано",
     )
 
-    ax.fill_between(x_values, down_values, alpha=0.16, color=down_color)
-    ax.fill_between(x_values, up_values, alpha=0.16, color=up_color)
+    ax.scatter(x_values, down_values, s=34, color=down_color, edgecolor="white", linewidth=1.0, zorder=3)
+    ax.scatter(x_values, up_values, s=34, color=up_color, edgecolor="white", linewidth=1.0, zorder=3)
 
     points_to_annotate = min(len(labels), max(annotate_last_points, 0))
     for offset in range(points_to_annotate):
@@ -1311,18 +1358,30 @@ def _draw_traffic_chart(
             weight="bold",
         )
 
-    ax.set_title(title, fontsize=12, weight="bold", pad=12)
-    ax.set_ylabel(y_label)
+    ax.set_title(title, fontsize=13, weight="bold", color=text_color, pad=12)
+    ax.set_ylabel(y_label, color=text_color)
 
-    tick_indexes = list(range(len(labels)))
+    tick_step = max(1, (len(labels) + 15) // 16)
+    tick_indexes = list(range(0, len(labels), tick_step))
+    if tick_indexes[-1] != len(labels) - 1:
+        tick_indexes.append(len(labels) - 1)
     ax.set_xticks(tick_indexes)
     ax.set_xticklabels([labels[idx] for idx in tick_indexes])
 
-    ax.tick_params(axis="x", rotation=0, labelsize=9)
-    ax.tick_params(axis="y", labelsize=9)
-    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.55)
+    y_max = max([*down_values, *up_values, 0.0])
+    ax.set_ylim(bottom=0, top=max(1.0, y_max * 1.12))
+    ax.margins(x=0.025)
+    ax.tick_params(axis="x", rotation=0, labelsize=9, colors=text_color)
+    ax.tick_params(axis="y", labelsize=9, colors=text_color)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.65, color=grid_color)
     ax.grid(False, axis="x")
-    ax.legend(loc="upper left", frameon=False)
+    ax.legend(
+        loc="upper left",
+        frameon=True,
+        facecolor="white",
+        edgecolor="#E5E7EB",
+        framealpha=0.92,
+    )
 
 
 def _month_name_ru(month: int) -> str:
