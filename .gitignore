@@ -1,0 +1,8 @@
+.env
+.env.tmp
+.venv/
+__pycache__/
+*.py[cod]
+bot-errors.log*
+traffic_anchors.json
+traffic_anchors.tmp

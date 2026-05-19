@@ -56,11 +56,6 @@ def load_dotenv_file(path: Path) -> None:
             continue
         os.environ[key] = value.strip().strip('"').strip("'")
 
-
-
-load_dotenv_file(Path(__file__).resolve().with_name(".env"))
-
-
 def configure_logging() -> logging.Logger:
     log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
@@ -99,7 +94,7 @@ def configure_logging() -> logging.Logger:
     return logger
 
 
-log = configure_logging()
+log = logging.getLogger("tg-transmission-bot")
 
 
 TG_MAX_MESSAGE = 4096
@@ -117,6 +112,7 @@ class TRCallError(Exception):
 class Config:
     tg_token: str
     allowed_user_ids: Optional[set[int]]
+    allow_all_users: bool
     tg_proxy: Optional[str]
     tg_get_updates_proxy: Optional[str]
 
@@ -153,7 +149,7 @@ def _parse_allowed_ids(raw: str) -> Optional[set[int]]:
         log.warning("Ignored invalid ALLOWED_USER_IDS entries: %s", ", ".join(ignored))
 
     if not values:
-        log.warning("No valid ALLOWED_USER_IDS values found; access restriction disabled")
+        log.warning("No valid ALLOWED_USER_IDS values found")
         return None
 
     return values
@@ -183,6 +179,13 @@ def _parse_float_env(name: str, default: str, *, min_exclusive: float = 0.0) -> 
     if value <= min_exclusive:
         raise RuntimeError(f"{name} must be > {min_exclusive:g}")
     return value
+
+
+def _parse_bool_env(name: str, *, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _normalize_proxy_url(raw_url: Optional[str], *, env_name: str) -> Optional[str]:
@@ -230,10 +233,25 @@ def load_config() -> Config:
     tr_port = _parse_int_env("TR_PORT", "9091", min_value=1, max_value=65535)
     tr_timeout = _parse_float_env("TR_TIMEOUT", "10", min_exclusive=0.0)
     list_limit = _parse_int_env("LIST_LIMIT", "25", min_value=1)
+    allowed_user_ids = _parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
+    allow_all_users = _parse_bool_env("ALLOW_ALL_USERS", default=False)
+
+    if allowed_user_ids is None:
+        if allow_all_users:
+            log.warning(
+                "ALLOWED_USER_IDS is empty and ALLOW_ALL_USERS is enabled; "
+                "every private Telegram user is allowed"
+            )
+        else:
+            log.warning(
+                "ALLOWED_USER_IDS is empty; access is denied until at least "
+                "one Telegram user id is configured"
+            )
 
     return Config(
         tg_token=tg_token,
-        allowed_user_ids=_parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", "")),
+        allowed_user_ids=allowed_user_ids,
+        allow_all_users=allow_all_users,
         tg_proxy=os.environ.get("TG_PROXY", "").strip() or None,
         tg_get_updates_proxy=os.environ.get("TG_GET_UPDATES_PROXY", "").strip() or None,
         tr_url=os.environ.get("TR_URL", "").strip() or None,
@@ -248,7 +266,24 @@ def load_config() -> Config:
     )
 
 
-CFG = load_config()
+CFG: Optional[Config] = None
+
+
+def get_config() -> Config:
+    if CFG is None:
+        raise RuntimeError("Configuration is not initialized")
+    return CFG
+
+
+def initialize_runtime() -> None:
+    global CFG, CONFIRM_DEL_KEEP_FLOW, _TR_CLIENT, log
+
+    load_dotenv_file(Path(__file__).resolve().with_name(".env"))
+    log = configure_logging()
+    CFG = load_config()
+    CONFIRM_DEL_KEEP_FLOW = _parse_bool_env("CONFIRM_DEL_KEEP", default=False)
+    with _TR_CLIENT_LOCK:
+        _TR_CLIENT = None
 
 MENU_MAIN = "MAIN"
 MENU_TORRENTS = "TORRENTS"
@@ -263,7 +298,7 @@ WAIT_CTRL_PAUSE = "WAIT_CTRL_PAUSE"
 WAIT_CTRL_START = "WAIT_CTRL_START"
 WAIT_CTRL_DEL_KEEP = "WAIT_CTRL_DEL_KEEP"
 WAIT_CTRL_DEL_DATA = "WAIT_CTRL_DEL_DATA"
-CONFIRM_DEL_KEEP_FLOW = os.environ.get("CONFIRM_DEL_KEEP", "").strip().lower() in {"1", "true", "yes", "on"}
+CONFIRM_DEL_KEEP_FLOW = False
 
 
 def kb(rows: Sequence[Sequence[str]]) -> ReplyKeyboardMarkup:
@@ -380,10 +415,21 @@ def user_allowed(update: Update) -> bool:
     if chat and chat.type != "private":
         return False
 
-    if CFG.allowed_user_ids is None:
-        return True
+    cfg = get_config()
+    if cfg.allowed_user_ids is None:
+        return cfg.allow_all_users
     uid = update.effective_user.id if update.effective_user else None
-    return uid in CFG.allowed_user_ids
+    return uid in cfg.allowed_user_ids
+
+
+async def callback_user_allowed(update: Update) -> bool:
+    if user_allowed(update):
+        return True
+
+    query = update.callback_query
+    if query is not None:
+        await query.answer("Доступ запрещён", show_alert=True)
+    return False
 
 
 def _sort_torrents(items: Sequence[Any]) -> list[Any]:
@@ -429,16 +475,17 @@ def parse_id(text: str) -> Optional[int]:
 
 
 def build_client() -> Client:
-    if CFG.tr_url:
-        return from_url(CFG.tr_url, timeout=CFG.tr_timeout)
+    cfg = get_config()
+    if cfg.tr_url:
+        return from_url(cfg.tr_url, timeout=cfg.tr_timeout)
     return Client(
-        protocol=CFG.tr_protocol,
-        host=CFG.tr_host,
-        port=CFG.tr_port,
-        path=CFG.tr_path,
-        username=CFG.tr_user,
-        password=CFG.tr_pass,
-        timeout=CFG.tr_timeout,
+        protocol=cfg.tr_protocol,
+        host=cfg.tr_host,
+        port=cfg.tr_port,
+        path=cfg.tr_path,
+        username=cfg.tr_user,
+        password=cfg.tr_pass,
+        timeout=cfg.tr_timeout,
     )
 
 
@@ -482,15 +529,19 @@ def build_telegram_application(
     post_init: Callable[[Application], Awaitable[None]],
     post_shutdown: Callable[[Application], Awaitable[None]],
 ) -> Application:
+    cfg = get_config()
     builder = (
         ApplicationBuilder()
-        .token(CFG.tg_token)
+        .token(cfg.tg_token)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
     )
 
-    tg_proxy = _normalize_proxy_url(CFG.tg_proxy, env_name="TG_PROXY")
-    tg_get_updates_proxy = _normalize_proxy_url(CFG.tg_get_updates_proxy, env_name="TG_GET_UPDATES_PROXY") or tg_proxy
+    tg_proxy = _normalize_proxy_url(cfg.tg_proxy, env_name="TG_PROXY")
+    tg_get_updates_proxy = _normalize_proxy_url(
+        cfg.tg_get_updates_proxy,
+        env_name="TG_GET_UPDATES_PROXY",
+    ) or tg_proxy
 
     if not tg_proxy and not tg_get_updates_proxy:
         log.info("Telegram proxy is not configured; using direct connection")
@@ -1375,6 +1426,9 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     if query is None:
         return
 
+    if not await callback_user_allowed(update):
+        return
+
     await query.answer()
 
     try:
@@ -1399,6 +1453,9 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
+        return
+
+    if not await callback_user_allowed(update):
         return
 
     data = query.data or ""
@@ -1428,6 +1485,9 @@ async def _edit_traffic_message(query: Any, text: str) -> None:
 async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
+        return
+
+    if not await callback_user_allowed(update):
         return
 
     data = query.data or ""
@@ -1576,7 +1636,7 @@ async def send_torrent_list(
         items = [t for t in items if q in (t.name or "").lower()]
 
     total = len(items)
-    max_items = CFG.list_limit
+    max_items = get_config().list_limit
     if total > max_items:
         items = heapq.nsmallest(max_items, items, key=lambda t: (0 if _is_active(str(t.status)) else 1, -float(getattr(t, "progress", 0.0)), (t.name or "").lower()))
     else:
@@ -1678,7 +1738,8 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await tg_file.download_to_drive(custom_path=str(tmp_path))
 
         def _add(client: Client):
-            assert tmp_path is not None
+            if tmp_path is None:
+                raise RuntimeError("Temporary torrent file path is missing")
             with tmp_path.open("rb") as rf:
                 return client.add_torrent(rf)
 
@@ -1788,6 +1849,9 @@ async def _request_delete_confirmation(
 async def on_delete_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
+        return
+
+    if not await callback_user_allowed(update):
         return
 
     data = query.data or ""
@@ -2117,6 +2181,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
+    initialize_runtime()
+
     async def notify_completed_torrents(ctx: ContextTypes.DEFAULT_TYPE) -> None:
         enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
         if not isinstance(enabled_chats, set) or not enabled_chats:

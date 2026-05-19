@@ -27,13 +27,13 @@ sudo bash install.sh
 4) Откройте меню настройки:
 
 ```bash
-transmission3-bot update
+sudo transmission3-bot update
 ```
 
 Проверить текущее состояние сервиса, прокси и ключевых интеграций можно командой:
 
 ```bash
-transmission3-bot status
+sudo transmission3-bot status
 ```
 
 В меню доступны пункты:
@@ -46,11 +46,13 @@ transmission3-bot status
 - `7` — перезапустить systemd-сервис бота (`transmission3-bot`);
 - `8` — вывести последние 10 строк файла логов ошибок бота.
 - `9` — отключить основной прокси Telegram (удалить `TG_PROXY`);
-- `10` — отключить отдельный прокси для `getUpdates` (удалить `TG_GET_UPDATES_PROXY`).
+- `10` — отключить отдельный прокси для `getUpdates` (удалить `TG_GET_UPDATES_PROXY`);
+- `11` — разрешить доступ всем приватным чатам (`ALLOW_ALL_USERS=1`);
+- `12` — снова отключить доступ всем приватным чатам (удалить `ALLOW_ALL_USERS`).
 
 Команда `transmission3-bot status` дополнительно показывает:
 - активен ли systemd-сервис `transmission3-bot`;
-- настроены ли `TG_PROXY` и `TG_GET_UPDATES_PROXY`;
+- настроены ли `ALLOWED_USER_IDS`, `ALLOW_ALL_USERS`, `TG_PROXY` и `TG_GET_UPDATES_PROXY`;
 - доступен ли Telegram Bot API через указанный прокси;
 - доступен ли Transmission RPC и сколько сейчас активных/остановленных торрентов;
 - где находится файл логов и когда он обновлялся в последний раз.
@@ -76,6 +78,7 @@ pip install -r requirements.txt
 > pip install matplotlib
 > ```
 export TG_TOKEN="<telegram-bot-token>"
+export ALLOWED_USER_IDS="<your-telegram-user-id>"
 export TG_PROXY="http://proxy-login:proxy-password@127.0.0.1:8080"
 # optional: separate proxy only for getUpdates long polling
 # export TG_GET_UPDATES_PROXY="socks5://proxy-login:proxy-password@127.0.0.1:1080"
@@ -117,7 +120,8 @@ curl -s "https://api.telegram.org/bot<TG_TOKEN>/getUpdates"
 По умолчанию уведомления о завершении торрентов включаются автоматически для нового приватного чата с ботом (в разделе «⚙️ Управление» их можно отключить).
 
 - `TG_TOKEN` — **обязательно**.
-- `ALLOWED_USER_IDS` — список Telegram user id через запятую.
+- `ALLOWED_USER_IDS` — список Telegram user id через запятую. По умолчанию доступ закрыт, пока не указан хотя бы один id.
+- `ALLOW_ALL_USERS` — **небезопасный режим** для личных/тестовых установок: `1`, `true`, `yes` или `on` разрешает доступ любому приватному чату, если `ALLOWED_USER_IDS` пустой.
 - `TG_PROXY` — **опционально**: прокси для всех запросов Telegram Bot API, например `http://127.0.0.1:8080`, `socks5://127.0.0.1:1080` или `http://login:password@127.0.0.1:8080`.
 - `TG_GET_UPDATES_PROXY` — **опционально**: отдельный прокси только для long polling (`getUpdates`); если не указан, используется `TG_PROXY`, а если и он не задан — бот работает без прокси. Формат тот же, включая вариант с `login:password@`.
 - `TR_URL` — полный URL подключения к Transmission RPC в явном виде, например: `http://127.0.0.1:9091/transmission/rpc` (если указан, перекрывает host/port/path).

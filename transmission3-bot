@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import base64
+import grp
 import json
 import os
+import pwd
 import socket
-import subprocess
+# CLI intentionally runs fixed system commands.
+import subprocess  # nosec B404
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,20 +20,22 @@ from urllib.request import ProxyHandler, Request, build_opener
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = ROOT / ".env"
 SERVICE_NAME = "transmission3-bot"
+SERVICE_USER = os.environ.get("SERVICE_USER", SERVICE_NAME)
+SERVICE_GROUP = os.environ.get("SERVICE_GROUP", SERVICE_USER)
 TELEGRAM_API_BASE = "https://api.telegram.org"
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
 def run(cmd: list[str], *, check: bool = True) -> int:
     print(f"\n$ {' '.join(cmd)}")
-    proc = subprocess.run(cmd, cwd=ROOT)
+    proc = subprocess.run(cmd, cwd=ROOT)  # nosec B603
     if check and proc.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
     return proc.returncode
 
 
 def run_capture(cmd: list[str]) -> tuple[int, str, str]:
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)  # nosec B603
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -39,7 +44,12 @@ def load_env() -> dict[str, str]:
     if not ENV_FILE.exists():
         return data
 
-    for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except PermissionError as exc:
+        raise PermissionError(f"Cannot read {ENV_FILE}; run this command with sudo") from exc
+
+    for line in lines:
         raw = line.strip()
         if not raw or raw.startswith("#") or "=" not in raw:
             continue
@@ -54,13 +64,48 @@ def save_env(values: dict[str, str]) -> None:
         *(f"{k}={v}" for k, v in sorted(values.items())),
         "",
     ]
-    ENV_FILE.write_text("\n".join(lines), encoding="utf-8")
+    payload = "\n".join(lines)
+    tmp_path = ENV_FILE.with_name(f".{ENV_FILE.name}.tmp")
+
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            temp_file.write(payload)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+
+        os.replace(tmp_path, ENV_FILE)
+        secure_env_file()
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
     print(f"✅ Saved {ENV_FILE}")
 
 
+def secure_env_file() -> None:
+    if not ENV_FILE.exists():
+        return
+
+    if os.geteuid() == 0:
+        try:
+            uid = pwd.getpwnam(SERVICE_USER).pw_uid
+            gid = grp.getgrnam(SERVICE_GROUP).gr_gid
+        except KeyError:
+            pass
+        else:
+            os.chown(ENV_FILE, uid, gid)
+
+    os.chmod(ENV_FILE, 0o600)
+
+
 def do_update_from_github() -> None:
-    run(["git", "fetch", "--all"])
-    run(["git", "pull", "--ff-only"])
+    safe_directory = str(ROOT)
+    run(["git", "-c", f"safe.directory={safe_directory}", "fetch", "--all"])
+    run(["git", "-c", f"safe.directory={safe_directory}", "pull", "--ff-only"])
 
     venv_python = ROOT / ".venv" / "bin" / "python"
     if venv_python.exists():
@@ -162,6 +207,10 @@ def mask_proxy_url(raw_url: Optional[str]) -> str:
 
 def format_bool(value: bool) -> str:
     return "yes" if value else "no"
+
+
+def parse_bool_value(raw: Optional[str]) -> bool:
+    return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def format_dt(value: float) -> str:
@@ -295,6 +344,8 @@ def print_status() -> int:
     env = load_env()
     timeout = parse_timeout(env.get("TR_TIMEOUT", "10"))
     tg_token = env.get("TG_TOKEN", "").strip()
+    allowed_user_ids = env.get("ALLOWED_USER_IDS", "").strip()
+    allow_all_users = parse_bool_value(env.get("ALLOW_ALL_USERS"))
     tg_proxy = env.get("TG_PROXY", "").strip() or None
     tg_updates_proxy = env.get("TG_GET_UPDATES_PROXY", "").strip() or None
     effective_updates_proxy = tg_updates_proxy or tg_proxy
@@ -313,6 +364,8 @@ def print_status() -> int:
 
     print("\n[configuration]")
     print(f"TG_TOKEN configured: {format_bool(bool(tg_token))}")
+    print(f"ALLOWED_USER_IDS configured: {format_bool(bool(allowed_user_ids))}")
+    print(f"ALLOW_ALL_USERS: {format_bool(allow_all_users)}")
     print(f"TG_PROXY: {mask_proxy_url(tg_proxy)}")
     print(f"TG_GET_UPDATES_PROXY: {mask_proxy_url(tg_updates_proxy)}")
     print(f"effective getUpdates proxy: {mask_proxy_url(effective_updates_proxy)}")
@@ -395,6 +448,8 @@ def menu() -> None:
             "8) Show last 10 lines from bot error log (показать последние 10 строк логов)\n"
             "9) Disable Telegram proxy (remove TG_PROXY)\n"
             "10) Disable Telegram getUpdates proxy override (remove TG_GET_UPDATES_PROXY)\n"
+            "11) Allow every private Telegram user (set ALLOW_ALL_USERS=1)\n"
+            "12) Disable allow-all access (remove ALLOW_ALL_USERS)\n"
             "0) Exit\n"
         )
 
@@ -408,7 +463,7 @@ def menu() -> None:
             elif choice == "3":
                 set_env_key(
                     "ALLOWED_USER_IDS",
-                    "Enter user id(s), comma-separated (leave empty to remove restriction): ",
+                    "Enter user id(s), comma-separated (empty denies everyone unless ALLOW_ALL_USERS=1): ",
                     allow_empty_delete=True,
                 )
             elif choice == "4":
@@ -449,6 +504,12 @@ def menu() -> None:
                 unset_env_key("TG_PROXY")
             elif choice == "10":
                 unset_env_key("TG_GET_UPDATES_PROXY")
+            elif choice == "11":
+                data = load_env()
+                data["ALLOW_ALL_USERS"] = "1"
+                save_env(data)
+            elif choice == "12":
+                unset_env_key("ALLOW_ALL_USERS")
             elif choice == "0":
                 print("Bye")
                 return
