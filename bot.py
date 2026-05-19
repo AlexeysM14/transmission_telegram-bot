@@ -326,14 +326,14 @@ def kb_torrents() -> ReplyKeyboardMarkup:
         [
             ["📋 Все", "⬇️ Скачиваются"],
             ["⏹️ Остановл.", "✅ Завершённые"],
-            ["🔎 Поиск", CANCEL_INPUT_BUTTON],
+            ["🔎 Поиск"],
             ["⬅️ Назад"],
         ]
     )
 
 
 def kb_add() -> ReplyKeyboardMarkup:
-    return kb([["🧲 Магнет/URL", "📄 .torrent файл"], [CANCEL_INPUT_BUTTON, "⬅️ Назад"]])
+    return kb([["🧲 Магнет/URL", "📄 .torrent файл"], ["⬅️ Назад"]])
 
 
 def kb_ctrl(notify_enabled: bool = True) -> ReplyKeyboardMarkup:
@@ -344,7 +344,7 @@ def kb_ctrl(notify_enabled: bool = True) -> ReplyKeyboardMarkup:
             ["🗑️ Удалить (оставить данные)"],
             ["💥 Удалить (с данными)"],
             [notify_label],
-            [CANCEL_INPUT_BUTTON, "⬅️ Назад"],
+            ["⬅️ Назад"],
         ]
     )
 
@@ -2103,7 +2103,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         update,
         "Привет! Я бот для управления Transmission.\n"
         "Выбирай пункт меню ниже 👇\n\n"
-        "💡 Подсказка: если бот ждёт ввод (ID/поиск/magnet), нажми «❌ Отменить ввод».",
+        "💡 Подсказка: если бот ждёт ввод, нажми «⬅️ Назад» — это сбросит текущий шаг.",
         reply_markup=KB_MAIN,
     )
 
@@ -2127,7 +2127,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "• ➕ Добавить — magnet/URL или .torrent файл\n"
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"
         "Подсказка: ID виден в списках торрентов.\n"
-        "Отменить любой шаг ввода можно кнопкой «❌ Отменить ввод»."
+        "Отменить любой шаг ввода можно кнопкой «⬅️ Назад»."
     )
     await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=KB_MAIN)
 
