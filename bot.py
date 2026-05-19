@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import calendar
 import contextlib
 import html
 import heapq
@@ -1174,9 +1173,8 @@ def _daily_totals_current_month(
         today_delta_uploaded = max(0, uploaded - int(points[-1].get("uploaded", uploaded)))
         daily_totals[today_date] = {"downloaded": today_delta_downloaded, "uploaded": today_delta_uploaded}
 
-    month_days = calendar.monthrange(now.year, now.month)[1]
     result: list[dict[str, int | str]] = []
-    for day in range(1, month_days + 1):
+    for day in range(1, now.day + 1):
         date_value = now.replace(day=day)
         day_key = date_value.strftime("%Y-%m-%d")
         totals = daily_totals.get(day_key)
