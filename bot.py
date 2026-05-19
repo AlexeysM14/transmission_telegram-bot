@@ -1882,7 +1882,7 @@ async def send_torrent_list(
 
 async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     link = text.strip()
-    if not (link.startswith("magnet:") or link.startswith("http://") or link.startswith("https://")):
+    if not is_magnet_or_torrent_link(link):
         await reply_chunks(update, "❌ Нужна magnet-ссылка или http(s) URL на .torrent.", reply_markup=KB_ADD)
         return
 
@@ -1906,6 +1906,11 @@ async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
     )
+
+
+def is_magnet_or_torrent_link(text: str) -> bool:
+    normalized = text.strip().lower()
+    return normalized.startswith("magnet:") or normalized.startswith("http://") or normalized.startswith("https://")
 
 
 async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2375,6 +2380,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         wait = get_wait(ctx)
 
         if await _handle_wait_state(update, ctx, wait, text):
+            return
+
+        if is_magnet_or_torrent_link(text):
+            set_wait(ctx, WAIT_NONE)
+            set_menu(ctx, MENU_ADD)
+            await add_magnet_or_url(update, ctx, text)
             return
 
         if await _handle_global_command(update, ctx, text, chat_id):
