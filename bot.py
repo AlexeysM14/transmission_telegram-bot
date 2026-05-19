@@ -1287,6 +1287,43 @@ def _smooth_chart_points(
     return smooth_x, smooth_y
 
 
+def _format_chart_value(value: float) -> str:
+    if value >= 100:
+        return f"{value:.0f}"
+    if value >= 10:
+        return f"{value:.1f}"
+    return f"{value:.2f}"
+
+
+def _annotate_latest_chart_value(
+    ax: Any,
+    *,
+    x_value: float,
+    y_value: float,
+    color: str,
+    y_max: float,
+) -> None:
+    y_offset = 14 if y_value < y_max * 0.12 else 0
+    ax.annotate(
+        _format_chart_value(y_value),
+        xy=(x_value, y_value),
+        xytext=(-12, y_offset),
+        textcoords="offset points",
+        ha="right",
+        va="center",
+        color=color,
+        fontsize=9,
+        weight="bold",
+        bbox={
+            "boxstyle": "round,pad=0.28",
+            "facecolor": "white",
+            "edgecolor": color,
+            "linewidth": 1.0,
+            "alpha": 0.95,
+        },
+    )
+
+
 def _draw_traffic_chart(
     ax: Any,
     labels: list[str],
@@ -1300,9 +1337,15 @@ def _draw_traffic_chart(
     up_color = "#F97316"
     grid_color = "#CBD5E1"
     text_color = "#111827"
+    muted_text_color = "#64748B"
+    y_max = max([*down_values, *up_values, 0.0])
+    minor_threshold = max(0.05, y_max * 0.025)
+    down_is_minor = max(down_values or [0.0]) <= minor_threshold
+    up_is_minor = max(up_values or [0.0]) <= minor_threshold
 
     ax.set_facecolor("#F8FAFC")
     ax.figure.set_facecolor("#FFFFFF")
+    ax.set_axisbelow(True)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
     ax.spines["left"].set_color("#D1D5DB")
@@ -1312,54 +1355,80 @@ def _draw_traffic_chart(
     smooth_down_x, smooth_down_y = _smooth_chart_points(x_values, down_values)
     smooth_up_x, smooth_up_y = _smooth_chart_points(x_values, up_values)
 
-    ax.fill_between(smooth_down_x, smooth_down_y, alpha=0.10, color=down_color)
-    ax.fill_between(smooth_up_x, smooth_up_y, alpha=0.12, color=up_color)
+    ax.fill_between(
+        smooth_down_x,
+        smooth_down_y,
+        alpha=0.04 if down_is_minor else 0.10,
+        color=down_color,
+    )
+    ax.fill_between(
+        smooth_up_x,
+        smooth_up_y,
+        alpha=0.04 if up_is_minor else 0.12,
+        color=up_color,
+    )
 
     ax.plot(
         smooth_down_x,
         smooth_down_y,
-        linewidth=2.8,
+        linewidth=2.0 if down_is_minor else 2.9,
         color=down_color,
+        alpha=0.42 if down_is_minor else 1.0,
         solid_capstyle="round",
         label="Скачано",
     )
     ax.plot(
         smooth_up_x,
         smooth_up_y,
-        linewidth=2.8,
+        linewidth=2.0 if up_is_minor else 2.9,
         color=up_color,
+        alpha=0.42 if up_is_minor else 1.0,
         solid_capstyle="round",
         label="Отдано",
     )
 
-    ax.scatter(x_values, down_values, s=34, color=down_color, edgecolor="white", linewidth=1.0, zorder=3)
-    ax.scatter(x_values, up_values, s=34, color=up_color, edgecolor="white", linewidth=1.0, zorder=3)
+    ax.scatter(
+        x_values,
+        down_values,
+        s=26 if down_is_minor else 38,
+        color=down_color,
+        alpha=0.46 if down_is_minor else 1.0,
+        edgecolor="white",
+        linewidth=1.0,
+        zorder=3,
+    )
+    ax.scatter(
+        x_values,
+        up_values,
+        s=26 if up_is_minor else 38,
+        color=up_color,
+        alpha=0.46 if up_is_minor else 1.0,
+        edgecolor="white",
+        linewidth=1.0,
+        zorder=3,
+    )
 
-    points_to_annotate = min(len(labels), max(annotate_last_points, 0))
-    for offset in range(points_to_annotate):
-        point_idx = len(labels) - points_to_annotate + offset
-        x_shift = 8
-        ax.annotate(
-            f"{down_values[point_idx]:.2f}",
-            xy=(x_values[point_idx], down_values[point_idx]),
-            xytext=(x_shift, 8),
-            textcoords="offset points",
-            color=down_color,
-            fontsize=9,
-            weight="bold",
-        )
-        ax.annotate(
-            f"{up_values[point_idx]:.2f}",
-            xy=(x_values[point_idx], up_values[point_idx]),
-            xytext=(x_shift, -12),
-            textcoords="offset points",
-            color=up_color,
-            fontsize=9,
-            weight="bold",
-        )
+    if labels and annotate_last_points > 0:
+        last_idx = len(labels) - 1
+        if not down_is_minor or down_values[last_idx] > 0:
+            _annotate_latest_chart_value(
+                ax,
+                x_value=x_values[last_idx],
+                y_value=down_values[last_idx],
+                color=down_color,
+                y_max=max(1.0, y_max),
+            )
+        if not up_is_minor or up_values[last_idx] > 0:
+            _annotate_latest_chart_value(
+                ax,
+                x_value=x_values[last_idx],
+                y_value=up_values[last_idx],
+                color=up_color,
+                y_max=max(1.0, y_max),
+            )
 
-    ax.set_title(title, fontsize=13, weight="bold", color=text_color, pad=12)
-    ax.set_ylabel(y_label, color=text_color)
+    ax.set_title(title, fontsize=14, weight="bold", color=text_color, pad=14, loc="left")
+    ax.set_ylabel(y_label, color=muted_text_color)
 
     tick_step = max(1, (len(labels) + 15) // 16)
     tick_indexes = list(range(0, len(labels), tick_step))
@@ -1368,19 +1437,19 @@ def _draw_traffic_chart(
     ax.set_xticks(tick_indexes)
     ax.set_xticklabels([labels[idx] for idx in tick_indexes])
 
-    y_max = max([*down_values, *up_values, 0.0])
     ax.set_ylim(bottom=0, top=max(1.0, y_max * 1.12))
-    ax.margins(x=0.025)
-    ax.tick_params(axis="x", rotation=0, labelsize=9, colors=text_color)
-    ax.tick_params(axis="y", labelsize=9, colors=text_color)
-    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.65, color=grid_color)
+    ax.margins(x=0.035)
+    ax.tick_params(axis="x", rotation=0, labelsize=9, colors=muted_text_color)
+    ax.tick_params(axis="y", labelsize=9, colors=muted_text_color)
+    ax.grid(True, axis="y", linestyle="-", linewidth=0.8, alpha=0.55, color=grid_color)
     ax.grid(False, axis="x")
     ax.legend(
-        loc="upper left",
+        loc="upper right",
         frameon=True,
         facecolor="white",
         edgecolor="#E5E7EB",
         framealpha=0.92,
+        fontsize=9,
     )
 
 
