@@ -2475,7 +2475,10 @@ def main() -> None:
 
             downloaded_ever = float(max(0.0, getattr(torrent, "downloaded_ever", 0.0)))
             percent_done = float(max(0.0, getattr(torrent, "percent_done", 0.0)))
-            if downloaded_ever > 0.0 or percent_done > 0.0:
+            rate_download = float(max(0.0, getattr(torrent, "rate_download", 0.0)))
+            status_raw = str(getattr(torrent, "status", "") or "").strip().lower()
+            started_by_status = status_raw in {"downloading", "download pending"}
+            if downloaded_ever > 0.0 or percent_done > 0.0 or rate_download > 0.0 or started_by_status:
                 chat_ids = state.get("chat_ids")
                 if isinstance(chat_ids, set) and chat_ids:
                     safe_name = html.escape(str(state.get("name") or getattr(torrent, "name", "<без названия>")))
