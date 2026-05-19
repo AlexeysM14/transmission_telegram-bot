@@ -299,6 +299,8 @@ WAIT_CTRL_DEL_KEEP = "WAIT_CTRL_DEL_KEEP"
 WAIT_CTRL_DEL_DATA = "WAIT_CTRL_DEL_DATA"
 CONFIRM_DEL_KEEP_FLOW = False
 
+CANCEL_INPUT_BUTTON = "❌ Отменить ввод"
+
 
 def kb(rows: Sequence[Sequence[str]]) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -324,13 +326,14 @@ def kb_torrents() -> ReplyKeyboardMarkup:
         [
             ["📋 Все", "⬇️ Скачиваются"],
             ["⏹️ Остановл.", "✅ Завершённые"],
-            ["🔎 Поиск", "⬅️ Назад"],
+            ["🔎 Поиск", CANCEL_INPUT_BUTTON],
+            ["⬅️ Назад"],
         ]
     )
 
 
 def kb_add() -> ReplyKeyboardMarkup:
-    return kb([["🧲 Магнет/URL", "📄 .torrent файл"], ["⬅️ Назад"]])
+    return kb([["🧲 Магнет/URL", "📄 .torrent файл"], [CANCEL_INPUT_BUTTON, "⬅️ Назад"]])
 
 
 def kb_ctrl(notify_enabled: bool = True) -> ReplyKeyboardMarkup:
@@ -341,7 +344,7 @@ def kb_ctrl(notify_enabled: bool = True) -> ReplyKeyboardMarkup:
             ["🗑️ Удалить (оставить данные)"],
             ["💥 Удалить (с данными)"],
             [notify_label],
-            ["⬅️ Назад"],
+            [CANCEL_INPUT_BUTTON, "⬅️ Назад"],
         ]
     )
 
@@ -354,6 +357,7 @@ KB_CTRL = kb_ctrl(True)
 STATUS_REFRESH_CB = "status_refresh"
 LIST_REFRESH_CB_PREFIX = "list_refresh:"
 TRAFFIC_VIEW_CB_PREFIX = "traffic_view:"
+TORRENT_ACTION_CB_PREFIX = "torrent_action:"
 CONFIRM_DEL_DATA_CB_PREFIX = "confirm_del_data:"
 CANCEL_DEL_DATA_CB = "cancel_del_data"
 CONFIRM_DEL_KEEP_CB_PREFIX = "confirm_del_keep:"
@@ -683,6 +687,32 @@ TRAFFIC_OVERVIEW_KEYBOARD = InlineKeyboardMarkup(
         [InlineKeyboardButton("🗓️ По дням (месяц)", callback_data=f"{TRAFFIC_VIEW_CB_PREFIX}4w")],
     ]
 )
+
+
+def _torrent_actions_keyboard(items: Sequence[Any], mode: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    max_rows = 8
+    for torrent in items[:max_rows]:
+        status = str(getattr(torrent, "status", ""))
+        action = "pause" if _is_active(status) else "start"
+        action_icon = "⏸️" if action == "pause" else "▶️"
+        label_name = (torrent.name or "<без названия>").strip()
+        short_name = label_name[:26] + "…" if len(label_name) > 27 else label_name
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{action_icon} {torrent.id} · {short_name}",
+                    callback_data=f"{TORRENT_ACTION_CB_PREFIX}{action}:{torrent.id}:{mode}",
+                ),
+                InlineKeyboardButton(
+                    "🗑️",
+                    callback_data=f"{TORRENT_ACTION_CB_PREFIX}del_keep:{torrent.id}:{mode}",
+                ),
+            ]
+        )
+
+    rows.append([InlineKeyboardButton("🔄 Обновить список", callback_data=f"{LIST_REFRESH_CB_PREFIX}{mode}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _notifications_enabled(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
@@ -1590,12 +1620,46 @@ async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     mode = data[len(LIST_REFRESH_CB_PREFIX) :]
-    if mode not in {"all", "downloading", "done"}:
+    if mode not in {"all", "downloading", "stopped", "done"}:
         await query.answer("Неизвестный тип списка", show_alert=True)
         return
 
     await query.answer("Обновляю список…")
     await send_torrent_list(update, ctx, mode=mode, edit_existing=True)
+
+
+async def on_torrent_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    if not await callback_user_allowed(update):
+        await query.answer("⛔️ Доступ запрещён", show_alert=True)
+        return
+
+    payload = query.data or ""
+    if not payload.startswith(TORRENT_ACTION_CB_PREFIX):
+        return
+
+    try:
+        action, torrent_id_raw, mode = payload[len(TORRENT_ACTION_CB_PREFIX) :].split(":", 2)
+        torrent_id = int(torrent_id_raw)
+    except (ValueError, TypeError):
+        await query.answer("Некорректные данные", show_alert=True)
+        return
+
+    if action == "del_keep":
+        await _request_delete_confirmation(update, ctx, action="del_keep", torrent_id=torrent_id)
+        await query.answer()
+        return
+
+    if action not in {"pause", "start"}:
+        await query.answer("Неизвестное действие", show_alert=True)
+        return
+
+    await query.answer("Выполняю…")
+    await ctrl_action(update, ctx, action, torrent_id=torrent_id)
+    await send_torrent_list(update, ctx, mode=mode, edit_existing=False)
 
 
 async def _edit_traffic_message(query: Any, text: str) -> None:
@@ -1796,11 +1860,13 @@ async def send_torrent_list(
     if total > max_items:
         tail = f"\n\nПоказано: {len(items)} из {total}."
 
+    list_keyboard = _torrent_actions_keyboard(items, mode) if items else TORRENT_LIST_KEYBOARD
+
     if edit_existing and update.callback_query is not None:
         await update.callback_query.edit_message_text(
             text=_build_single_torrent_message(header, lines, tail),
             parse_mode=ParseMode.HTML,
-            reply_markup=TORRENT_LIST_KEYBOARD,
+            reply_markup=list_keyboard,
         )
         return
 
@@ -1810,7 +1876,7 @@ async def send_torrent_list(
             update,
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=TORRENT_LIST_KEYBOARD if idx == len(messages) - 1 else None,
+            reply_markup=list_keyboard if idx == len(messages) - 1 else None,
         )
 
 
@@ -2028,7 +2094,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     set_menu(ctx, MENU_MAIN)
     set_wait(ctx, WAIT_NONE)
-    await reply_chunks(update, "Привет! Я бот для управления Transmission.\nВыбирай пункт меню ниже 👇", reply_markup=KB_MAIN)
+    await reply_chunks(
+        update,
+        "Привет! Я бот для управления Transmission.\n"
+        "Выбирай пункт меню ниже 👇\n\n"
+        "💡 Подсказка: если бот ждёт ввод (ID/поиск/magnet), нажми «❌ Отменить ввод».",
+        reply_markup=KB_MAIN,
+    )
 
 
 async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2049,7 +2121,8 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "• 📋 Торренты — списки + поиск\n"
         "• ➕ Добавить — magnet/URL или .torrent файл\n"
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"
-        "Подсказка: ID виден в списках торрентов."
+        "Подсказка: ID виден в списках торрентов.\n"
+        "Отменить любой шаг ввода можно кнопкой «❌ Отменить ввод»."
     )
     await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=KB_MAIN)
 
@@ -2289,6 +2362,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await send_ephemeral(update, ctx, "Ок, назад в главное меню.", reply_markup=KB_MAIN)
             return
 
+        if text == CANCEL_INPUT_BUTTON:
+            if get_wait(ctx) in {WAIT_NONE, None}:
+                await send_ephemeral(update, ctx, "Сейчас нет активного ввода 🙂", reply_markup=KB_MAIN)
+                return
+            set_wait(ctx, WAIT_NONE)
+            ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
+            await send_ephemeral(update, ctx, "Ввод отменён. Выбери следующее действие.", reply_markup=KB_MAIN)
+            return
+
         menu = get_menu(ctx)
         wait = get_wait(ctx)
 
@@ -2499,7 +2581,8 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
-    app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|done)$"))
+    app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|stopped|done)$"))
+    app.add_handler(CallbackQueryHandler(on_torrent_action, pattern=f"^{TORRENT_ACTION_CB_PREFIX}"))
     app.add_handler(CallbackQueryHandler(on_traffic_view, pattern=f"^{TRAFFIC_VIEW_CB_PREFIX}(refresh|7d|4w)$"))
     app.add_handler(
         CallbackQueryHandler(
