@@ -1828,7 +1828,13 @@ async def send_torrent_list(
     total = len(items)
     max_items = get_config().list_limit
     if total > max_items:
-        items = heapq.nsmallest(max_items, items, key=lambda t: (0 if _is_active(str(t.status)) else 1, -float(getattr(t, "progress", 0.0)), (t.name or "").lower()))
+        def shortlist_key(torrent: Any) -> tuple[int, float, str]:
+            status = str(torrent.status)
+            progress = float(getattr(torrent, "progress", 0.0))
+            name = (torrent.name or "").lower()
+            return (0 if _is_active(status) else 1, -progress, name)
+
+        items = heapq.nsmallest(max_items, items, key=shortlist_key)
     else:
         items = _sort_torrents(items)
 
