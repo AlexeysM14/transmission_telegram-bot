@@ -1130,12 +1130,8 @@ def _traffic_points_last_7_days(
 
 
 def _build_traffic_chart_last_7_days(
-    now: datetime,
-    downloaded: int,
-    uploaded: int,
-    history: list[dict[str, int | str]],
+    points: list[dict[str, int | str]],
 ) -> tuple[Optional[bytes], Optional[str]]:
-    points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
     if len(points) < 2:
         return None, "Недостаточно данных для графика. История заполняется раз в день."
 
@@ -1757,7 +1753,7 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
     chart_points = _traffic_points_last_7_days(now, downloaded, uploaded, history)
     try:
-        chart_payload, chart_error = await asyncio.to_thread(_build_traffic_chart_last_7_days, now, downloaded, uploaded, history)
+        chart_payload, chart_error = await asyncio.to_thread(_build_traffic_chart_last_7_days, chart_points)
     except Exception:
         log.exception("Failed to build 7-day traffic chart")
         await _edit_traffic_message(query, "❌ Не удалось построить график за 7 дней. Попробуйте позже.")
