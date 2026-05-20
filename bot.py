@@ -899,15 +899,36 @@ async def _delete_user_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     await _delete_message_safe(ctx, chat.id, message.message_id)
 
 
-def _build_status_text(stats: Any, free_space: Optional[int]) -> str:
+def _build_active_torrents_text(torrents: Sequence[Any]) -> str:
+    active = [t for t in torrents if _is_active(str(getattr(t, "status", "")))]
+    if not active:
+        return "Сейчас активных скачиваний нет"
+
+    active_sorted = sorted(active, key=lambda t: float(getattr(t, "progress", 0.0)), reverse=True)
+    lines: list[str] = []
+    for torrent in active_sorted[:5]:
+        safe_name = html.escape(str(getattr(torrent, "name", "") or "<без названия>"))
+        progress = float(getattr(torrent, "progress", 0.0))
+        lines.append(f"• {safe_name} — <b>{progress:.2f}%</b>")
+
+    hidden_count = len(active_sorted) - len(lines)
+    if hidden_count > 0:
+        lines.append(f"• …и ещё <b>{hidden_count}</b>")
+
+    return "\n".join(lines)
+
+
+def _build_status_text(stats: Any, free_space: Optional[int], torrents: Sequence[Any]) -> str:
     cur = stats.current_stats
     cum = stats.cumulative_stats
     session_duration = _format_session_duration(getattr(cur, "seconds_active", 0))
     free_space_text = _build_free_space_text(free_space)
+    active_torrents_text = _build_active_torrents_text(torrents)
     return (
         "📊 <b>Transmission — статус</b>\n"
         f"Скорость: ⇣ <b>{fmt_rate(stats.download_speed)}</b> | ⇡ <b>{fmt_rate(stats.upload_speed)}</b>\n"
-        f"Торренты: активных <b>{stats.active_torrent_count}</b>, на паузе <b>{stats.paused_torrent_count}</b>, всего <b>{stats.torrent_count}</b>\n\n"
+        f"Торренты: активных <b>{stats.active_torrent_count}</b>, на паузе <b>{stats.paused_torrent_count}</b>, всего <b>{stats.torrent_count}</b>\n"
+        f"Активные сейчас:\n{active_torrents_text}\n\n"
         f"{free_space_text}\n"
         f"Трафик (сессия - {session_duration}): ⇣ <b>{fmt_bytes(cur.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cur.uploaded_bytes)}</b>\n"
         f"Трафик (всего): ⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>\n"
@@ -1561,15 +1582,16 @@ async def send_traffic_stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
 
 async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        stats, free_space = await asyncio.gather(
+        stats, free_space, torrents = await asyncio.gather(
             tr_call(lambda c: c.session_stats()),
             _get_download_dir_free_space(),
+            tr_call(lambda c: c.get_torrents()),
         )
     except (TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_MAIN)
         return
 
-    text = _build_status_text(stats, free_space)
+    text = _build_status_text(stats, free_space, torrents)
     await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=STATUS_KEYBOARD)
 
 
@@ -1584,9 +1606,10 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
 
     try:
-        stats, free_space = await asyncio.gather(
+        stats, free_space, torrents = await asyncio.gather(
             tr_call(lambda c: c.session_stats()),
             _get_download_dir_free_space(),
+            tr_call(lambda c: c.get_torrents()),
         )
     except (TransmissionError, TRCallError) as exc:
         await query.edit_message_text(
@@ -1596,7 +1619,7 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     await query.edit_message_text(
-        text=_build_status_text(stats, free_space),
+        text=_build_status_text(stats, free_space, torrents),
         parse_mode=ParseMode.HTML,
         reply_markup=STATUS_KEYBOARD,
     )
