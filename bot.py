@@ -19,6 +19,7 @@ import time as time_module
 from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, time
+from math import ceil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional, Sequence
@@ -440,7 +441,7 @@ def _sort_torrents(items: Sequence[Any]) -> list[Any]:
         items,
         key=lambda t: (
             0 if _is_active(str(t.status)) else 1,
-            -float(getattr(t, "progress", 0.0)),
+            -torrent_progress_percent(t),
             (t.name or "").lower(),
         ),
     )
@@ -460,12 +461,85 @@ def fmt_rate(bps: int | float) -> str:
     return f"{fmt_bytes(bps)}/s"
 
 
+def _clamp_progress(value: int | float) -> float:
+    return min(100.0, max(0.0, float(value)))
+
+
+def torrent_progress_percent(torrent: Any) -> float:
+    progress = getattr(torrent, "progress", None)
+    if isinstance(progress, (int, float)):
+        return _clamp_progress(progress)
+
+    percent_done = getattr(torrent, "percent_done", None)
+    if isinstance(percent_done, (int, float)):
+        return _clamp_progress(percent_done * 100.0)
+
+    return 0.0
+
+
+def _format_progress_bar(progress: int | float, *, width: int = 10) -> str:
+    normalized = _clamp_progress(progress)
+    filled = int(normalized * width / 100.0)
+    if normalized > 0 and filled == 0:
+        filled = 1
+    if normalized >= 100:
+        filled = width
+    return f"{'▓' * filled}{'░' * (width - filled)}"
+
+
 def torrent_total_size(torrent: Any) -> int:
     for attr in ("total_size", "size_when_done"):
         value = getattr(torrent, attr, None)
         if isinstance(value, (int, float)) and value > 0:
             return int(value)
     return 0
+
+
+def _torrent_left_until_done(torrent: Any) -> Optional[int]:
+    for attr in ("left_until_done", "leftUntilDone"):
+        value = getattr(torrent, attr, None)
+        if isinstance(value, (int, float)) and value >= 0:
+            return int(value)
+    return None
+
+
+def _torrent_eta_seconds(torrent: Any) -> Optional[int]:
+    eta = getattr(torrent, "eta", None)
+    if isinstance(eta, (int, float)):
+        return int(eta) if eta >= 0 else None
+
+    total_seconds = getattr(eta, "total_seconds", None)
+    if callable(total_seconds):
+        seconds = int(total_seconds())
+        return seconds if seconds >= 0 else None
+
+    left_until_done = _torrent_left_until_done(torrent)
+    rate_download = getattr(torrent, "rate_download", None)
+    if (
+        left_until_done is not None
+        and left_until_done > 0
+        and isinstance(rate_download, (int, float))
+        and rate_download > 0
+    ):
+        return int(ceil(left_until_done / rate_download))
+
+    if torrent_progress_percent(torrent) >= 100:
+        return 0
+    return None
+
+
+def _format_eta(torrent: Any) -> str:
+    eta_seconds = _torrent_eta_seconds(torrent)
+    if eta_seconds is None:
+        return "осталось: неизвестно"
+    if eta_seconds <= 0:
+        return "готово"
+    return f"осталось: {_format_download_duration(eta_seconds)}"
+
+
+def _format_progress_summary(torrent: Any) -> str:
+    progress = torrent_progress_percent(torrent)
+    return f"{_format_progress_bar(progress)} <b>{progress:.1f}%</b> · {_format_eta(torrent)}"
 
 
 def status_icon(status: str) -> str:
@@ -904,12 +978,11 @@ def _build_active_torrents_text(torrents: Sequence[Any]) -> str:
     if not active:
         return "Сейчас активных скачиваний нет"
 
-    active_sorted = sorted(active, key=lambda t: float(getattr(t, "progress", 0.0)), reverse=True)
+    active_sorted = sorted(active, key=torrent_progress_percent, reverse=True)
     lines: list[str] = []
     for torrent in active_sorted[:5]:
         safe_name = html.escape(str(getattr(torrent, "name", "") or "<без названия>"))
-        progress = float(getattr(torrent, "progress", 0.0))
-        lines.append(f"• {safe_name} — <b>{progress:.2f}%</b>")
+        lines.append(f"• {safe_name}\n  {_format_progress_summary(torrent)}")
 
     hidden_count = len(active_sorted) - len(lines)
     if hidden_count > 0:
@@ -1849,9 +1922,8 @@ async def send_torrent_list(
     if total > max_items:
         def shortlist_key(torrent: Any) -> tuple[int, float, str]:
             status = str(torrent.status)
-            progress = float(getattr(torrent, "progress", 0.0))
             name = (torrent.name or "").lower()
-            return (0 if _is_active(status) else 1, -progress, name)
+            return (0 if _is_active(status) else 1, -torrent_progress_percent(torrent), name)
 
         items = heapq.nsmallest(max_items, items, key=shortlist_key)
     else:
@@ -1870,7 +1942,8 @@ async def send_torrent_list(
         safe_name = html.escape(t.name or "<без названия>")
         size_text = fmt_bytes(torrent_total_size(t))
         lines.append(
-            f"<b>{t.id}</b> {status_icon(st)} {safe_name} — <b>{t.progress:.2f}%</b> • <b>{size_text}</b>\n"
+            f"<b>{t.id}</b> {status_icon(st)} {safe_name} • <b>{size_text}</b>\n"
+            f"   {_format_progress_summary(t)}\n"
             f"   ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
         )
 
@@ -2033,13 +2106,12 @@ def _build_delete_confirm_keyboard(action: str, torrent_id: int) -> InlineKeyboa
 
 def _build_delete_confirm_text(torrent: Any, *, with_data: bool) -> str:
     title = "⚠️ Подтверждение удаления (с данными)" if with_data else "⚠️ Подтверждение удаления"
-    progress = float(getattr(torrent, "progress", 0.0))
     return (
         f"{title}\n\n"
         f"ID: <b>{torrent.id}</b>\n"
         f"Название: <b>{html.escape(torrent.name or '<без названия>')}</b>\n"
         f"Размер: <b>{fmt_bytes(torrent_total_size(torrent))}</b>\n"
-        f"Прогресс: <b>{progress:.2f}%</b>"
+        f"Прогресс: {_format_progress_summary(torrent)}"
     )
 
 
