@@ -376,10 +376,15 @@ NOTIFY_POLL_INTERVAL_SEC = 60
 NOTIFY_NO_PEERS_DELAY_SEC = 10 * 60
 TRAFFIC_ANCHORS_PATH = Path(__file__).resolve().with_name("traffic_anchors.json")
 TRAFFIC_STATE_LOCK = asyncio.Lock()
-ACTIVE_STATUSES = frozenset(
+DOWNLOADING_STATUSES = frozenset(
     {
         "downloading",
         "download pending",
+    }
+)
+ACTIVE_STATUSES = frozenset(
+    {
+        *DOWNLOADING_STATUSES,
         "seeding",
         "seed pending",
         "checking",
@@ -974,7 +979,7 @@ async def _delete_user_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
 
 
 def _build_active_torrents_text(torrents: Sequence[Any]) -> str:
-    active = [t for t in torrents if _is_active(str(getattr(t, "status", "")))]
+    active = [t for t in torrents if _is_downloading(str(getattr(t, "status", "")))]
     if not active:
         return "Сейчас активных скачиваний нет"
 
@@ -1890,6 +1895,10 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _is_active(status: str) -> bool:
     return status in ACTIVE_STATUSES
+
+
+def _is_downloading(status: str) -> bool:
+    return status in DOWNLOADING_STATUSES
 
 
 async def send_torrent_list(
