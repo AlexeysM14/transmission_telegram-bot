@@ -948,47 +948,13 @@ def _extract_free_space_value(source: Any) -> Optional[int]:
     return _non_negative_int(raw_value)
 
 
-def _extract_download_dir(session: Any) -> Optional[str]:
-    download_dir = _get_mapping_or_attr_value(session, ("download_dir", "download-dir"))
-    if isinstance(download_dir, str) and download_dir.strip():
-        return download_dir
-    return None
-
-
-def _refresh_download_dir_free_space(client: Client, download_dir: Optional[str]) -> Optional[int]:
-    free_space_fn = getattr(client, "free_space", None)
-    if not callable(free_space_fn):
-        return None
-
-    call_variants: list[tuple[Any, ...]] = []
-    if download_dir is not None:
-        call_variants.append((download_dir,))
-    call_variants.append(())
-
-    for args in call_variants:
-        try:
-            refreshed = free_space_fn(*args)
-        except (TransmissionError, TypeError, ValueError):
-            continue
-
-        free_space = _extract_free_space_value(refreshed)
-        if free_space is not None:
-            return free_space
-
-    return None
-
-
 async def _get_download_dir_free_space() -> Optional[int]:
     try:
-        def _get_free_space(client: Client) -> Optional[int]:
-            session = client.get_session()
-            fallback_free_space = _extract_free_space_value(session)
-            refreshed_free_space = _refresh_download_dir_free_space(client, _extract_download_dir(session))
-            return refreshed_free_space if refreshed_free_space is not None else fallback_free_space
-
-        return await tr_call(_get_free_space)
+        session = await tr_call(lambda c: c.get_session())
     except (TransmissionError, TRCallError):
         return None
+
+    return _extract_free_space_value(session)
 
 
 def _build_free_space_text(free_space: Optional[int]) -> str:
