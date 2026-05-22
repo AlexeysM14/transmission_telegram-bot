@@ -482,6 +482,15 @@ def torrent_progress_percent(torrent: Any) -> float:
     return 0.0
 
 
+def _progress_segment_symbol(index: int, width: int) -> str:
+    position = (index + 1) / max(1, width)
+    if position <= 0.35:
+        return "🟦"
+    if position <= 0.70:
+        return "🟨"
+    return "🟩"
+
+
 def _format_progress_bar(progress: int | float, *, width: int = 10) -> str:
     normalized = _clamp_progress(progress)
     filled = int(normalized * width / 100.0)
@@ -489,7 +498,8 @@ def _format_progress_bar(progress: int | float, *, width: int = 10) -> str:
         filled = 1
     if normalized >= 100:
         filled = width
-    return f"{'▓' * filled}{'░' * (width - filled)}"
+    filled_bar = "".join(_progress_segment_symbol(index, width) for index in range(filled))
+    return f"{filled_bar}{'⬜' * (width - filled)}"
 
 
 def torrent_total_size(torrent: Any) -> int:
