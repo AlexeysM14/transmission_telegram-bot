@@ -368,6 +368,7 @@ PENDING_CTRL_ACTION_KEY = "pending_ctrl_action"
 NOTIFY_ENABLED_CHATS_KEY = "notify_enabled_chat_ids"
 NOTIFY_KNOWN_CHATS_KEY = "notify_known_chat_ids"
 NOTIFY_COMPLETED_CACHE_KEY = "notify_completed_cache"
+NOTIFY_COMPLETION_PENDING_KEY = "notify_completion_pending"
 NOTIFY_INITIALIZED_KEY = "notify_initialized"
 NOTIFY_START_PENDING_KEY = "notify_start_pending"
 TRAFFIC_LAST_SNAPSHOT_DAY_KEY = "traffic_last_snapshot_day"
@@ -391,6 +392,7 @@ ACTIVE_STATUSES = frozenset(
         "check pending",
     }
 )
+COMPLETED_STATUSES = frozenset({"seeding", "seed pending"})
 STATUS_ICONS = {
     "downloading": "⬇️",
     "download pending": "⬇️",
@@ -845,6 +847,38 @@ def _register_torrent_start_watch(
     chat_ids.add(chat_id)
 
 
+def _register_torrent_completion_watch(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    torrent: Any,
+) -> None:
+    if chat_id is None:
+        return
+
+    pending = ctx.application.bot_data.setdefault(NOTIFY_COMPLETION_PENDING_KEY, {})
+    if not isinstance(pending, dict):
+        pending = {}
+        ctx.application.bot_data[NOTIFY_COMPLETION_PENDING_KEY] = pending
+
+    torrent_id = int(getattr(torrent, "id", 0))
+    if torrent_id <= 0:
+        return
+
+    state = pending.get(torrent_id)
+    if not isinstance(state, dict):
+        pending[torrent_id] = {
+            "name": str(getattr(torrent, "name", "") or "<без названия>"),
+            "chat_ids": {chat_id},
+        }
+        return
+
+    chat_ids = state.get("chat_ids")
+    if not isinstance(chat_ids, set):
+        chat_ids = set()
+        state["chat_ids"] = chat_ids
+    chat_ids.add(chat_id)
+
+
 def _ensure_chat_notifications_initialized(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
     if chat_id is None:
         return
@@ -916,6 +950,17 @@ def _extract_download_duration_seconds(torrent: Any) -> Optional[int]:
         return None
 
     return done_ts - added_ts
+
+
+def _build_completion_notification_text(torrent_id: int, name: str, torrent: Optional[Any]) -> str:
+    duration_text = ""
+    if torrent is not None:
+        duration_seconds = _extract_download_duration_seconds(torrent)
+        if duration_seconds is not None:
+            duration_text = f"\n⏱️ Время скачивания: <b>{_format_download_duration(duration_seconds)}</b>"
+
+    safe_name = html.escape(name or "<без названия>")
+    return f"✅ Торрент завершён: <b>{safe_name}</b>\nID: <b>{torrent_id}</b>{duration_text}"
 
 
 def _non_negative_int(value: Any) -> Optional[int]:
@@ -1948,6 +1993,18 @@ def _is_downloading(status: str) -> bool:
     return status in DOWNLOADING_STATUSES
 
 
+def _is_torrent_completed(torrent: Any) -> bool:
+    status = str(getattr(torrent, "status", "") or "").strip().lower()
+    if status in COMPLETED_STATUSES:
+        return True
+
+    if torrent_progress_percent(torrent) >= 100.0:
+        return True
+
+    left_until_done = _torrent_left_until_done(torrent)
+    return left_until_done == 0 and torrent_total_size(torrent) > 0
+
+
 async def send_torrent_list(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
@@ -1963,11 +2020,11 @@ async def send_torrent_list(
 
     items = torrents
     if mode == "downloading":
-        items = [t for t in items if float(t.percent_done) < 1.0]
+        items = [t for t in items if not _is_torrent_completed(t)]
     elif mode == "stopped":
         items = [t for t in items if str(t.status) == "stopped"]
     elif mode == "done":
-        items = [t for t in items if float(t.percent_done) >= 1.0]
+        items = [t for t in items if _is_torrent_completed(t)]
 
     if query:
         q = query.strip().lower()
@@ -2048,7 +2105,9 @@ async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
         await reply_chunks(update, f"❌ Не удалось добавить: {html.escape(str(exc))}", reply_markup=KB_ADD)
         return
 
-    _register_torrent_start_watch(ctx, update.effective_chat.id if update.effective_chat else None, torrent)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    _register_torrent_start_watch(ctx, chat_id, torrent)
+    _register_torrent_completion_watch(ctx, chat_id, torrent)
 
     await reply_chunks(
         update,
@@ -2103,7 +2162,9 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         if tmp_path and tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
 
-    _register_torrent_start_watch(ctx, update.effective_chat.id if update.effective_chat else None, torrent)
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    _register_torrent_start_watch(ctx, chat_id, torrent)
+    _register_torrent_completion_watch(ctx, chat_id, torrent)
 
     await reply_chunks(
         update,
@@ -2291,6 +2352,8 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not user_allowed(update):
         return
+
+    _ensure_chat_notifications_initialized(ctx, update.effective_chat.id if update.effective_chat else None)
 
     wait = get_wait(ctx)
     menu = get_menu(ctx)
@@ -2568,10 +2631,11 @@ def main() -> None:
             log.warning("Skipping completion notifications due to Transmission error", exc_info=True)
             return
 
+        torrents_by_id = {int(t.id): t for t in torrents}
         completed_now = {
-            int(t.id): (t.name or "<без названия>")
-            for t in torrents
-            if float(getattr(t, "percent_done", 0.0)) >= 1.0
+            torrent_id: (getattr(torrent, "name", None) or "<без названия>")
+            for torrent_id, torrent in torrents_by_id.items()
+            if _is_torrent_completed(torrent)
         }
 
         initialized = bool(ctx.application.bot_data.get(NOTIFY_INITIALIZED_KEY))
@@ -2580,28 +2644,44 @@ def main() -> None:
             prev_completed = {}
 
         if not initialized:
-            ctx.application.bot_data[NOTIFY_COMPLETED_CACHE_KEY] = completed_now
             ctx.application.bot_data[NOTIFY_INITIALIZED_KEY] = True
-            return
-
-        new_ids = sorted(set(completed_now) - set(prev_completed))
-        ctx.application.bot_data[NOTIFY_COMPLETED_CACHE_KEY] = completed_now
-        torrents_by_id = {int(t.id): t for t in torrents}
-
-        if not new_ids:
-            pass
+            new_ids: list[int] = []
         else:
-            for torrent_id in new_ids:
-                torrent = torrents_by_id.get(torrent_id)
-                name = html.escape(completed_now.get(torrent_id, "<без названия>"))
-                duration_text = ""
-                if torrent is not None:
-                    duration_seconds = _extract_download_duration_seconds(torrent)
-                    if duration_seconds is not None:
-                        duration_text = f"\n⏱️ Время скачивания: <b>{_format_download_duration(duration_seconds)}</b>"
+            new_ids = sorted(set(completed_now) - set(prev_completed))
 
-                text = f"✅ Торрент завершён: <b>{name}</b>\nID: <b>{torrent_id}</b>{duration_text}"
-                for chat_id in list(enabled_chats):
+        ctx.application.bot_data[NOTIFY_COMPLETED_CACHE_KEY] = completed_now
+
+        notified_completion_chats: dict[int, set[int]] = {}
+        pending_completion = ctx.application.bot_data.get(NOTIFY_COMPLETION_PENDING_KEY)
+        if isinstance(pending_completion, dict) and pending_completion:
+            expired_completion_ids: list[int] = []
+            for torrent_id, state in list(pending_completion.items()):
+                if not isinstance(state, dict):
+                    expired_completion_ids.append(torrent_id)
+                    continue
+
+                torrent = torrents_by_id.get(torrent_id)
+                if torrent is None:
+                    expired_completion_ids.append(torrent_id)
+                    continue
+
+                if torrent_id not in completed_now:
+                    continue
+
+                chat_ids = state.get("chat_ids")
+                if not isinstance(chat_ids, set) or not chat_ids:
+                    expired_completion_ids.append(torrent_id)
+                    continue
+
+                text = _build_completion_notification_text(
+                    torrent_id,
+                    str(state.get("name") or completed_now.get(torrent_id, "<без названия>")),
+                    torrent,
+                )
+                sent_chat_ids: set[int] = set()
+                for chat_id in list(chat_ids):
+                    if chat_id not in enabled_chats:
+                        continue
                     try:
                         await _send_with_timeout_retry(
                             lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
@@ -2609,6 +2689,34 @@ def main() -> None:
                         )
                     except TelegramError:
                         log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
+                    else:
+                        sent_chat_ids.add(chat_id)
+
+                if sent_chat_ids:
+                    notified_completion_chats[torrent_id] = sent_chat_ids
+                expired_completion_ids.append(torrent_id)
+
+            for torrent_id in expired_completion_ids:
+                pending_completion.pop(torrent_id, None)
+
+        for torrent_id in new_ids:
+            torrent = torrents_by_id.get(torrent_id)
+            text = _build_completion_notification_text(
+                torrent_id,
+                completed_now.get(torrent_id, "<без названия>"),
+                torrent,
+            )
+            already_notified = notified_completion_chats.get(torrent_id, set())
+            for chat_id in list(enabled_chats):
+                if chat_id in already_notified:
+                    continue
+                try:
+                    await _send_with_timeout_retry(
+                        lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                        op_name="notify_completed.send_message",
+                    )
+                except TelegramError:
+                    log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
 
         pending_start = ctx.application.bot_data.get(NOTIFY_START_PENDING_KEY)
         if not isinstance(pending_start, dict) or not pending_start:
