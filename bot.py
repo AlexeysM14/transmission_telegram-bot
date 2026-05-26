@@ -797,7 +797,7 @@ def _torrent_actions_keyboard(items: Sequence[Any], mode: str) -> InlineKeyboard
                 ),
                 InlineKeyboardButton(
                     "🗑️",
-                    callback_data=f"{TORRENT_ACTION_CB_PREFIX}del_keep:{torrent.id}:{mode}",
+                    callback_data=f"{TORRENT_ACTION_CB_PREFIX}del_data:{torrent.id}:{mode}",
                 ),
             ]
         )
@@ -1837,8 +1837,8 @@ async def on_torrent_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         await query.answer("Некорректные данные", show_alert=True)
         return
 
-    if action == "del_keep":
-        await _request_delete_confirmation(update, ctx, action="del_keep", torrent_id=torrent_id)
+    if action in {"del_keep", "del_data"}:
+        await _request_delete_confirmation(update, ctx, action=action, torrent_id=torrent_id)
         await query.answer()
         return
 
