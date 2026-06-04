@@ -404,20 +404,27 @@ STATUS_ICONS = {
 }
 
 
+def _require_user_data(ctx: ContextTypes.DEFAULT_TYPE) -> dict[Any, Any]:
+    user_data = ctx.user_data
+    if user_data is None:
+        raise RuntimeError("User data is unavailable for this context")
+    return user_data
+
+
 def set_menu(ctx: ContextTypes.DEFAULT_TYPE, menu: str) -> None:
-    ctx.user_data["menu"] = menu
+    _require_user_data(ctx)["menu"] = menu
 
 
 def get_menu(ctx: ContextTypes.DEFAULT_TYPE) -> str:
-    return str(ctx.user_data.get("menu", MENU_MAIN))
+    return str(_require_user_data(ctx).get("menu", MENU_MAIN))
 
 
 def set_wait(ctx: ContextTypes.DEFAULT_TYPE, wait: Optional[str]) -> None:
-    ctx.user_data["wait"] = wait
+    _require_user_data(ctx)["wait"] = wait
 
 
 def get_wait(ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
-    value = ctx.user_data.get("wait", WAIT_NONE)
+    value = _require_user_data(ctx).get("wait", WAIT_NONE)
     return str(value) if isinstance(value, str) else None
 
 
@@ -1043,7 +1050,7 @@ async def _cleanup_previous_ephemeral(update: Update, ctx: ContextTypes.DEFAULT_
     chat = update.effective_chat
     if chat is None:
         return
-    old_message_id = ctx.user_data.get(LAST_EPHEMERAL_MESSAGE_KEY)
+    old_message_id = _require_user_data(ctx).get(LAST_EPHEMERAL_MESSAGE_KEY)
     if isinstance(old_message_id, int):
         await _delete_message_safe(ctx, chat.id, old_message_id)
 
@@ -1059,7 +1066,7 @@ async def send_ephemeral(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: s
         lambda: message.reply_text(text=text, reply_markup=reply_markup),
         op_name="send_ephemeral.reply_text",
     )
-    ctx.user_data[LAST_EPHEMERAL_MESSAGE_KEY] = sent.message_id
+    _require_user_data(ctx)[LAST_EPHEMERAL_MESSAGE_KEY] = sent.message_id
 
 
 async def _delete_user_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2042,8 +2049,8 @@ async def send_torrent_list(
     else:
         items = _sort_torrents(items)
 
-    ctx.user_data["last_list_mode"] = mode
-    ctx.user_data["last_list_query"] = query
+    _require_user_data(ctx)["last_list_mode"] = mode
+    _require_user_data(ctx)["last_list_query"] = query
 
     if total == 0:
         await reply_chunks(update, "Пусто.", reply_markup=TORRENT_LIST_KEYBOARD)
@@ -2247,7 +2254,7 @@ async def _request_delete_confirmation(
 
     set_wait(ctx, WAIT_NONE)
     set_menu(ctx, MENU_CTRL)
-    ctx.user_data[PENDING_CTRL_ACTION_KEY] = {"action": action, "torrent_id": torrent_id}
+    _require_user_data(ctx)[PENDING_CTRL_ACTION_KEY] = {"action": action, "torrent_id": torrent_id}
 
     await reply_chunks(
         update,
@@ -2266,12 +2273,12 @@ async def on_delete_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         return
 
     data = query.data or ""
-    pending = ctx.user_data.get(PENDING_CTRL_ACTION_KEY)
+    pending = _require_user_data(ctx).get(PENDING_CTRL_ACTION_KEY)
     set_menu(ctx, MENU_CTRL)
     set_wait(ctx, WAIT_NONE)
 
     if data == CANCEL_DEL_DATA_CB or data == CANCEL_DEL_KEEP_CB:
-        ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
+        _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
         await query.answer("Отменено")
         await query.edit_message_reply_markup(reply_markup=None)
         await reply_chunks(update, "Ок, удаление отменено.", reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
@@ -2295,7 +2302,7 @@ async def on_delete_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await query.answer("Запрос подтверждения устарел", show_alert=True)
         return
 
-    ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
+    _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
     await query.answer("Выполняю…")
     await query.edit_message_reply_markup(reply_markup=None)
     await ctrl_action(update, ctx, action, torrent_id=torrent_id)
@@ -2520,12 +2527,12 @@ async def _handle_menu_command(
         await send_ephemeral(update, ctx, "Пришли ID торрента для запуска:", reply_markup=KB_CTRL)
 
     async def _ask_del_keep() -> None:
-        ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
+        _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
         set_wait(ctx, WAIT_CTRL_DEL_KEEP)
         await send_ephemeral(update, ctx, "Пришли ID торрента для удаления (данные останутся на диске):", reply_markup=KB_CTRL)
 
     async def _ask_del_data() -> None:
-        ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
+        _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
         set_wait(ctx, WAIT_CTRL_DEL_DATA)
         await send_ephemeral(update, ctx, "⚠️ Пришли ID торрента для удаления вместе с данными:", reply_markup=KB_CTRL)
 
@@ -2588,7 +2595,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 await send_ephemeral(update, ctx, "Сейчас нет активного ввода 🙂", reply_markup=KB_MAIN)
                 return
             set_wait(ctx, WAIT_NONE)
-            ctx.user_data.pop(PENDING_CTRL_ACTION_KEY, None)
+            _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
             await send_ephemeral(update, ctx, "Ввод отменён. Выбери следующее действие.", reply_markup=KB_MAIN)
             return
 
