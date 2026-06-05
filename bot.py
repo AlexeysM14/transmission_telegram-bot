@@ -22,7 +22,7 @@ from datetime import datetime, time
 from math import ceil
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Optional, Sequence
+from typing import Any, Awaitable, Callable, Coroutine, Optional, Sequence
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -627,8 +627,8 @@ async def tr_call(fn: Callable[[Client], Any]) -> Any:
 
 def build_telegram_application(
     *,
-    post_init: Callable[[Application], Awaitable[None]],
-    post_shutdown: Callable[[Application], Awaitable[None]],
+    post_init: Callable[[Application], Coroutine[Any, Any, None]],
+    post_shutdown: Callable[[Application], Coroutine[Any, Any, None]],
 ) -> Application:
     cfg = get_config()
     builder = (
