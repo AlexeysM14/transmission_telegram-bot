@@ -1,0 +1,32 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Static analysis: Ruff check",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "-m",
+                "ruff",
+                "check",
+                "."
+            ],
+            "group": "test",
+            "problemMatcher": []
+        },
+        {
+            "label": "Static analysis: Ruff format check",
+            "type": "shell",
+            "command": "${workspaceFolder}/.venv/bin/python",
+            "args": [
+                "-m",
+                "ruff",
+                "format",
+                "--check",
+                "."
+            ],
+            "group": "test",
+            "problemMatcher": []
+        }
+    ]
+}

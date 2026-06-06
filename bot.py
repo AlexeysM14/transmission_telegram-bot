@@ -22,9 +22,9 @@ from datetime import datetime, time
 from math import ceil
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, Coroutine, Optional, Sequence
+from typing import Any, Awaitable, Callable, Coroutine, Literal, Optional, Sequence, cast
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError, TimedOut
 from telegram.ext import (
@@ -102,6 +102,7 @@ TORRENT_ID_RE = re.compile(r"\b(\d{1,9})\b")
 _TR_CLIENT: Optional[Client] = None
 _TR_CLIENT_LOCK = threading.Lock()
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+TransmissionProtocol = Literal["http", "https"]
 
 
 class TRCallError(Exception):
@@ -117,7 +118,7 @@ class Config:
     tg_get_updates_proxy: Optional[str]
 
     tr_url: Optional[str]
-    tr_protocol: str
+    tr_protocol: TransmissionProtocol
     tr_host: str
     tr_port: int
     tr_path: str
@@ -226,8 +227,12 @@ def load_config() -> Config:
     if not tg_token:
         raise RuntimeError("ENV TG_TOKEN is required")
 
-    tr_protocol = os.environ.get("TR_PROTOCOL", "http").strip().lower()
-    if tr_protocol not in {"http", "https"}:
+    tr_protocol_raw = os.environ.get("TR_PROTOCOL", "http").strip().lower()
+    if tr_protocol_raw == "http":
+        tr_protocol: TransmissionProtocol = "http"
+    elif tr_protocol_raw == "https":
+        tr_protocol = "https"
+    else:
         raise RuntimeError("TR_PROTOCOL must be 'http' or 'https'")
 
     tr_port = _parse_int_env("TR_PORT", "9091", min_value=1, max_value=65535)
@@ -534,8 +539,10 @@ def _torrent_eta_seconds(torrent: Any) -> Optional[int]:
 
     total_seconds = getattr(eta, "total_seconds", None)
     if callable(total_seconds):
-        seconds = int(total_seconds())
-        return seconds if seconds >= 0 else None
+        raw_seconds = total_seconds()
+        if isinstance(raw_seconds, (int, float)):
+            seconds = int(raw_seconds)
+            return seconds if seconds >= 0 else None
 
     left_until_done = _torrent_left_until_done(torrent)
     rate_download = getattr(torrent, "rate_download", None)
@@ -1931,13 +1938,14 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in day_points))}</b>"
         )
 
-        if query.message is None:
+        message = query.message
+        if not isinstance(message, Message):
             await query.answer("Не удалось отправить график", show_alert=True)
             return
 
         image_file = InputFile(io.BytesIO(chart_payload), filename="traffic_month.png")
         try:
-            await query.message.reply_photo(
+            await message.reply_photo(
                 photo=image_file,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
@@ -1972,13 +1980,14 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         f"| ⇡ <b>{fmt_bytes(sum(int(item['uploaded']) for item in chart_points))}</b>"
     )
 
-    if query.message is None:
+    message = query.message
+    if not isinstance(message, Message):
         await query.answer("Не удалось отправить график", show_alert=True)
         return
 
     image_file = InputFile(io.BytesIO(chart_payload), filename="traffic_7d.png")
     try:
-        await query.message.reply_photo(
+        await message.reply_photo(
             photo=image_file,
             caption=caption,
             parse_mode=ParseMode.HTML,
@@ -2827,7 +2836,7 @@ def main() -> None:
 
     async def notify_completed_torrents_fallback(app: Application) -> None:
         while True:
-            fake_ctx = SimpleNamespace(application=app, bot=app.bot)
+            fake_ctx = cast(ContextTypes.DEFAULT_TYPE, SimpleNamespace(application=app, bot=app.bot))
             await notify_completed_torrents(fake_ctx)
             await snapshot_traffic_anchors(fake_ctx)
             await asyncio.sleep(NOTIFY_POLL_INTERVAL_SEC)

@@ -1,0 +1,9 @@
+{
+    "include": [
+        "bot.py"
+    ],
+    "pythonVersion": "3.9",
+    "typeCheckingMode": "basic",
+    "venv": ".venv",
+    "venvPath": "."
+}
