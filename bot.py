@@ -5,24 +5,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import html
 import heapq
+import html
 import io
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import re
 import tempfile
 import threading
 import time as time_module
-from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime, time
+from logging.handlers import RotatingFileHandler
 from math import ceil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Coroutine, Literal, Optional, Sequence, cast
+from urllib.parse import urlsplit, urlunsplit
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -30,14 +30,13 @@ from telegram.error import TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 from telegram.request import HTTPXRequest
-
 from transmission_rpc import Client, from_url
 from transmission_rpc.error import TransmissionError
 
@@ -744,7 +743,11 @@ async def reply_chunks(
         kwargs: dict[str, Any] = {"text": part, "parse_mode": parse_mode}
         if idx == len(chunks) - 1:
             kwargs["reply_markup"] = reply_markup
-        await _send_with_timeout_retry(lambda: message.reply_text(**kwargs), op_name="reply_text")
+        send_kwargs = kwargs.copy()
+        await _send_with_timeout_retry(
+            lambda send_kwargs=send_kwargs: message.reply_text(**send_kwargs),
+            op_name="reply_text",
+        )
 
 
 async def _send_with_timeout_retry(
@@ -774,6 +777,19 @@ async def _send_with_timeout_retry(
             await asyncio.sleep(delay)
 
     raise last_error if last_error is not None else RuntimeError(f"{op_name} failed without TimedOut exception")
+
+
+async def _send_html_message_with_retry(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    text: str,
+    *,
+    op_name: str,
+) -> None:
+    await _send_with_timeout_retry(
+        lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+        op_name=op_name,
+    )
 
 
 STATUS_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить статус", callback_data=STATUS_REFRESH_CB)]])
@@ -1062,7 +1078,12 @@ async def _cleanup_previous_ephemeral(update: Update, ctx: ContextTypes.DEFAULT_
         await _delete_message_safe(ctx, chat.id, old_message_id)
 
 
-async def send_ephemeral(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str, reply_markup: ReplyKeyboardMarkup) -> None:
+async def send_ephemeral(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup: ReplyKeyboardMarkup,
+) -> None:
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat is None:
@@ -1108,19 +1129,31 @@ def _build_status_text(stats: Any, free_space: Optional[int], torrents: Sequence
     session_duration = _format_session_duration(getattr(cur, "seconds_active", 0))
     free_space_text = _build_free_space_text(free_space)
     active_torrents_text = _build_active_torrents_text(torrents)
+    torrent_counts_text = (
+        f"Торренты: активных <b>{stats.active_torrent_count}</b>, "
+        f"на паузе <b>{stats.paused_torrent_count}</b>, всего <b>{stats.torrent_count}</b>"
+    )
+    session_traffic_text = (
+        f"Трафик (сессия - {session_duration}): "
+        f"⇣ <b>{fmt_bytes(cur.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cur.uploaded_bytes)}</b>"
+    )
+    total_traffic_text = (
+        f"Трафик (всего): "
+        f"⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>"
+    )
     return (
         "📊 <b>Transmission — статус</b>\n"
         f"Скорость: ⇣ <b>{fmt_rate(stats.download_speed)}</b> | ⇡ <b>{fmt_rate(stats.upload_speed)}</b>\n"
-        f"Торренты: активных <b>{stats.active_torrent_count}</b>, на паузе <b>{stats.paused_torrent_count}</b>, всего <b>{stats.torrent_count}</b>\n"
+        f"{torrent_counts_text}\n"
         f"Активные сейчас:\n{active_torrents_text}\n\n"
         f"{free_space_text}\n"
-        f"Трафик (сессия - {session_duration}): ⇣ <b>{fmt_bytes(cur.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cur.uploaded_bytes)}</b>\n"
-        f"Трафик (всего): ⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>\n"
+        f"{session_traffic_text}\n"
+        f"{total_traffic_text}\n"
         f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
 
-def _read_traffic_state() -> tuple[dict[str, dict[str, int | str]], list[dict[str, int | str]]]:
+def _read_traffic_state() -> tuple[dict[str, dict[str, int | str]], list[dict[str, int | str]]]:  # noqa: C901
     try:
         data = json.loads(TRAFFIC_ANCHORS_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1875,7 +1908,7 @@ async def _edit_traffic_message(query: Any, text: str) -> None:
     await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=TRAFFIC_OVERVIEW_KEYBOARD)
 
 
-async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: C901
     query = update.callback_query
     if query is None:
         return
@@ -2021,7 +2054,7 @@ def _is_torrent_completed(torrent: Any) -> bool:
     return left_until_done == 0 and torrent_total_size(torrent) > 0
 
 
-async def send_torrent_list(
+async def send_torrent_list(  # noqa: C901
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     mode: str,
@@ -2031,7 +2064,11 @@ async def send_torrent_list(
     try:
         torrents = await tr_call(lambda c: c.get_torrents())
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=TORRENT_LIST_KEYBOARD)
+        await reply_chunks(
+            update,
+            f"❌ Ошибка Transmission: {html.escape(str(exc))}",
+            reply_markup=TORRENT_LIST_KEYBOARD,
+        )
         return
 
     items = torrents
@@ -2073,7 +2110,8 @@ async def send_torrent_list(
         lines.append(
             f"<b>{t.id}</b> {status_icon(st)} {safe_name} • <b>{size_text}</b>\n"
             f"   {_format_progress_summary(t)}\n"
-            f"   ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
+            f"   ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | "
+            f"Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
         )
 
     header = {
@@ -2195,6 +2233,8 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str, torrent_id: int) -> None:
+    ctrl_keyboard = _ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None)
+
     try:
         if action == "pause":
             await tr_call(lambda c: c.stop_torrent(torrent_id))
@@ -2213,10 +2253,14 @@ async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: st
         else:
             msg = "❌ Неизвестное действие"
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
+        await reply_chunks(
+            update,
+            f"❌ Ошибка Transmission: {html.escape(str(exc))}",
+            reply_markup=ctrl_keyboard,
+        )
         return
 
-    await reply_chunks(update, msg, reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
+    await reply_chunks(update, msg, reply_markup=ctrl_keyboard)
 
 
 def _build_delete_confirm_keyboard(action: str, torrent_id: int) -> InlineKeyboardMarkup:
@@ -2255,10 +2299,16 @@ async def _request_delete_confirmation(
     action: str,
     torrent_id: int,
 ) -> None:
+    ctrl_keyboard = _ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None)
+
     try:
         torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
+        await reply_chunks(
+            update,
+            f"❌ Ошибка Transmission: {html.escape(str(exc))}",
+            reply_markup=ctrl_keyboard,
+        )
         return
 
     set_wait(ctx, WAIT_NONE)
@@ -2286,11 +2336,12 @@ async def on_delete_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     set_menu(ctx, MENU_CTRL)
     set_wait(ctx, WAIT_NONE)
 
-    if data == CANCEL_DEL_DATA_CB or data == CANCEL_DEL_KEEP_CB:
+    if data in (CANCEL_DEL_DATA_CB, CANCEL_DEL_KEEP_CB):
         _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
         await query.answer("Отменено")
         await query.edit_message_reply_markup(reply_markup=None)
-        await reply_chunks(update, "Ок, удаление отменено.", reply_markup=_ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None))
+        ctrl_keyboard = _ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None)
+        await reply_chunks(update, "Ок, удаление отменено.", reply_markup=ctrl_keyboard)
         return
 
     action = "del_data" if data.startswith(CONFIRM_DEL_DATA_CB_PREFIX) else "del_keep"
@@ -2427,7 +2478,12 @@ async def _handle_wait_state(update: Update, ctx: ContextTypes.DEFAULT_TYPE, wai
 
 async def _toggle_notifications(update: Update, ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
     if chat_id is None:
-        await send_ephemeral(update, ctx, "❌ Не удалось определить чат для настройки уведомлений.", reply_markup=KB_CTRL)
+        await send_ephemeral(
+            update,
+            ctx,
+            "❌ Не удалось определить чат для настройки уведомлений.",
+            reply_markup=KB_CTRL,
+        )
         return
 
     enabled_chats = ctx.application.bot_data.setdefault(NOTIFY_ENABLED_CHATS_KEY, set())
@@ -2441,7 +2497,12 @@ async def _toggle_notifications(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     await send_ephemeral(update, ctx, status_text, reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id))
 
 
-async def _handle_global_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str, chat_id: Optional[int]) -> bool:
+async def _handle_global_command(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    chat_id: Optional[int],
+) -> bool:
     async def _open_main_status() -> None:
         set_menu(ctx, MENU_MAIN)
         set_wait(ctx, WAIT_NONE)
@@ -2484,7 +2545,7 @@ async def _handle_global_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     return True
 
 
-async def _handle_menu_command(
+async def _handle_menu_command(  # noqa: C901
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     menu: str,
@@ -2538,7 +2599,12 @@ async def _handle_menu_command(
     async def _ask_del_keep() -> None:
         _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
         set_wait(ctx, WAIT_CTRL_DEL_KEEP)
-        await send_ephemeral(update, ctx, "Пришли ID торрента для удаления (данные останутся на диске):", reply_markup=KB_CTRL)
+        await send_ephemeral(
+            update,
+            ctx,
+            "Пришли ID торрента для удаления (данные останутся на диске):",
+            reply_markup=KB_CTRL,
+        )
 
     async def _ask_del_data() -> None:
         _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
@@ -2575,7 +2641,7 @@ async def _handle_menu_command(
     return True
 
 
-async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: C901
     if update.effective_chat and update.effective_chat.type != "private":
         return
 
@@ -2631,10 +2697,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _delete_user_message(update, ctx)
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901
     initialize_runtime()
 
-    async def notify_completed_torrents(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    async def notify_completed_torrents(ctx: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: C901
         enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
         if not isinstance(enabled_chats, set) or not enabled_chats:
             return
@@ -2699,8 +2765,10 @@ def main() -> None:
                     if chat_id not in enabled_chats:
                         continue
                     try:
-                        await _send_with_timeout_retry(
-                            lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                        await _send_html_message_with_retry(
+                            ctx,
+                            chat_id,
+                            text,
                             op_name="notify_completed.send_message",
                         )
                     except TelegramError:
@@ -2727,8 +2795,10 @@ def main() -> None:
                 if chat_id in already_notified:
                     continue
                 try:
-                    await _send_with_timeout_retry(
-                        lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                    await _send_html_message_with_retry(
+                        ctx,
+                        chat_id,
+                        text,
                         op_name="notify_completed.send_message",
                     )
                 except TelegramError:
@@ -2769,8 +2839,10 @@ def main() -> None:
                         if chat_id not in enabled_chats:
                             continue
                         try:
-                            await _send_with_timeout_retry(
-                                lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                            await _send_html_message_with_retry(
+                                ctx,
+                                chat_id,
+                                text,
                                 op_name="notify_started.send_message",
                             )
                         except TelegramError:
@@ -2804,8 +2876,10 @@ def main() -> None:
                 if chat_id not in enabled_chats:
                     continue
                 try:
-                    await _send_with_timeout_retry(
-                        lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
+                    await _send_html_message_with_retry(
+                        ctx,
+                        chat_id,
+                        text,
                         op_name="notify_no_peers.send_message",
                     )
                 except TelegramError:
@@ -2872,7 +2946,12 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
-    app.add_handler(CallbackQueryHandler(on_list_refresh, pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|stopped|done)$"))
+    app.add_handler(
+        CallbackQueryHandler(
+            on_list_refresh,
+            pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|stopped|done)$",
+        )
+    )
     app.add_handler(CallbackQueryHandler(on_torrent_action, pattern=f"^{TORRENT_ACTION_CB_PREFIX}"))
     app.add_handler(CallbackQueryHandler(on_traffic_view, pattern=f"^{TRAFFIC_VIEW_CB_PREFIX}(refresh|7d|4w)$"))
     app.add_handler(

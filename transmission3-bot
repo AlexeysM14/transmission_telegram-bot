@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import grp
 import json
 import os
 import pwd
 import socket
+
 # CLI intentionally runs fixed system commands.
 import subprocess  # nosec B404
 import sys
@@ -77,10 +79,8 @@ def save_env(values: dict[str, str]) -> None:
         os.replace(tmp_path, ENV_FILE)
         secure_env_file()
     except Exception:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()
-        except FileNotFoundError:
-            pass
         raise
 
     print(f"✅ Saved {ENV_FILE}")
@@ -223,7 +223,14 @@ def build_proxy_handler(proxy_url: Optional[str]) -> ProxyHandler:
     return ProxyHandler({"http": proxy_url, "https": proxy_url})
 
 
-def open_url(url: str, *, proxy_url: Optional[str], timeout: float, headers: Optional[dict[str, str]] = None, data: bytes | None = None) -> bytes:
+def open_url(
+    url: str,
+    *,
+    proxy_url: Optional[str],
+    timeout: float,
+    headers: Optional[dict[str, str]] = None,
+    data: bytes | None = None,
+) -> bytes:
     opener = build_opener(build_proxy_handler(proxy_url))
     request = Request(url, data=data, headers=headers or {})
     with opener.open(request, timeout=timeout) as response:
@@ -259,7 +266,7 @@ def build_basic_auth(user: Optional[str], password: Optional[str]) -> Optional[s
     return f"Basic {token}"
 
 
-def check_transmission_rpc(env: dict[str, str]) -> tuple[bool, str]:
+def check_transmission_rpc(env: dict[str, str]) -> tuple[bool, str]:  # noqa: C901
     url = build_transmission_url(env)
     timeout = parse_timeout(env.get("TR_TIMEOUT", "10"))
     headers = {"Content-Type": "application/json"}
@@ -340,7 +347,7 @@ def check_tcp_target(raw_url: str, *, timeout: float, label: str) -> tuple[bool,
         return False, f"{label}: tcp error: {exc}"
 
 
-def print_status() -> int:
+def print_status() -> int:  # noqa: C901
     env = load_env()
     timeout = parse_timeout(env.get("TR_TIMEOUT", "10"))
     tg_token = env.get("TG_TOKEN", "").strip()
@@ -384,7 +391,14 @@ def print_status() -> int:
         if code != 0 and field == "active":
             service_ok = False
 
-    code, out, err = run_capture(["systemctl", "show", SERVICE_NAME, "--property=MainPID,ExecMainStatus,ExecMainStartTimestamp,FragmentPath"])
+    code, out, err = run_capture(
+        [
+            "systemctl",
+            "show",
+            SERVICE_NAME,
+            "--property=MainPID,ExecMainStatus,ExecMainStartTimestamp,FragmentPath",
+        ]
+    )
     if code == 0:
         for line in out.splitlines():
             if line:
@@ -413,7 +427,12 @@ def print_status() -> int:
         overall_ok = overall_ok and upd_tcp_ok
 
     if tg_token:
-        bot_ok, bot_message = check_telegram_api(tg_token, proxy_url=tg_proxy, timeout=timeout, label="Telegram Bot API")
+        bot_ok, bot_message = check_telegram_api(
+            tg_token,
+            proxy_url=tg_proxy,
+            timeout=timeout,
+            label="Telegram Bot API",
+        )
         print(bot_message)
         overall_ok = overall_ok and bot_ok
 
@@ -434,7 +453,7 @@ def print_status() -> int:
     return 0 if overall_ok else 1
 
 
-def menu() -> None:
+def menu() -> None:  # noqa: C901
     while True:
         print(
             "\n=== transmission3-bot update ===\n"
@@ -481,7 +500,8 @@ def menu() -> None:
             elif choice == "5":
                 data = load_env()
                 value = input(
-                    "Enter Telegram getUpdates proxy URL (leave empty to reuse TG_PROXY; supported: http(s):// or socks5://): "
+                    "Enter Telegram getUpdates proxy URL "
+                    "(leave empty to reuse TG_PROXY; supported: http(s):// or socks5://): "
                 ).strip()
                 if not value:
                     data.pop("TG_GET_UPDATES_PROXY", None)
