@@ -375,9 +375,11 @@ NOTIFY_COMPLETED_CACHE_KEY = "notify_completed_cache"
 NOTIFY_COMPLETION_PENDING_KEY = "notify_completion_pending"
 NOTIFY_INITIALIZED_KEY = "notify_initialized"
 NOTIFY_START_PENDING_KEY = "notify_start_pending"
+NOTIFY_START_TASKS_KEY = "notify_start_tasks"
 TRAFFIC_LAST_SNAPSHOT_DAY_KEY = "traffic_last_snapshot_day"
 
 NOTIFY_POLL_INTERVAL_SEC = 60
+NOTIFY_START_QUICK_DELAYS_SEC = (0.0, 2.0, 5.0, 15.0, 30.0)
 NOTIFY_NO_PEERS_DELAY_SEC = 10 * 60
 TRAFFIC_ANCHORS_PATH = Path(__file__).resolve().with_name("traffic_anchors.json")
 TRAFFIC_STATE_LOCK = asyncio.Lock()
@@ -907,6 +909,125 @@ def _register_torrent_completion_watch(
         chat_ids = set()
         state["chat_ids"] = chat_ids
     chat_ids.add(chat_id)
+
+
+def _torrent_start_detected(torrent: Any) -> bool:
+    downloaded_ever = float(max(0.0, getattr(torrent, "downloaded_ever", 0.0)))
+    percent_done = float(max(0.0, getattr(torrent, "percent_done", 0.0)))
+    rate_download = float(max(0.0, getattr(torrent, "rate_download", 0.0)))
+    status_raw = str(getattr(torrent, "status", "") or "").strip().lower()
+    started_by_status = status_raw in DOWNLOADING_STATUSES
+    return downloaded_ever > 0.0 or percent_done > 0.0 or rate_download > 0.0 or started_by_status
+
+
+def _pop_pending_torrent_start(ctx: ContextTypes.DEFAULT_TYPE, torrent_id: int) -> Optional[dict[Any, Any]]:
+    pending = ctx.application.bot_data.get(NOTIFY_START_PENDING_KEY)
+    if not isinstance(pending, dict):
+        return None
+
+    state = pending.pop(torrent_id, None)
+    return state if isinstance(state, dict) else None
+
+
+def _build_torrent_start_notification_text(torrent_id: int, name: str) -> str:
+    safe_name = html.escape(name or "<без названия>")
+    return (
+        "▶️ <b>Скачивание началось</b>\n"
+        f"Торрент: <b>{safe_name}</b>\n"
+        f"ID: <b>{torrent_id}</b>"
+    )
+
+
+async def _send_torrent_start_notification(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    torrent_id: int,
+    state: dict[Any, Any],
+    torrent: Any,
+) -> None:
+    enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
+    if not isinstance(enabled_chats, set) or not enabled_chats:
+        return
+
+    chat_ids = state.get("chat_ids")
+    if not isinstance(chat_ids, set) or not chat_ids:
+        return
+
+    name = str(state.get("name") or getattr(torrent, "name", "<без названия>"))
+    text = _build_torrent_start_notification_text(torrent_id, name)
+
+    for chat_id in list(chat_ids):
+        if chat_id not in enabled_chats:
+            continue
+        try:
+            await _send_html_message_with_retry(
+                ctx,
+                chat_id,
+                text,
+                op_name="notify_started.send_message",
+            )
+        except TelegramError:
+            log.warning("Failed to send start notification to chat %s", chat_id, exc_info=True)
+
+
+async def _notify_torrent_start_soon(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    torrent_id: int,
+    initial_torrent: Any,
+) -> None:
+    torrent = initial_torrent
+    for delay_sec in NOTIFY_START_QUICK_DELAYS_SEC:
+        if delay_sec > 0:
+            await asyncio.sleep(delay_sec)
+
+        pending = ctx.application.bot_data.get(NOTIFY_START_PENDING_KEY)
+        if not isinstance(pending, dict) or torrent_id not in pending:
+            return
+
+        if torrent is None:
+            try:
+                torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
+            except (TransmissionError, TRCallError):
+                log.warning("Skipping quick start notification check due to Transmission error", exc_info=True)
+                return
+
+            pending = ctx.application.bot_data.get(NOTIFY_START_PENDING_KEY)
+            if not isinstance(pending, dict) or torrent_id not in pending:
+                return
+
+        if _torrent_start_detected(torrent):
+            state = _pop_pending_torrent_start(ctx, torrent_id)
+            if state is not None:
+                await _send_torrent_start_notification(ctx, torrent_id, state, torrent)
+            return
+
+        torrent = None
+
+
+def _finish_torrent_start_task(app: Application, task: asyncio.Task[None]) -> None:
+    tasks = app.bot_data.get(NOTIFY_START_TASKS_KEY)
+    if isinstance(tasks, set):
+        tasks.discard(task)
+
+    with contextlib.suppress(asyncio.CancelledError):
+        exc = task.exception()
+        if exc is not None:
+            log.warning("Quick start notification task failed", exc_info=(type(exc), exc, exc.__traceback__))
+
+
+def _schedule_torrent_start_watch(ctx: ContextTypes.DEFAULT_TYPE, torrent: Any) -> None:
+    torrent_id = int(getattr(torrent, "id", 0))
+    if torrent_id <= 0:
+        return
+
+    tasks = ctx.application.bot_data.setdefault(NOTIFY_START_TASKS_KEY, set())
+    if not isinstance(tasks, set):
+        tasks = set()
+        ctx.application.bot_data[NOTIFY_START_TASKS_KEY] = tasks
+
+    task_ctx = cast(ContextTypes.DEFAULT_TYPE, SimpleNamespace(application=ctx.application, bot=ctx.bot))
+    task = asyncio.create_task(_notify_torrent_start_soon(task_ctx, torrent_id, torrent))
+    tasks.add(task)
+    task.add_done_callback(lambda done_task: _finish_torrent_start_task(ctx.application, done_task))
 
 
 def _ensure_chat_notifications_initialized(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
@@ -2173,6 +2294,7 @@ async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
     )
+    _schedule_torrent_start_watch(ctx, torrent)
 
 
 def is_magnet_or_torrent_link(text: str) -> bool:
@@ -2230,6 +2352,7 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
     )
+    _schedule_torrent_start_watch(ctx, torrent)
 
 
 async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str, torrent_id: int) -> None:
@@ -2820,35 +2943,10 @@ def main() -> None:  # noqa: C901
                 expired_ids.append(torrent_id)
                 continue
 
-            downloaded_ever = float(max(0.0, getattr(torrent, "downloaded_ever", 0.0)))
-            percent_done = float(max(0.0, getattr(torrent, "percent_done", 0.0)))
-            rate_download = float(max(0.0, getattr(torrent, "rate_download", 0.0)))
-            status_raw = str(getattr(torrent, "status", "") or "").strip().lower()
-            started_by_status = status_raw in {"downloading", "download pending"}
-            if downloaded_ever > 0.0 or percent_done > 0.0 or rate_download > 0.0 or started_by_status:
-                chat_ids = state.get("chat_ids")
-                if isinstance(chat_ids, set) and chat_ids:
-                    safe_name = html.escape(str(state.get("name") or getattr(torrent, "name", "<без названия>")))
-                    text = (
-                        "▶️ <b>Скачивание началось</b>\n"
-                        f"Торрент: <b>{safe_name}</b>\n"
-                        f"ID: <b>{torrent_id}</b>"
-                    )
-
-                    for chat_id in list(chat_ids):
-                        if chat_id not in enabled_chats:
-                            continue
-                        try:
-                            await _send_html_message_with_retry(
-                                ctx,
-                                chat_id,
-                                text,
-                                op_name="notify_started.send_message",
-                            )
-                        except TelegramError:
-                            log.warning("Failed to send start notification to chat %s", chat_id, exc_info=True)
-
-                expired_ids.append(torrent_id)
+            if _torrent_start_detected(torrent):
+                state_to_notify = _pop_pending_torrent_start(ctx, torrent_id)
+                if state_to_notify is not None:
+                    await _send_torrent_start_notification(ctx, torrent_id, state_to_notify, torrent)
                 continue
 
             added_at = state.get("added_at")
@@ -2929,6 +3027,15 @@ def main() -> None:  # noqa: C901
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        start_tasks = app.bot_data.pop(NOTIFY_START_TASKS_KEY, None)
+        if isinstance(start_tasks, set):
+            for start_task in list(start_tasks):
+                if isinstance(start_task, asyncio.Task):
+                    start_task.cancel()
+            for start_task in list(start_tasks):
+                if isinstance(start_task, asyncio.Task):
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await start_task
 
     app = build_telegram_application(post_init=on_post_init, post_shutdown=on_post_shutdown)
 
