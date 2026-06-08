@@ -41,6 +41,20 @@ from transmission_rpc import Client, from_url
 from transmission_rpc.error import TransmissionError
 
 
+class EventTimeFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        if "\n" not in formatted:
+            return formatted
+
+        prefix = self._line_prefix(record)
+        return "\n".join(line if index == 0 else f"{prefix}{line}" for index, line in enumerate(formatted.splitlines()))
+
+    def _line_prefix(self, record: logging.LogRecord) -> str:
+        timestamp = self.formatTime(record, self.datefmt)
+        return f"{timestamp}.{int(record.msecs):03d}Z | {record.levelname} | {record.name} | "
+
+
 def load_dotenv_file(path: Path) -> None:
     if not path.exists():
         return
@@ -67,7 +81,7 @@ def configure_logging() -> logging.Logger:
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
-    console_formatter = logging.Formatter(log_format, datefmt=log_date_format)
+    console_formatter = EventTimeFormatter(log_format, datefmt=log_date_format)
     console_formatter.converter = time_module.gmtime
     console_handler.setFormatter(console_formatter)
     root_logger.addHandler(console_handler)
@@ -83,7 +97,7 @@ def configure_logging() -> logging.Logger:
         encoding="utf-8",
     )
     file_handler.setLevel(logging.WARNING)
-    file_formatter = logging.Formatter(log_format, datefmt=log_date_format)
+    file_formatter = EventTimeFormatter(log_format, datefmt=log_date_format)
     file_formatter.converter = time_module.gmtime
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
