@@ -1390,8 +1390,8 @@ def _ensure_daily_traffic_history(
 
     history.append({"date": day_key, "downloaded": downloaded, "uploaded": uploaded})
     # Храним небольшой хвост: достаточно для текущего месяца + запас.
-    if len(history) > 45:
-        del history[:-45]
+    if len(history) > 365:
+        del history[:-365]
     return True
 
 
