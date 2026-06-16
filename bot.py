@@ -513,9 +513,9 @@ def torrent_progress_percent(torrent: Any) -> float:
 
 def _progress_segment_symbol(index: int, width: int) -> str:
     position = (index + 1) / max(1, width)
-    if position <= 0.35:
-        return "🟦"
-    if position <= 0.70:
+    if position <= 0.33:
+        return "🟥"
+    if position <= 0.66:
         return "🟨"
     return "🟩"
 
