@@ -583,9 +583,12 @@ def _format_eta(torrent: Any) -> str:
     return f"осталось: {_format_download_duration(eta_seconds)}"
 
 
-def _format_progress_summary(torrent: Any) -> str:
+def _format_progress_summary(torrent: Any, *, hide_completed_bar: bool = False) -> str:
     progress = torrent_progress_percent(torrent)
-    return f"{_format_progress_bar(progress)} <b>{progress:.1f}%</b> · {_format_eta(torrent)}"
+    progress_text = f"<b>{progress:.1f}%</b> · {_format_eta(torrent)}"
+    if hide_completed_bar and _is_torrent_completed(torrent):
+        return progress_text
+    return f"{_format_progress_bar(progress)} {progress_text}"
 
 
 def status_icon(status: str) -> str:
@@ -2244,7 +2247,7 @@ async def send_torrent_list(  # noqa: C901
         size_text = fmt_bytes(torrent_total_size(t))
         lines.append(
             f"<b>{t.id}</b> {status_icon(st)} {safe_name} • <b>{size_text}</b>\n"
-            f"   {_format_progress_summary(t)}\n"
+            f"   {_format_progress_summary(t, hide_completed_bar=True)}\n"
             f"   ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | "
             f"Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
         )
