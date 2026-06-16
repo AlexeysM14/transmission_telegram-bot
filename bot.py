@@ -513,16 +513,16 @@ def torrent_progress_percent(torrent: Any) -> float:
 
 def _progress_segment_symbol(index: int, width: int) -> str:
     position = (index + 1) / max(1, width)
-    if position <= 0.33:
+    if position <= 1 / 3:
         return "🟥"
-    if position <= 0.66:
+    if position <= 2 / 3:
         return "🟨"
     return "🟩"
 
 
-def _format_progress_bar(progress: int | float, *, width: int = 10) -> str:
+def _format_progress_bar(progress: int | float, *, width: int = 9) -> str:
     normalized = _clamp_progress(progress)
-    filled = int(normalized * width / 100.0)
+    filled = int((normalized * width / 100.0) + 0.5)
     if normalized > 0 and filled == 0:
         filled = 1
     if normalized >= 100:
