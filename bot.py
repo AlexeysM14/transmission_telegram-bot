@@ -307,6 +307,7 @@ MENU_MAIN = "MAIN"
 MENU_TORRENTS = "TORRENTS"
 MENU_ADD = "ADD"
 MENU_CTRL = "CTRL"
+MENU_HISTORY = "HISTORY"
 
 WAIT_NONE = None
 WAIT_SEARCH = "WAIT_SEARCH"
@@ -335,7 +336,7 @@ def kb_main() -> ReplyKeyboardMarkup:
         [
             ["📊 Статус", "📋 Торренты"],
             ["➕ Добавить", "⚙️ Управление"],
-            ["📈 Статистика"],
+            ["📈 Статистика", "📚 История раздач"],
         ]
     )
 
@@ -376,6 +377,7 @@ KB_CTRL = kb_ctrl(True)
 STATUS_REFRESH_CB = "status_refresh"
 LIST_REFRESH_CB_PREFIX = "list_refresh:"
 TRAFFIC_VIEW_CB_PREFIX = "traffic_view:"
+TORRENT_HISTORY_CB_PREFIX = "torrent_history:"
 TORRENT_ACTION_CB_PREFIX = "torrent_action:"
 CONFIRM_DEL_DATA_CB_PREFIX = "confirm_del_data:"
 CANCEL_DEL_DATA_CB = "cancel_del_data"
@@ -391,12 +393,30 @@ NOTIFY_INITIALIZED_KEY = "notify_initialized"
 NOTIFY_START_PENDING_KEY = "notify_start_pending"
 NOTIFY_START_TASKS_KEY = "notify_start_tasks"
 TRAFFIC_LAST_SNAPSHOT_DAY_KEY = "traffic_last_snapshot_day"
+TORRENT_HISTORY_LAST_PAGE_KEY = "torrent_history_last_page"
 
 NOTIFY_POLL_INTERVAL_SEC = 60
 NOTIFY_START_QUICK_DELAYS_SEC = (0.0, 2.0, 5.0, 15.0, 30.0)
 NOTIFY_NO_PEERS_DELAY_SEC = 10 * 60
 TRAFFIC_ANCHORS_PATH = Path(__file__).resolve().with_name("traffic_anchors.json")
 TRAFFIC_STATE_LOCK = asyncio.Lock()
+TORRENT_HISTORY_PATH = Path(__file__).resolve().with_name("torrent_history.json")
+TORRENT_HISTORY_LOCK = asyncio.Lock()
+TORRENT_HISTORY_FIELDS = (
+    "id",
+    "hashString",
+    "name",
+    "status",
+    "totalSize",
+    "sizeWhenDone",
+    "downloadedEver",
+    "uploadedEver",
+    "uploadRatio",
+    "percentDone",
+    "leftUntilDone",
+    "addedDate",
+    "doneDate",
+)
 DOWNLOADING_STATUSES = frozenset(
     {
         "downloading",
@@ -1918,6 +1938,497 @@ def _build_traffic_stats_text(
     return "\n".join(lines)
 
 
+def _read_torrent_history_state() -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(TORRENT_HISTORY_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    raw_items = data.get("items")
+    if not isinstance(raw_items, dict):
+        return {}
+
+    items: dict[str, dict[str, Any]] = {}
+    for key, value in raw_items.items():
+        if isinstance(key, str) and isinstance(value, dict):
+            items[key] = dict(value)
+    return items
+
+
+def _persist_torrent_history_state(items: dict[str, dict[str, Any]]) -> None:
+    payload = json.dumps(
+        {
+            "version": 1,
+            "updated_at": int(time_module.time()),
+            "items": items,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    tmp_path = TORRENT_HISTORY_PATH.with_suffix(".tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    tmp_path.replace(TORRENT_HISTORY_PATH)
+
+
+def _history_entry_int(entry: Optional[dict[str, Any]], field: str, default: int = 0) -> int:
+    if not isinstance(entry, dict):
+        return default
+    value = entry.get(field)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    return default
+
+
+def _history_entry_optional_int(entry: Optional[dict[str, Any]], field: str) -> Optional[int]:
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get(field)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        as_int = int(value)
+        return as_int if as_int > 0 else None
+    return None
+
+
+def _history_entry_float(entry: Optional[dict[str, Any]], field: str, default: float = 0.0) -> float:
+    if not isinstance(entry, dict):
+        return default
+    value = entry.get(field)
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    return default
+
+
+def _non_negative_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return max(0.0, float(value))
+    return None
+
+
+def _torrent_history_hash(torrent: Any) -> Optional[str]:
+    value = _get_mapping_or_attr_value(
+        torrent,
+        (
+            "hash_string",
+            "hashString",
+            "hash-string",
+            "hash",
+        ),
+    )
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
+def _torrent_history_key(torrent: Any) -> Optional[str]:
+    torrent_hash = _torrent_history_hash(torrent)
+    if torrent_hash:
+        return f"hash:{torrent_hash}"
+
+    torrent_id = _non_negative_int(getattr(torrent, "id", None))
+    if torrent_id is not None and torrent_id > 0:
+        return f"id:{torrent_id}"
+    return None
+
+
+def _torrent_history_stat_int(torrent: Any, names: Sequence[str]) -> int:
+    value = _get_mapping_or_attr_value(torrent, names)
+    normalized = _non_negative_int(value)
+    return normalized if normalized is not None else 0
+
+
+def _torrent_uploaded_ever(torrent: Any) -> int:
+    return _torrent_history_stat_int(torrent, ("uploaded_ever", "uploadedEver", "uploaded-ever"))
+
+
+def _torrent_downloaded_ever(torrent: Any) -> int:
+    return _torrent_history_stat_int(torrent, ("downloaded_ever", "downloadedEver", "downloaded-ever"))
+
+
+def _torrent_upload_ratio(torrent: Any, uploaded: int, downloaded: int, total_size: int) -> float:
+    ratio = _non_negative_float(_get_mapping_or_attr_value(torrent, ("upload_ratio", "uploadRatio", "upload-ratio")))
+    if ratio is not None:
+        return ratio
+    if downloaded > 0:
+        return uploaded / downloaded
+    if total_size > 0:
+        return uploaded / total_size
+    return 0.0
+
+
+def _torrent_history_timepoint(torrent: Any, names: Sequence[str]) -> Optional[int]:
+    return _torrent_timepoint_to_ts(_get_mapping_or_attr_value(torrent, names))
+
+
+def _torrent_history_entry_from_torrent(
+    torrent: Any,
+    existing: Optional[dict[str, Any]],
+    now_ts: int,
+) -> Optional[dict[str, Any]]:
+    key = _torrent_history_key(torrent)
+    if key is None:
+        return None
+
+    torrent_id = _non_negative_int(getattr(torrent, "id", None))
+    torrent_hash = _torrent_history_hash(torrent)
+    total_size = max(torrent_total_size(torrent), _history_entry_int(existing, "total_size"))
+    downloaded = max(_torrent_downloaded_ever(torrent), _history_entry_int(existing, "downloaded_ever"))
+    uploaded = max(_torrent_uploaded_ever(torrent), _history_entry_int(existing, "uploaded_ever"))
+    upload_ratio = max(
+        _torrent_upload_ratio(torrent, uploaded, downloaded, total_size),
+        _history_entry_float(existing, "upload_ratio"),
+    )
+    first_seen_at = _history_entry_optional_int(existing, "first_seen_at") or now_ts
+    added_at = _torrent_history_timepoint(torrent, ("added_date", "date_added", "addedDate", "added-date"))
+    done_at = _torrent_history_timepoint(torrent, ("done_date", "date_done", "doneDate", "done-date"))
+    existing_name = str(existing.get("name", "")) if isinstance(existing, dict) else ""
+    name = str(getattr(torrent, "name", "") or existing_name or "<без названия>")
+    status = str(getattr(torrent, "status", "") or "").strip().lower()
+
+    return {
+        "key": key,
+        "id": torrent_id,
+        "hash": torrent_hash,
+        "name": name,
+        "status": status,
+        "total_size": total_size,
+        "downloaded_ever": downloaded,
+        "uploaded_ever": uploaded,
+        "upload_ratio": round(upload_ratio, 4),
+        "progress": round(torrent_progress_percent(torrent), 2),
+        "first_seen_at": first_seen_at,
+        "last_seen_at": now_ts,
+        "added_at": added_at or _history_entry_optional_int(existing, "added_at"),
+        "done_at": done_at or _history_entry_optional_int(existing, "done_at"),
+        "removed_at": None,
+        "removed_with_data": None,
+    }
+
+
+def _mark_missing_torrent_history_entries(
+    items: dict[str, dict[str, Any]],
+    seen_keys: set[str],
+    now_ts: int,
+) -> bool:
+    changed = False
+    for key, entry in items.items():
+        if key in seen_keys:
+            continue
+        if _history_entry_optional_int(entry, "removed_at") is not None:
+            continue
+
+        entry["removed_at"] = now_ts
+        entry["status"] = "removed"
+        changed = True
+    return changed
+
+
+def _merge_torrent_history_entries(primary: dict[str, Any], secondary: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(primary)
+
+    for field in ("total_size", "downloaded_ever", "uploaded_ever"):
+        merged[field] = max(_history_entry_int(primary, field), _history_entry_int(secondary, field))
+
+    merged["upload_ratio"] = max(
+        _history_entry_float(primary, "upload_ratio"),
+        _history_entry_float(secondary, "upload_ratio"),
+    )
+
+    primary_first_seen = _history_entry_optional_int(primary, "first_seen_at")
+    secondary_first_seen = _history_entry_optional_int(secondary, "first_seen_at")
+    if primary_first_seen is not None and secondary_first_seen is not None:
+        merged["first_seen_at"] = min(primary_first_seen, secondary_first_seen)
+    elif secondary_first_seen is not None:
+        merged["first_seen_at"] = secondary_first_seen
+
+    primary_last_seen = _history_entry_optional_int(primary, "last_seen_at")
+    secondary_last_seen = _history_entry_optional_int(secondary, "last_seen_at")
+    if secondary_last_seen is not None and (primary_last_seen is None or secondary_last_seen > primary_last_seen):
+        merged["last_seen_at"] = secondary_last_seen
+
+    if not merged.get("name") and secondary.get("name"):
+        merged["name"] = secondary["name"]
+
+    return merged
+
+
+def _pop_fallback_torrent_history_entry(
+    items: dict[str, dict[str, Any]],
+    torrent: Any,
+    key: str,
+) -> Optional[dict[str, Any]]:
+    if not key.startswith("hash:"):
+        return None
+
+    torrent_id = _non_negative_int(getattr(torrent, "id", None))
+    if torrent_id is None or torrent_id <= 0:
+        return None
+
+    fallback_key = f"id:{torrent_id}"
+    if fallback_key == key:
+        return None
+
+    return items.pop(fallback_key, None)
+
+
+async def sync_torrent_history(
+    torrents: Sequence[Any],
+    *,
+    mark_missing: bool = True,
+) -> list[dict[str, Any]]:
+    now_ts = int(time_module.time())
+    async with TORRENT_HISTORY_LOCK:
+        items = _read_torrent_history_state()
+        seen_keys: set[str] = set()
+        changed = False
+
+        for torrent in torrents:
+            key = _torrent_history_key(torrent)
+            if key is None:
+                continue
+
+            seen_keys.add(key)
+            existing = items.get(key)
+            fallback_entry = _pop_fallback_torrent_history_entry(items, torrent, key)
+            if fallback_entry is not None:
+                changed = True
+                existing = (
+                    fallback_entry
+                    if existing is None
+                    else _merge_torrent_history_entries(existing, fallback_entry)
+                )
+
+            updated = _torrent_history_entry_from_torrent(torrent, existing, now_ts)
+            if updated is None:
+                continue
+
+            if items.get(key) != updated:
+                items[key] = updated
+                changed = True
+
+        if mark_missing:
+            changed = _mark_missing_torrent_history_entries(items, seen_keys, now_ts) or changed
+
+        if changed:
+            try:
+                _persist_torrent_history_state(items)
+            except OSError:
+                log.warning("Failed to persist torrent history", exc_info=True)
+
+        return list(items.values())
+
+
+async def mark_torrent_history_removed(torrent: Any, *, with_data: bool) -> None:
+    now_ts = int(time_module.time())
+    key = _torrent_history_key(torrent)
+    if key is None:
+        return
+
+    async with TORRENT_HISTORY_LOCK:
+        items = _read_torrent_history_state()
+        entry = _torrent_history_entry_from_torrent(torrent, items.get(key), now_ts)
+        if entry is None:
+            return
+
+        entry["removed_at"] = now_ts
+        entry["removed_with_data"] = with_data
+        entry["status"] = "removed"
+        items[key] = entry
+
+        try:
+            _persist_torrent_history_state(items)
+        except OSError:
+            log.warning("Failed to mark torrent history entry as removed", exc_info=True)
+
+
+async def load_torrent_history_entries() -> list[dict[str, Any]]:
+    async with TORRENT_HISTORY_LOCK:
+        return list(_read_torrent_history_state().values())
+
+
+def _shorten_text(value: str, max_len: int) -> str:
+    if len(value) <= max_len:
+        return value
+    return f"{value[: max(0, max_len - 1)]}…"
+
+
+def _format_history_ts(value: Optional[int]) -> str:
+    if value is None:
+        return "неизвестно"
+    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+
+
+def _torrent_status_label_ru(status: str) -> str:
+    labels = {
+        "downloading": "скачивается",
+        "download pending": "ожидает скачивания",
+        "seeding": "раздаётся",
+        "seed pending": "ожидает раздачи",
+        "checking": "проверяется",
+        "check pending": "ожидает проверки",
+        "stopped": "остановлен",
+        "removed": "удалён из Transmission",
+    }
+    return labels.get(status, status or "в Transmission")
+
+
+def _history_entry_removed(entry: dict[str, Any]) -> bool:
+    return _history_entry_optional_int(entry, "removed_at") is not None
+
+
+def _history_entry_sort_key(entry: dict[str, Any]) -> tuple[int, int, str]:
+    return (
+        -_history_entry_int(entry, "uploaded_ever"),
+        -_history_entry_int(entry, "last_seen_at"),
+        str(entry.get("name", "")).lower(),
+    )
+
+
+def _torrent_history_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    nav: list[InlineKeyboardButton] = []
+
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀️ Назад", callback_data=f"{TORRENT_HISTORY_CB_PREFIX}page:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"{TORRENT_HISTORY_CB_PREFIX}page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+
+    rows.append(
+        [InlineKeyboardButton("🔄 Обновить историю", callback_data=f"{TORRENT_HISTORY_CB_PREFIX}refresh:{page}")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _build_torrent_history_text(
+    entries: Sequence[dict[str, Any]],
+    *,
+    page: int,
+    warning: Optional[str] = None,
+) -> tuple[str, InlineKeyboardMarkup, int]:
+    sorted_entries = sorted(entries, key=_history_entry_sort_key)
+    total = len(sorted_entries)
+    page_size = min(max(1, get_config().list_limit), 8)
+    total_pages = max(1, ceil(total / page_size))
+    current_page = max(0, min(page, total_pages - 1))
+    start = current_page * page_size
+    page_entries = sorted_entries[start : start + page_size]
+
+    lines = ["📚 <b>История раздач</b>"]
+    if warning:
+        lines.append(f"⚠️ {html.escape(warning)}")
+
+    if total == 0:
+        lines.append("История пока пустая. Она начнёт пополняться при следующем опросе Transmission.")
+        return "\n".join(lines), _torrent_history_keyboard(0, 1), 0
+
+    total_uploaded = sum(_history_entry_int(entry, "uploaded_ever") for entry in sorted_entries)
+    total_downloaded = sum(_history_entry_int(entry, "downloaded_ever") for entry in sorted_entries)
+    removed_count = sum(1 for entry in sorted_entries if _history_entry_removed(entry))
+    active_count = total - removed_count
+    lines.append(
+        f"Всего: <b>{total}</b> | В Transmission: <b>{active_count}</b> | Удалены: <b>{removed_count}</b>"
+    )
+    lines.append(f"Суммарно: ⇣ <b>{fmt_bytes(total_downloaded)}</b> | ⇡ <b>{fmt_bytes(total_uploaded)}</b>")
+    lines.append(f"Страница <b>{current_page + 1}</b>/<b>{total_pages}</b>")
+
+    for index, entry in enumerate(page_entries, start=start + 1):
+        name = html.escape(_shorten_text(str(entry.get("name") or "<без названия>"), 72))
+        uploaded = _history_entry_int(entry, "uploaded_ever")
+        downloaded = _history_entry_int(entry, "downloaded_ever")
+        total_size = _history_entry_int(entry, "total_size")
+        ratio = _history_entry_float(entry, "upload_ratio")
+        status = str(entry.get("status") or "").strip().lower()
+        removed_at = _history_entry_optional_int(entry, "removed_at")
+        last_seen_at = _history_entry_optional_int(entry, "last_seen_at")
+        if removed_at:
+            status_text = "🗑️ удалён из Transmission"
+        else:
+            status_text = f"{status_icon(status)} {_torrent_status_label_ru(status)}"
+        date_label = "удалён" if removed_at else "обновлено"
+        date_value = removed_at or last_seen_at
+        torrent_id = _history_entry_optional_int(entry, "id")
+        id_text = f"ID {torrent_id} | " if torrent_id is not None else ""
+
+        lines.append(
+            f"\n<b>{index}. {name}</b>\n"
+            f"   ⇡ Раздано: <b>{fmt_bytes(uploaded)}</b> | Ratio <b>{ratio:.2f}</b>\n"
+            f"   ⇣ Скачано: <b>{fmt_bytes(downloaded)}</b> | Размер: <b>{fmt_bytes(total_size)}</b>\n"
+            f"   {id_text}{html.escape(status_text)} | {date_label}: <b>{_format_history_ts(date_value)}</b>"
+        )
+
+    return "\n".join(lines), _torrent_history_keyboard(current_page, total_pages), current_page
+
+
+async def send_torrent_history(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    page: int = 0,
+    edit_existing: bool = False,
+) -> None:
+    warning: Optional[str] = None
+    try:
+        torrents = await tr_call(lambda c: c.get_torrents(arguments=TORRENT_HISTORY_FIELDS))
+    except (TransmissionError, TRCallError) as exc:
+        entries = await load_torrent_history_entries()
+        warning = f"Transmission сейчас недоступен, показываю сохранённую историю: {exc}"
+    else:
+        entries = await sync_torrent_history(torrents, mark_missing=True)
+
+    text, keyboard, current_page = _build_torrent_history_text(entries, page=page, warning=warning)
+    _require_user_data(ctx)[TORRENT_HISTORY_LAST_PAGE_KEY] = current_page
+
+    if edit_existing and update.callback_query is not None:
+        await update.callback_query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+async def on_torrent_history_view(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+
+    if not await callback_user_allowed(update):
+        return
+
+    data = query.data or ""
+    if not data.startswith(TORRENT_HISTORY_CB_PREFIX):
+        await query.answer()
+        return
+
+    try:
+        action, page_raw = data[len(TORRENT_HISTORY_CB_PREFIX) :].split(":", 1)
+        page = int(page_raw)
+    except (ValueError, TypeError):
+        await query.answer("Некорректная страница", show_alert=True)
+        return
+
+    if action not in {"page", "refresh"}:
+        await query.answer("Неизвестный режим", show_alert=True)
+        return
+
+    await query.answer("Обновляю историю…")
+    set_menu(ctx, MENU_HISTORY)
+    set_wait(ctx, WAIT_NONE)
+    await send_torrent_history(update, ctx, page=page, edit_existing=True)
+
+
 async def send_traffic_stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         stats = await tr_call(lambda c: c.session_stats())
@@ -1946,6 +2457,7 @@ async def send_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_MAIN)
         return
 
+    await sync_torrent_history(torrents, mark_missing=True)
     text = _build_status_text(stats, free_space, torrents)
     await reply_chunks(update, text, parse_mode=ParseMode.HTML, reply_markup=STATUS_KEYBOARD)
 
@@ -1973,6 +2485,7 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         )
         return
 
+    await sync_torrent_history(torrents, mark_missing=True)
     await query.edit_message_text(
         text=_build_status_text(stats, free_space, torrents),
         parse_mode=ParseMode.HTML,
@@ -2209,6 +2722,7 @@ async def send_torrent_list(  # noqa: C901
         )
         return
 
+    await sync_torrent_history(torrents, mark_missing=True)
     items = torrents
     if mode == "downloading":
         items = [t for t in items if not _is_torrent_completed(t)]
@@ -2300,6 +2814,7 @@ async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
     chat_id = update.effective_chat.id if update.effective_chat else None
     _register_torrent_start_watch(ctx, chat_id, torrent)
     _register_torrent_completion_watch(ctx, chat_id, torrent)
+    await sync_torrent_history([torrent], mark_missing=False)
 
     await reply_chunks(
         update,
@@ -2358,6 +2873,7 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = update.effective_chat.id if update.effective_chat else None
     _register_torrent_start_watch(ctx, chat_id, torrent)
     _register_torrent_completion_watch(ctx, chat_id, torrent)
+    await sync_torrent_history([torrent], mark_missing=False)
 
     await reply_chunks(
         update,
@@ -2383,12 +2899,16 @@ async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: st
             await tr_call(lambda c: c.start_torrent(torrent_id))
             msg = f"▶️ Запущено: ID {torrent_id}"
         elif action == "del_keep":
-            torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
+            torrent = await tr_call(lambda c: c.get_torrent(torrent_id, arguments=TORRENT_HISTORY_FIELDS))
+            await sync_torrent_history([torrent], mark_missing=False)
             await tr_call(lambda c: c.remove_torrent(torrent_id, delete_data=False))
+            await mark_torrent_history_removed(torrent, with_data=False)
             msg = f"🗑️ Удалено (данные сохранены): ID {torrent_id} | {torrent.name}"
         elif action == "del_data":
-            torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
+            torrent = await tr_call(lambda c: c.get_torrent(torrent_id, arguments=TORRENT_HISTORY_FIELDS))
+            await sync_torrent_history([torrent], mark_missing=False)
             await tr_call(lambda c: c.remove_torrent(torrent_id, delete_data=True))
+            await mark_torrent_history_removed(torrent, with_data=True)
             msg = f"💥 Удалено вместе с данными: ID {torrent_id} | {torrent.name}"
         else:
             msg = "❌ Неизвестное действие"
@@ -2544,6 +3064,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Как пользоваться</b>\n"
         "• 📊 Статус — скорость и текущая активность\n"
         "• 📈 Статистика — сводка + график/детально за 7 дней и по дням текущего месяца\n"
+        "• 📚 История раздач — сколько отдано и какой ratio у каждого торрента, включая удалённые\n"
         "• 📋 Торренты — списки + поиск\n"
         "• ➕ Добавить — magnet/URL или .torrent файл\n"
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"
@@ -2669,9 +3190,15 @@ async def _handle_global_command(
         set_wait(ctx, WAIT_NONE)
         await send_ephemeral(update, ctx, "Выбери действие:", reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id))
 
+    async def _open_history() -> None:
+        set_menu(ctx, MENU_HISTORY)
+        set_wait(ctx, WAIT_NONE)
+        await send_torrent_history(update, ctx)
+
     handlers: dict[str, Callable[[], Awaitable[None]]] = {
         "📊 Статус": _open_main_status,
         "📈 Статистика": lambda: send_traffic_stats(update, ctx),
+        "📚 История раздач": _open_history,
         "📋 Торренты": _open_torrents,
         "➕ Добавить": _open_add,
         "⚙️ Управление": _open_ctrl,
@@ -2853,6 +3380,7 @@ def main() -> None:  # noqa: C901
             log.warning("Skipping completion notifications due to Transmission error", exc_info=True)
             return
 
+        await sync_torrent_history(torrents, mark_missing=True)
         torrents_by_id = {int(t.id): t for t in torrents}
         completed_now = {
             torrent_id: (getattr(torrent, "name", None) or "<без названия>")
@@ -3023,11 +3551,21 @@ def main() -> None:  # noqa: C901
         await update_traffic_state(now, downloaded, uploaded)
         ctx.application.bot_data[TRAFFIC_LAST_SNAPSHOT_DAY_KEY] = day_key
 
+    async def snapshot_torrent_history(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            torrents = await tr_call(lambda c: c.get_torrents(arguments=TORRENT_HISTORY_FIELDS))
+        except (TransmissionError, TRCallError):
+            log.warning("Skipping torrent history snapshot due to Transmission error", exc_info=True)
+            return
+
+        await sync_torrent_history(torrents, mark_missing=True)
+
     async def notify_completed_torrents_fallback(app: Application) -> None:
         while True:
             fake_ctx = cast(ContextTypes.DEFAULT_TYPE, SimpleNamespace(application=app, bot=app.bot))
             await notify_completed_torrents(fake_ctx)
             await snapshot_traffic_anchors(fake_ctx)
+            await snapshot_torrent_history(fake_ctx)
             await asyncio.sleep(NOTIFY_POLL_INTERVAL_SEC)
 
     async def on_post_init(app: Application) -> None:
@@ -3035,7 +3573,7 @@ def main() -> None:  # noqa: C901
             app.bot_data["notify_poll_task"] = asyncio.create_task(notify_completed_torrents_fallback(app))
             log.warning(
                 "python-telegram-bot job queue is unavailable; using fallback polling task "
-                "for completion notifications and traffic snapshots."
+                "for completion notifications, traffic snapshots, and torrent history snapshots."
             )
 
     async def on_post_shutdown(app: Application) -> None:
@@ -3065,6 +3603,11 @@ def main() -> None:  # noqa: C901
             first=NOTIFY_POLL_INTERVAL_SEC,
         )
         app.job_queue.run_daily(snapshot_traffic_anchors, time=time(hour=0, minute=0, second=0))
+        app.job_queue.run_repeating(
+            snapshot_torrent_history,
+            interval=NOTIFY_POLL_INTERVAL_SEC,
+            first=5.0,
+        )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -3078,6 +3621,7 @@ def main() -> None:  # noqa: C901
     )
     app.add_handler(CallbackQueryHandler(on_torrent_action, pattern=f"^{TORRENT_ACTION_CB_PREFIX}"))
     app.add_handler(CallbackQueryHandler(on_traffic_view, pattern=f"^{TRAFFIC_VIEW_CB_PREFIX}(refresh|7d|4w)$"))
+    app.add_handler(CallbackQueryHandler(on_torrent_history_view, pattern=f"^{TORRENT_HISTORY_CB_PREFIX}"))
     app.add_handler(
         CallbackQueryHandler(
             on_delete_confirmation,

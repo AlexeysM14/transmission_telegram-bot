@@ -6,3 +6,5 @@ __pycache__/
 bot-errors.log*
 traffic_anchors.json
 traffic_anchors.tmp
+torrent_history.json
+torrent_history.tmp
