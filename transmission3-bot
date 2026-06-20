@@ -113,7 +113,8 @@ def do_update_from_github() -> None:
     else:
         run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
 
-    print("✅ Update complete.")
+    print("✅ Update complete. Restarting bot service...")
+    restart_bot_service()
 
 
 def restart_bot_service() -> None:
@@ -457,7 +458,7 @@ def menu() -> None:  # noqa: C901
     while True:
         print(
             "\n=== transmission3-bot update ===\n"
-            "1) Download updates from GitHub\n"
+            "1) Download updates from GitHub and restart bot service\n"
             "2) Set Telegram bot token (TG_TOKEN)\n"
             "3) Set Telegram allowed user id(s) (ALLOWED_USER_IDS)\n"
             "4) Set Telegram proxy URL (TG_PROXY, example: http://login:password@127.0.0.1:8080)\n"
