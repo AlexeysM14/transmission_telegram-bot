@@ -4,11 +4,13 @@ Telegram-бот для управления Transmission 3 через меню-�
 
 ## Установка в Linux (с systemd)
 
+Команды ниже рассчитаны на запуск от пользователя `root` (например, в Proxmox/LXC-контейнере), поэтому `sudo` не используется.
+
 1) Установите Git (если ещё не установлен):
 
 ```bash
-sudo apt update
-sudo apt install -y git python3 python3-venv
+apt update
+apt install -y git python3 python3-venv
 ```
 
 2) Склонируйте репозиторий и перейдите в него:
@@ -21,19 +23,19 @@ cd transmission_telegram-bot
 3) Запустите установку (создаст `.venv`, systemd-сервис и команду `transmission3-bot`):
 
 ```bash
-sudo bash install.sh
+bash install.sh
 ```
 
 4) Откройте меню настройки:
 
 ```bash
-sudo transmission3-bot update
+transmission3-bot update
 ```
 
 Проверить текущее состояние сервиса, прокси и ключевых интеграций можно командой:
 
 ```bash
-sudo transmission3-bot status
+transmission3-bot status
 ```
 
 В меню доступны пункты:
@@ -60,8 +62,8 @@ sudo transmission3-bot status
 5) После настройки запустите сервис:
 
 ```bash
-sudo systemctl start transmission3-bot
-sudo systemctl status transmission3-bot
+systemctl start transmission3-bot
+systemctl status transmission3-bot
 ```
 
 ## Быстрый запуск вручную (без systemd)
