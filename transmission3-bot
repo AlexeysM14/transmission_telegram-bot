@@ -49,7 +49,7 @@ def load_env() -> dict[str, str]:
     try:
         lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
     except PermissionError as exc:
-        raise PermissionError(f"Cannot read {ENV_FILE}; run this command with sudo") from exc
+        raise PermissionError(f"Cannot read {ENV_FILE}; run this command as root") from exc
 
     for line in lines:
         raw = line.strip()
@@ -118,11 +118,10 @@ def do_update_from_github() -> None:
 
 
 def restart_bot_service() -> None:
-    cmd = ["systemctl", "restart", SERVICE_NAME]
     if os.geteuid() != 0:
-        cmd = ["sudo", *cmd]
+        raise PermissionError("Restarting the systemd service requires root; run this command as root")
 
-    run(cmd)
+    run(["systemctl", "restart", SERVICE_NAME])
     print(f"✅ Service '{SERVICE_NAME}' restarted.")
 
 

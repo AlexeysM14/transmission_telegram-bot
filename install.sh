@@ -56,7 +56,7 @@ ensure_service_user() {
 }
 
 if [[ ${EUID} -ne 0 ]]; then
-  echo "Please run as root: sudo bash install.sh"
+  echo "Please run as root: bash install.sh"
   exit 1
 fi
 
@@ -124,5 +124,5 @@ EOF
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME"
 
-echo "Installed. Configure token/user id via: sudo transmission3-bot update"
+echo "Installed. Configure token/user id via: transmission3-bot update"
 echo "Then start bot: systemctl start $SERVICE_NAME"
