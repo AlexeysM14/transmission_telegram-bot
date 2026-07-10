@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+umask 0022
 
 REPO_URL="${REPO_URL:-https://github.com/AlexeysM14/transmission_telegram-bot.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/transmission3-bot}"
@@ -7,95 +8,359 @@ INSTALL_DIR="${INSTALL_DIR%/}"
 if [[ -z "$INSTALL_DIR" ]]; then
   INSTALL_DIR="/"
 fi
+
 SERVICE_NAME="transmission3-bot"
 SERVICE_USER="${SERVICE_USER:-transmission3-bot}"
 SERVICE_GROUP="${SERVICE_GROUP:-$SERVICE_USER}"
+START_SERVICE="${START_SERVICE:-auto}"
+CONFIG_DIR="/etc/$SERVICE_NAME"
+ENV_FILE="$CONFIG_DIR/environment"
+INSTALL_CONFIG="$CONFIG_DIR/install.conf"
+STATE_DIR="/var/lib/$SERVICE_NAME"
+LOG_DIR="/var/log/$SERVICE_NAME"
+UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+CLI_PATH="/usr/local/bin/$SERVICE_NAME"
+CLI_IMPL_DIR="/usr/local/libexec"
+CLI_IMPL_PATH="$CLI_IMPL_DIR/$SERVICE_NAME"
+INSTALL_PARENT="$(dirname "$INSTALL_DIR")"
 
-validate_install_dir() {
-  if [[ "$INSTALL_DIR" != /* ]]; then
-    echo "INSTALL_DIR must be an absolute path"
-    exit 1
-  fi
+BUILD_ROOT=""
+STAGED_RELEASE=""
+PREVIOUS_RELEASE="$INSTALL_PARENT/.${SERVICE_NAME}.previous.$$"
+FAILED_RELEASE="$INSTALL_PARENT/.${SERVICE_NAME}.failed.$$"
+CLI_BACKUP="${CLI_PATH}.previous.$$"
+CLI_IMPL_BACKUP="${CLI_IMPL_PATH}.previous.$$"
+ENV_BACKUP="$CONFIG_DIR/.environment.previous.$$"
+INSTALL_CONFIG_BACKUP="$CONFIG_DIR/.install.conf.previous.$$"
+UNIT_BACKUP="/etc/systemd/system/.${SERVICE_NAME}.service.previous.$$"
 
-  if [[ "$INSTALL_DIR" =~ [[:space:]] ]]; then
-    echo "INSTALL_DIR must not contain whitespace"
-    exit 1
-  fi
+CURRENT_PRESENT=0
+CURRENT_TRUSTED=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_WAS_ENABLED=0
+SHOULD_START=0
+UNTRUSTED_SERVICE_STOPPED=0
+TRANSACTION_STARTED=0
+RELEASE_SWAPPED=0
+CLI_HAD_PREVIOUS=0
+CLI_IMPL_HAD_PREVIOUS=0
+ENV_HAD_PREVIOUS=0
+INSTALL_CONFIG_HAD_PREVIOUS=0
+UNIT_HAD_PREVIOUS=0
+CONFIG_TOUCHED=0
+CLI_TOUCHED=0
+UNIT_TOUCHED=0
+DEPLOY_COMMITTED=0
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+validate_inputs() {
+  local repository_path
+  local resolved_repository
+  local resolved_install
+
+  [[ "$INSTALL_DIR" == /* ]] || die "INSTALL_DIR must be an absolute path"
+  [[ ! "$INSTALL_DIR" =~ [[:space:]] ]] || die "INSTALL_DIR must not contain whitespace"
+  [[ "$REPO_URL" != *$'\n'* && "$REPO_URL" != *$'\r'* ]] || die "REPO_URL must be one line"
 
   case "$INSTALL_DIR" in
     /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/sys|/tmp|/usr|/usr/local|/var)
-      echo "Refusing to install directly into unsafe path: $INSTALL_DIR"
-      exit 1
+      die "Refusing to install directly into unsafe path: $INSTALL_DIR"
       ;;
   esac
+
+  [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid SERVICE_USER: $SERVICE_USER"
+  [[ "$SERVICE_GROUP" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || die "Invalid SERVICE_GROUP: $SERVICE_GROUP"
+  [[ "$START_SERVICE" == auto || "$START_SERVICE" == 0 || "$START_SERVICE" == 1 ]] || die "START_SERVICE must be auto, 0, or 1"
+
+  repository_path="$REPO_URL"
+  if [[ "$repository_path" == file://* ]]; then
+    repository_path="${repository_path#file://}"
+  fi
+  if [[ "$repository_path" == /* && -e "$repository_path" ]]; then
+    resolved_repository="$(readlink -f "$repository_path")"
+    resolved_install="$(readlink -m "$INSTALL_DIR")"
+    case "$resolved_repository" in
+      "$resolved_install"|"$resolved_install"/*)
+        die "REPO_URL must not use the existing installation tree"
+        ;;
+    esac
+  fi
+}
+
+sanitize_build_environment() {
+  local variable
+
+  while IFS='=' read -r variable _; do
+    if [[ "$variable" == PYTHON* || "$variable" == PIP_* || "$variable" == GIT_* || "$variable" == LD_* || "$variable" == DYLD_* || "$variable" == APT_* || "$variable" == DPKG_* ]]; then
+      unset "$variable"
+    fi
+  done < <(/usr/bin/env)
+  unset LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export PYTHONNOUSERSITE=1
+  export PYTHONSAFEPATH=1
+  export PIP_CONFIG_FILE=/dev/null
+  export PIP_DISABLE_PIP_VERSION_CHECK=1
+  export PIP_NO_INPUT=1
+}
+
+ensure_system_dependencies() {
+  if [[ ! -x /usr/bin/git ]] || [[ ! -x /usr/bin/python3 ]] || ! /usr/bin/python3 -I -m venv --help >/dev/null 2>&1; then
+    /usr/bin/apt-get update
+    /usr/bin/apt-get install -y git python3 python3-venv
+  fi
+  [[ -x /usr/bin/git ]] || die "/usr/bin/git is required"
+  [[ -x /usr/bin/python3 ]] || die "/usr/bin/python3 is required"
+  [[ -x /usr/bin/systemctl ]] || die "/usr/bin/systemctl is required"
 }
 
 ensure_service_user() {
-  if ! [[ "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
-    echo "SERVICE_USER has an invalid system username: $SERVICE_USER"
-    exit 1
-  fi
-
-  if ! [[ "$SERVICE_GROUP" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
-    echo "SERVICE_GROUP has an invalid system group name: $SERVICE_GROUP"
-    exit 1
-  fi
-
   if ! getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
     groupadd --system "$SERVICE_GROUP"
   fi
-
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     useradd \
       --system \
       --gid "$SERVICE_GROUP" \
-      --home-dir "$INSTALL_DIR" \
+      --home-dir "$STATE_DIR" \
       --shell /usr/sbin/nologin \
       "$SERVICE_USER"
   fi
 }
 
-if [[ ${EUID} -ne 0 ]]; then
-  echo "Please run as root: bash install.sh"
-  exit 1
-fi
+systemctl_cmd() {
+  /usr/bin/systemctl "$@"
+}
 
-validate_install_dir
-ensure_service_user
+start_service_and_check() {
+  systemctl_cmd start "$SERVICE_NAME"
+  sleep 2
+  systemctl_cmd is-active --quiet "$SERVICE_NAME"
+}
 
-if ! command -v git >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1 || ! python3 -m venv --help >/dev/null 2>&1; then
-  apt-get update
-  apt-get install -y git python3 python3-venv
-fi
+is_secure_regular_file() {
+  local path="$1"
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  [[ -z "$(find "$path" -maxdepth 0 \( ! -user root -o -perm /022 \) -print -quit)" ]]
+}
 
-if [[ -d "$INSTALL_DIR/.git" ]]; then
-  echo "Updating existing install in $INSTALL_DIR"
-  git -c "safe.directory=$INSTALL_DIR" -C "$INSTALL_DIR" pull --ff-only
-else
-  if [[ -e "$INSTALL_DIR" ]]; then
-    if [[ -d "$INSTALL_DIR" ]] && [[ -z "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
-      rmdir "$INSTALL_DIR"
+is_trusted_tree() {
+  local root="$1"
+  [[ -d "$root" && ! -L "$root" ]] || return 1
+  [[ -z "$(find "$root" -xdev ! -user root -print -quit)" ]] || return 1
+  [[ -z "$(find "$root" -xdev ! -type l -perm /022 -print -quit)" ]]
+}
+
+is_secure_parent_directory() {
+  local path="$1"
+  [[ -d "$path" && ! -L "$path" ]] || return 1
+  [[ -z "$(find "$path" -maxdepth 0 \( ! -user root -o -perm /022 \) -print -quit)" ]]
+}
+
+assess_current_deployment() {
+  if [[ -e "$INSTALL_DIR" || -L "$INSTALL_DIR" ]]; then
+    CURRENT_PRESENT=1
+  else
+    return
+  fi
+
+  if ! is_trusted_tree "$INSTALL_DIR"; then
+    return
+  fi
+  if [[ -e "$CLI_PATH" || -L "$CLI_PATH" ]]; then
+    is_secure_regular_file "$CLI_PATH" || return
+  fi
+  if [[ -e "$CLI_IMPL_PATH" || -L "$CLI_IMPL_PATH" ]]; then
+    is_secure_regular_file "$CLI_IMPL_PATH" || return
+  fi
+  if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
+    is_secure_regular_file "$UNIT_FILE" || return
+  fi
+  CURRENT_TRUSTED=1
+}
+
+run_clean_git() {
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG=/dev/null \
+    /usr/bin/git \
+      -c core.hooksPath=/dev/null \
+      -c core.fsmonitor=false \
+      -c protocol.ext.allow=never \
+      "$@"
+}
+
+harden_release() {
+  local release="$1"
+  chown -hR root:root "$release"
+  chmod -R u=rwX,go=rX "$release"
+  if [[ -d "$release/.git" ]]; then
+    chmod -R u+rwX,go-rwx "$release/.git"
+  fi
+}
+
+build_clean_release() {
+  BUILD_ROOT="$(mktemp -d "$INSTALL_PARENT/.${SERVICE_NAME}.build.XXXXXX")"
+  STAGED_RELEASE="$BUILD_ROOT/release"
+
+  echo "Building a clean release from the configured repository"
+  run_clean_git clone --quiet --depth 1 --no-hardlinks "$REPO_URL" "$STAGED_RELEASE"
+
+  /usr/bin/python3 -I -m venv "$STAGED_RELEASE/.venv"
+  PIP_ONLY_BINARY=:all: \
+    "$STAGED_RELEASE/.venv/bin/python" -I -m pip install \
+      --disable-pip-version-check \
+      --no-input \
+      --only-binary=:all: \
+      -r "$STAGED_RELEASE/requirements.txt"
+
+  ln -s "$ENV_FILE" "$STAGED_RELEASE/.env"
+  chown -h root:root "$STAGED_RELEASE/.env"
+  harden_release "$STAGED_RELEASE"
+  is_trusted_tree "$STAGED_RELEASE" || die "Fresh release did not pass ownership/permission validation"
+  is_secure_regular_file "$STAGED_RELEASE/transmission3-bot" || die "Fresh release has an unsafe CLI source"
+  is_secure_regular_file "$STAGED_RELEASE/requirements.txt" || die "Fresh release has unsafe requirements"
+}
+
+ensure_secure_config_directory() {
+  if [[ -e "$CONFIG_DIR" || -L "$CONFIG_DIR" ]]; then
+    is_secure_parent_directory "$CONFIG_DIR" || die "Unsafe configuration directory: $CONFIG_DIR"
+  else
+    install -d -o root -g "$SERVICE_GROUP" -m 0750 "$CONFIG_DIR"
+  fi
+  chown root:"$SERVICE_GROUP" "$CONFIG_DIR"
+  chmod 0750 "$CONFIG_DIR"
+}
+
+backup_transaction_files() {
+  if [[ -e "$ENV_FILE" || -L "$ENV_FILE" ]]; then
+    is_secure_regular_file "$ENV_FILE" || die "Unsafe environment file: $ENV_FILE"
+    install -o root -g "$SERVICE_GROUP" -m 0640 "$ENV_FILE" "$ENV_BACKUP"
+    ENV_HAD_PREVIOUS=1
+  fi
+  if [[ -e "$INSTALL_CONFIG" || -L "$INSTALL_CONFIG" ]]; then
+    is_secure_regular_file "$INSTALL_CONFIG" || die "Unsafe install metadata: $INSTALL_CONFIG"
+    install -o root -g root -m 0644 "$INSTALL_CONFIG" "$INSTALL_CONFIG_BACKUP"
+    INSTALL_CONFIG_HAD_PREVIOUS=1
+  fi
+  if [[ -e "$UNIT_FILE" || -L "$UNIT_FILE" ]]; then
+    is_secure_regular_file "$UNIT_FILE" || die "Unsafe systemd unit: $UNIT_FILE"
+    install -o root -g root -m 0644 "$UNIT_FILE" "$UNIT_BACKUP"
+    UNIT_HAD_PREVIOUS=1
+  fi
+}
+
+normalize_environment_file() {
+  local normalized_env
+  local line
+
+  normalized_env="$(mktemp "$CONFIG_DIR/.environment.XXXXXX")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*(STATE_DIR|LOG_FILE|PATH|VIRTUAL_ENV|BASH_ENV|ENV|SHELLOPTS|PYTHON[^=]*|PIP_[^=]*|GIT_[^=]*|LD_[^=]*|DYLD_[^=]*|APT_[^=]*|DPKG_[^=]*|CC|CXX|CFLAGS|CPPFLAGS|LDFLAGS|MAKEFLAGS|RUSTC_WRAPPER|CARGO_[^=]*)= ]]; then
+      continue
+    fi
+    printf '%s\n' "$line" >> "$normalized_env"
+  done < "$ENV_FILE"
+  printf 'STATE_DIR=%s\n' "$STATE_DIR" >> "$normalized_env"
+  printf 'LOG_FILE=%s/bot-errors.log\n' "$LOG_DIR" >> "$normalized_env"
+  chown root:"$SERVICE_GROUP" "$normalized_env"
+  chmod 0640 "$normalized_env"
+  mv -f "$normalized_env" "$ENV_FILE"
+}
+
+migrate_configuration_by_copy() {
+  local legacy_env="$INSTALL_DIR/.env"
+  local metadata_tmp
+
+  if [[ ! -e "$ENV_FILE" ]]; then
+    if [[ -f "$legacy_env" && ! -L "$legacy_env" ]]; then
+      install -o root -g "$SERVICE_GROUP" -m 0640 "$legacy_env" "$ENV_FILE"
+      echo "Copied legacy configuration to $ENV_FILE"
     else
-      echo "Refusing to overwrite non-empty non-git directory: $INSTALL_DIR"
-      exit 1
+      install -o root -g "$SERVICE_GROUP" -m 0640 /dev/null "$ENV_FILE"
     fi
   fi
-  mkdir -p "$(dirname "$INSTALL_DIR")"
-  git clone "$REPO_URL" "$INSTALL_DIR"
-fi
+  normalize_environment_file
 
-python3 -m venv "$INSTALL_DIR/.venv"
-"$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
-chmod +x "$INSTALL_DIR/transmission3-bot"
-chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
-chmod 0755 "$INSTALL_DIR"
-if [[ -f "$INSTALL_DIR/.env" ]]; then
-  chmod 0600 "$INSTALL_DIR/.env"
-fi
+  metadata_tmp="$(mktemp "$CONFIG_DIR/.install.conf.XXXXXX")"
+  {
+    printf 'INSTALL_DIR=%s\n' "$INSTALL_DIR"
+    printf 'ENV_FILE=%s\n' "$ENV_FILE"
+    printf 'STATE_DIR=%s\n' "$STATE_DIR"
+    printf 'LOG_DIR=%s\n' "$LOG_DIR"
+    printf 'SERVICE_USER=%s\n' "$SERVICE_USER"
+    printf 'SERVICE_GROUP=%s\n' "$SERVICE_GROUP"
+    printf 'REPO_URL=%s\n' "$REPO_URL"
+    printf 'CLI_IMPL_PATH=%s\n' "$CLI_IMPL_PATH"
+  } > "$metadata_tmp"
+  chown root:root "$metadata_tmp"
+  chmod 0644 "$metadata_tmp"
+  mv -f "$metadata_tmp" "$INSTALL_CONFIG"
+}
 
-ln -sf "$INSTALL_DIR/transmission3-bot" /usr/local/bin/transmission3-bot
+ensure_runtime_directory() {
+  local path="$1"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -d "$path" && ! -L "$path" ]] || die "Unsafe runtime directory: $path"
+  else
+    install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0750 "$path"
+  fi
+  chown root:root "$path"
+  chmod 0700 "$path"
+}
 
-cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+release_runtime_directories() {
+  local path
+  for path in "$STATE_DIR" "$LOG_DIR"; do
+    if [[ -d "$path" && ! -L "$path" ]]; then
+      chown "$SERVICE_USER:$SERVICE_GROUP" "$path"
+      chmod 0750 "$path"
+    fi
+  done
+}
+
+migrate_mutable_files_by_copy() {
+  local name
+  local source_path
+  local target_path
+
+  ensure_runtime_directory "$STATE_DIR"
+  ensure_runtime_directory "$LOG_DIR"
+
+  if [[ $CURRENT_PRESENT -eq 1 && -d "$INSTALL_DIR" ]]; then
+    for name in traffic_anchors.json torrent_history.json; do
+      source_path="$INSTALL_DIR/$name"
+      target_path="$STATE_DIR/$name"
+      [[ ! -L "$target_path" ]] || die "Refusing legacy migration through symlink: $target_path"
+      if [[ -f "$source_path" && ! -L "$source_path" && ! -e "$target_path" ]]; then
+        install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 "$source_path" "$target_path"
+        echo "Copied legacy state to $target_path"
+      fi
+    done
+
+    for source_path in "$INSTALL_DIR"/bot-errors.log*; do
+      [[ -f "$source_path" && ! -L "$source_path" ]] || continue
+      name="$(basename "$source_path")"
+      target_path="$LOG_DIR/$name"
+      [[ ! -L "$target_path" ]] || die "Refusing log migration through symlink: $target_path"
+      if [[ ! -e "$target_path" ]]; then
+        install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 "$source_path" "$target_path"
+        echo "Copied legacy log to $target_path"
+      fi
+    done
+  fi
+  release_runtime_directories
+}
+
+prepare_unit_file() {
+  local unit_tmp
+  unit_tmp="$(mktemp "/etc/systemd/system/.${SERVICE_NAME}.service.XXXXXX")"
+  cat > "$unit_tmp" <<EOF
 [Unit]
 Description=Transmission Telegram Bot
 Wants=network-online.target
@@ -106,23 +371,276 @@ Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_GROUP
 WorkingDirectory=$INSTALL_DIR
-EnvironmentFile=-$INSTALL_DIR/.env
+EnvironmentFile=-$ENV_FILE
+Environment=STATE_DIR=$STATE_DIR
+Environment=LOG_FILE=$LOG_DIR/bot-errors.log
 ExecStart=$INSTALL_DIR/.venv/bin/python $INSTALL_DIR/bot.py
 Restart=always
 RestartSec=5
 UMask=0077
+StateDirectory=$SERVICE_NAME
+StateDirectoryMode=0750
+LogsDirectory=$SERVICE_NAME
+LogsDirectoryMode=0750
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=$INSTALL_DIR
+ReadWritePaths=$STATE_DIR $LOG_DIR
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  chown root:root "$unit_tmp"
+  chmod 0644 "$unit_tmp"
+  mv -f "$unit_tmp" "$UNIT_FILE"
+}
 
-systemctl daemon-reload
-systemctl enable "$SERVICE_NAME"
+backup_existing_cli_paths() {
+  [[ ! -e "$CLI_BACKUP" && ! -L "$CLI_BACKUP" ]] || die "CLI rollback path already exists: $CLI_BACKUP"
+  [[ ! -e "$CLI_IMPL_BACKUP" && ! -L "$CLI_IMPL_BACKUP" ]] || die "CLI rollback path already exists: $CLI_IMPL_BACKUP"
+  if [[ $CURRENT_TRUSTED -eq 1 ]]; then
+    if [[ -e "$CLI_PATH" || -L "$CLI_PATH" ]]; then
+      install -o root -g root -m 0755 "$CLI_PATH" "$CLI_BACKUP"
+      CLI_HAD_PREVIOUS=1
+    fi
+    if [[ -e "$CLI_IMPL_PATH" || -L "$CLI_IMPL_PATH" ]]; then
+      install -o root -g root -m 0755 "$CLI_IMPL_PATH" "$CLI_IMPL_BACKUP"
+      CLI_IMPL_HAD_PREVIOUS=1
+    fi
+  else
+    if [[ -e "$CLI_PATH" || -L "$CLI_PATH" ]]; then
+      mv "$CLI_PATH" "$CLI_BACKUP"
+      CLI_HAD_PREVIOUS=1
+    fi
+    if [[ -e "$CLI_IMPL_PATH" || -L "$CLI_IMPL_PATH" ]]; then
+      mv "$CLI_IMPL_PATH" "$CLI_IMPL_BACKUP"
+      CLI_IMPL_HAD_PREVIOUS=1
+    fi
+  fi
+  CLI_TOUCHED=1
+}
 
-echo "Installed. Configure token/user id via: transmission3-bot update"
-echo "Then start bot: systemctl start $SERVICE_NAME"
+install_cli_from_release() {
+  local cli_tmp
+  local wrapper_tmp
+
+  if [[ -e "$CLI_IMPL_DIR" || -L "$CLI_IMPL_DIR" ]]; then
+    is_secure_parent_directory "$CLI_IMPL_DIR" || die "Unsafe CLI implementation directory: $CLI_IMPL_DIR"
+  else
+    install -d -o root -g root -m 0755 "$CLI_IMPL_DIR"
+  fi
+  is_secure_parent_directory "$(dirname "$CLI_PATH")" || die "Unsafe CLI directory: $(dirname "$CLI_PATH")"
+  backup_existing_cli_paths
+
+  cli_tmp="$(mktemp "$CLI_IMPL_DIR/.${SERVICE_NAME}.XXXXXX")"
+  install -o root -g root -m 0755 "$INSTALL_DIR/transmission3-bot" "$cli_tmp"
+  mv -f "$cli_tmp" "$CLI_IMPL_PATH"
+
+  wrapper_tmp="$(mktemp "$(dirname "$CLI_PATH")/.${SERVICE_NAME}.XXXXXX")"
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' 'unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT PYTHONWARNINGS PYTHONBREAKPOINT PYTHONUSERBASE'
+    printf '%s\n' 'unset LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_DYNAMIC_WEAK LD_HWCAP_MASK LD_LIBRARY_PATH LD_ORIGIN_PATH LD_PRELOAD LD_PROFILE LD_SHOW_AUXV LD_USE_LOAD_BIAS'
+    printf '%s\n' 'unset DYLD_FRAMEWORK_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH DYLD_PRINT_TO_FILE'
+    printf '%s\n' 'export PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1 PIP_CONFIG_FILE=/dev/null'
+    printf 'exec /usr/bin/python3 -I %s "$@"\n' "$CLI_IMPL_PATH"
+  } > "$wrapper_tmp"
+  chown root:root "$wrapper_tmp"
+  chmod 0755 "$wrapper_tmp"
+  mv -f "$wrapper_tmp" "$CLI_PATH"
+}
+
+swap_release() {
+  [[ ! -e "$PREVIOUS_RELEASE" && ! -L "$PREVIOUS_RELEASE" ]] || die "Rollback path already exists: $PREVIOUS_RELEASE"
+  if [[ $CURRENT_PRESENT -eq 1 ]]; then
+    mv "$INSTALL_DIR" "$PREVIOUS_RELEASE"
+  fi
+  if ! mv "$STAGED_RELEASE" "$INSTALL_DIR"; then
+    if [[ $CURRENT_TRUSTED -eq 1 && -e "$PREVIOUS_RELEASE" && ! -e "$INSTALL_DIR" ]]; then
+      mv "$PREVIOUS_RELEASE" "$INSTALL_DIR"
+    fi
+    return 1
+  fi
+  STAGED_RELEASE=""
+  RELEASE_SWAPPED=1
+}
+
+restore_backed_file() {
+  local target="$1"
+  local backup="$2"
+  local had_previous="$3"
+  rm -f -- "$target"
+  if [[ "$had_previous" -eq 1 ]]; then
+    [[ -e "$backup" ]] || return 1
+    mv "$backup" "$target"
+  fi
+}
+
+rollback_trusted_deployment() {
+  local rollback_ok=1
+
+  echo "Deployment failed; restoring the previous trusted release" >&2
+  systemctl_cmd stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+  if [[ $RELEASE_SWAPPED -eq 1 ]]; then
+    if [[ -e "$INSTALL_DIR" || -L "$INSTALL_DIR" ]]; then
+      mv "$INSTALL_DIR" "$FAILED_RELEASE" || rollback_ok=0
+    fi
+    if [[ $rollback_ok -eq 1 && $CURRENT_PRESENT -eq 1 && -e "$PREVIOUS_RELEASE" ]]; then
+      mv "$PREVIOUS_RELEASE" "$INSTALL_DIR" || rollback_ok=0
+    elif [[ $CURRENT_PRESENT -eq 1 ]]; then
+      rollback_ok=0
+    fi
+  fi
+
+  if [[ $CLI_TOUCHED -eq 1 ]]; then
+    restore_backed_file "$CLI_PATH" "$CLI_BACKUP" "$CLI_HAD_PREVIOUS" || rollback_ok=0
+    restore_backed_file "$CLI_IMPL_PATH" "$CLI_IMPL_BACKUP" "$CLI_IMPL_HAD_PREVIOUS" || rollback_ok=0
+  fi
+  if [[ $CONFIG_TOUCHED -eq 1 ]]; then
+    restore_backed_file "$ENV_FILE" "$ENV_BACKUP" "$ENV_HAD_PREVIOUS" || rollback_ok=0
+    restore_backed_file "$INSTALL_CONFIG" "$INSTALL_CONFIG_BACKUP" "$INSTALL_CONFIG_HAD_PREVIOUS" || rollback_ok=0
+  fi
+  if [[ $UNIT_TOUCHED -eq 1 ]]; then
+    restore_backed_file "$UNIT_FILE" "$UNIT_BACKUP" "$UNIT_HAD_PREVIOUS" || rollback_ok=0
+  fi
+  release_runtime_directories
+  systemctl_cmd daemon-reload >/dev/null 2>&1 || true
+  if [[ $SERVICE_WAS_ENABLED -eq 1 ]]; then
+    systemctl_cmd enable "$SERVICE_NAME" >/dev/null 2>&1 || rollback_ok=0
+  else
+    systemctl_cmd disable "$SERVICE_NAME" >/dev/null 2>&1 || rollback_ok=0
+  fi
+
+  if [[ $SERVICE_WAS_ACTIVE -eq 1 && $rollback_ok -eq 1 ]]; then
+    if start_service_and_check; then
+      echo "Previous trusted release restored and active" >&2
+    else
+      echo "Previous release was restored but did not become active" >&2
+    fi
+  fi
+
+  if [[ $rollback_ok -eq 0 ]]; then
+    echo "Rollback could not be completed; the service remains stopped." >&2
+  elif [[ -e "$FAILED_RELEASE" ]]; then
+    rm -rf -- "$FAILED_RELEASE"
+  fi
+}
+
+rollback_or_fail_closed() {
+  if [[ $CURRENT_TRUSTED -eq 1 ]]; then
+    rollback_trusted_deployment
+    return
+  fi
+
+  systemctl_cmd stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl_cmd disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  release_runtime_directories
+  if [[ $CURRENT_PRESENT -eq 1 ]]; then
+    echo "Deployment failed and the previous release was untrusted." >&2
+    echo "The service remains stopped; the untrusted release will not be restored or executed." >&2
+  else
+    echo "Initial deployment failed; no previous release is available and the service remains stopped." >&2
+  fi
+  if [[ -e "$PREVIOUS_RELEASE" || -L "$PREVIOUS_RELEASE" ]]; then
+    echo "Untrusted files were preserved for inspection at $PREVIOUS_RELEASE" >&2
+  fi
+}
+
+cleanup_artifacts() {
+  if [[ -n "$BUILD_ROOT" && -d "$BUILD_ROOT" ]]; then
+    rm -rf -- "$BUILD_ROOT"
+  fi
+  if [[ $DEPLOY_COMMITTED -eq 1 ]]; then
+    rm -rf -- "$PREVIOUS_RELEASE" "$CLI_BACKUP" "$CLI_IMPL_BACKUP"
+  fi
+  rm -f -- "$ENV_BACKUP" "$INSTALL_CONFIG_BACKUP" "$UNIT_BACKUP"
+}
+
+on_exit() {
+  local exit_code=$?
+  trap - EXIT
+  set +e
+  if [[ $exit_code -ne 0 && $TRANSACTION_STARTED -eq 1 && $DEPLOY_COMMITTED -eq 0 ]]; then
+    rollback_or_fail_closed
+  elif [[ $exit_code -ne 0 && $CURRENT_TRUSTED -eq 0 ]]; then
+    systemctl_cmd stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl_cmd disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    echo "Update failed before activation; no untrusted or incomplete release will start at boot." >&2
+  fi
+  cleanup_artifacts
+  exit "$exit_code"
+}
+trap on_exit EXIT
+
+if [[ ${TRANSMISSION3_BOT_INSTALL_LIB_ONLY:-0} == 1 ]]; then
+  trap - EXIT
+  return 0 2>/dev/null || exit 0
+fi
+
+if [[ ${EUID} -ne 0 ]]; then
+  die "Please run as root: sudo bash install.sh"
+fi
+
+validate_inputs
+sanitize_build_environment
+ensure_system_dependencies
+ensure_service_user
+
+if [[ -e "$INSTALL_PARENT" || -L "$INSTALL_PARENT" ]]; then
+  is_secure_parent_directory "$INSTALL_PARENT" || die "INSTALL_DIR parent must be root-owned and not group/world-writable"
+else
+  install -d -o root -g root -m 0755 "$INSTALL_PARENT"
+fi
+is_secure_parent_directory "$INSTALL_PARENT" || die "INSTALL_DIR parent must be root-owned and not group/world-writable"
+assess_current_deployment
+
+if systemctl_cmd is-active --quiet "$SERVICE_NAME"; then
+  SERVICE_WAS_ACTIVE=1
+fi
+if systemctl_cmd is-enabled --quiet "$SERVICE_NAME"; then
+  SERVICE_WAS_ENABLED=1
+fi
+SHOULD_START=$SERVICE_WAS_ACTIVE
+if [[ "$START_SERVICE" == 1 ]]; then
+  SHOULD_START=1
+elif [[ "$START_SERVICE" == 0 ]]; then
+  SHOULD_START=0
+fi
+if [[ $CURRENT_PRESENT -eq 1 && $CURRENT_TRUSTED -eq 0 && $SERVICE_WAS_ACTIVE -eq 1 ]]; then
+  systemctl_cmd stop "$SERVICE_NAME"
+  UNTRUSTED_SERVICE_STOPPED=1
+  echo "Stopped legacy service before building; its writable checkout will not be executed as root."
+fi
+
+build_clean_release
+
+ensure_secure_config_directory
+if [[ $SERVICE_WAS_ACTIVE -eq 1 && $UNTRUSTED_SERVICE_STOPPED -eq 0 ]]; then
+  systemctl_cmd stop "$SERVICE_NAME"
+fi
+TRANSACTION_STARTED=1
+backup_transaction_files
+CONFIG_TOUCHED=1
+migrate_configuration_by_copy
+migrate_mutable_files_by_copy
+
+swap_release
+install_cli_from_release
+UNIT_TOUCHED=1
+prepare_unit_file
+systemctl_cmd daemon-reload
+systemctl_cmd enable "$SERVICE_NAME"
+
+if [[ $SHOULD_START -eq 1 ]]; then
+  start_service_and_check || die "New release did not remain active"
+fi
+
+DEPLOY_COMMITTED=1
+cleanup_artifacts
+echo "Installed a clean root-owned release in $INSTALL_DIR"
+echo "Configure token/user id via: sudo transmission3-bot update"
+if [[ $SHOULD_START -eq 0 ]]; then
+  echo "Then start bot: systemctl start $SERVICE_NAME"
+fi

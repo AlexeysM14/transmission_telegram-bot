@@ -20,7 +20,7 @@ git clone https://github.com/AlexeysM14/transmission_telegram-bot.git
 cd transmission_telegram-bot
 ```
 
-3) Запустите установку (создаст `.venv`, systemd-сервис и команду `transmission3-bot`):
+3) Запустите установку (создаст изолированную `.venv`, systemd-сервис и команду `transmission3-bot`):
 
 ```bash
 bash install.sh
@@ -39,7 +39,7 @@ transmission3-bot status
 ```
 
 В меню доступны пункты:
-- `1` — скачать обновления бота из GitHub (`git pull` + обновление зависимостей) и перезапустить сервис;
+- `1` — скачать обновления бота из GitHub, собрать новую `.venv` и перезапустить сервис;
 - `2` — задать токен Telegram-бота (`TG_TOKEN`);
 - `3` — задать Telegram user id (`ALLOWED_USER_IDS`);
 - `4` — задать прокси для Telegram Bot API (`TG_PROXY`, например: `http://127.0.0.1:8080` или `socks5://127.0.0.1:1080`);
@@ -59,6 +59,24 @@ transmission3-bot status
 - доступен ли Transmission RPC и сколько сейчас активных/остановленных торрентов;
 - где находится файл логов и когда он обновлялся в последний раз.
 
+### Системные пути и права
+
+При установке через `install.sh` файлы разделены по назначению:
+
+- `/opt/transmission3-bot` — код и `.venv`, принадлежат `root:root` и недоступны сервису для записи;
+- `/etc/transmission3-bot/environment` — токены и настройки, `root:transmission3-bot`, права `0640`;
+- `/var/lib/transmission3-bot` — изменяемое состояние бота, принадлежит сервисному пользователю;
+- `/var/log/transmission3-bot` — ротируемые файловые логи, принадлежит сервисному пользователю;
+- `/usr/local/bin/transmission3-bot` — обычный root-owned launcher, а не ссылка в каталог с кодом.
+
+systemd монтирует корневую файловую систему для процесса только для чтения и разрешает запись лишь в каталоги состояния и логов. При повторном запуске `install.sh` старая конфигурация `.env`, JSON-состояние и файлы логов автоматически переносятся в новые каталоги. В `/opt/transmission3-bot/.env` остаётся только root-owned совместимая ссылка на файл из `/etc`.
+
+Для первой миграции старой установки запускайте новый `install.sh` из отдельного доверенного checkout, а не из прежнего `/opt/transmission3-bot`: в старой схеме этот каталог принадлежал сервисному пользователю.
+
+Обновление кода требует `sudo`. CLI и установщик никогда не выполняют Git-команды, `pip`, Python или requirements из текущего `/opt/transmission3-bot`. Вместо этого создаётся новый root-owned checkout рядом с каталогом установки, Git запускается без system/global/local config и hooks, а зависимости устанавливаются только из бинарных wheels (`--only-binary=:all:`, `--no-input`) в новую `.venv`.
+
+Готовый release целиком переключается через rename. Предыдущие root-owned release, CLI, unit и конфигурация сохраняются до перезапуска и проверки `systemctl is-active`; при ошибке они восстанавливаются и прежний сервис запускается снова. Если старая установка доступна сервисному пользователю на запись, она считается недоверенной: при неудачной миграции бот остаётся остановленным, а старый код не восстанавливается и не выполняется.
+
 5) После настройки запустите сервис:
 
 ```bash
@@ -72,18 +90,21 @@ systemctl status transmission3-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
 
+Опционально: для отправки графика трафика установите `matplotlib`:
 
-> Опционально: для отправки графика трафика за 7 дней в виде изображения установите `matplotlib`:
->
-> ```bash
-> pip install matplotlib
-> ```
+```bash
+pip install matplotlib
+```
+
+```bash
 export TG_TOKEN="<telegram-bot-token>"
 export ALLOWED_USER_IDS="<your-telegram-user-id>"
 export TG_PROXY="http://proxy-login:proxy-password@127.0.0.1:8080"
 # optional: separate proxy only for getUpdates long polling
 # export TG_GET_UPDATES_PROXY="socks5://proxy-login:proxy-password@127.0.0.1:1080"
+export BOT_TIMEZONE="Europe/Moscow"
 python bot.py
 ```
 
@@ -102,7 +123,7 @@ python bot.py
 - `➕ Добавить` — magnet/URL или `.torrent` файл.
 - `⚙️ Управление` — пауза, старт, удаление и уведомления.
 
-История раздач хранится рядом с ботом в `torrent_history.json` и обновляется при обычных действиях с ботом, а также фоновым снимком раз в минуту.
+История раздач и настройки уведомлений хранятся в SQLite в каталоге состояния. При systemd-установке это `/var/lib/transmission3-bot`; старые `traffic_anchors.json` и `torrent_history.json` импортируются автоматически. Снимок истории обновляется при обычных действиях с ботом и фоновым заданием.
 
 ## Как получить токен Telegram
 
@@ -145,5 +166,7 @@ curl -s "https://api.telegram.org/bot<TG_TOKEN>/getUpdates"
 - `TR_USER` / `TR_PASS` — логин/пароль RPC.
 - `TR_TIMEOUT` — таймаут RPC в секундах (по умолчанию `10`).
 - `LIST_LIMIT` — сколько торрентов показывать в одном списке (по умолчанию `25`).
+- `BOT_TIMEZONE` — часовой пояс статистики и фоновых снимков в формате IANA, например `Europe/Moscow` (по умолчанию `UTC`).
 - `LOG_LEVEL` — уровень логирования в консоль (`INFO`, `DEBUG` и т.п.).
-- `LOG_FILE` — путь к файлу логов предупреждений/ошибок (по умолчанию `bot-errors.log`, ротация 1 MiB × 3 файла).
+- `STATE_DIR` — каталог постоянного состояния (при systemd-установке `/var/lib/transmission3-bot`).
+- `LOG_FILE` — путь к файлу логов предупреждений/ошибок (при systemd-установке `/var/log/transmission3-bot/bot-errors.log`, ротация 1 MiB × 3 файла).

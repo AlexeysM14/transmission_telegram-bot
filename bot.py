@@ -8,25 +8,27 @@ import contextlib
 import heapq
 import html
 import io
-import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import threading
 import time as time_module
 from dataclasses import dataclass
-from datetime import datetime, time
+from dataclasses import field as dataclass_field
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from math import ceil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Coroutine, Literal, Optional, Sequence, cast
 from urllib.parse import urlsplit, urlunsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import TelegramError, TimedOut
+from telegram.error import Forbidden, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -38,12 +40,26 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 from transmission_rpc import Client, from_url
-from transmission_rpc.error import TransmissionError
+from transmission_rpc.error import TransmissionAuthError, TransmissionConnectError, TransmissionError
+
+from state_store import OutboxItem, Snapshot, SQLiteStateStore, StartWatch
+
+_BOT_TOKEN_RE = re.compile(r"(?i)(/bot)(\d{6,}:[A-Za-z0-9_-]{20,})")
+_URL_CREDENTIALS_RE = re.compile(r"(?i)([a-z][a-z0-9+.-]*://)([^/@\s:]+):([^/@\s]+)@")
+_LOG_SECRETS: tuple[str, ...] = ()
+
+
+def _redact_log_text(value: str) -> str:
+    redacted = _BOT_TOKEN_RE.sub(r"\1<redacted>", value)
+    redacted = _URL_CREDENTIALS_RE.sub(r"\1***:***@", redacted)
+    for secret in _LOG_SECRETS:
+        redacted = redacted.replace(secret, "<redacted>")
+    return redacted
 
 
 class EventTimeFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        formatted = super().format(record)
+        formatted = _redact_log_text(super().format(record))
         if "\n" not in formatted:
             return formatted
 
@@ -69,7 +85,10 @@ def load_dotenv_file(path: Path) -> None:
             continue
         os.environ[key] = value.strip().strip('"').strip("'")
 
+
 def configure_logging() -> logging.Logger:
+    global _LOG_SECRETS
+
     log_level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
     log_format = "%(asctime)s.%(msecs)03dZ | %(levelname)s | %(name)s | %(message)s"
@@ -77,7 +96,24 @@ def configure_logging() -> logging.Logger:
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
+    for handler in root_logger.handlers:
+        with contextlib.suppress(Exception):
+            handler.close()
     root_logger.handlers.clear()
+
+    secrets = {
+        os.environ.get("TG_TOKEN", "").strip(),
+        os.environ.get("TR_PASS", "").strip(),
+    }
+    for env_name in ("TG_PROXY", "TG_GET_UPDATES_PROXY", "TR_URL"):
+        raw_url = os.environ.get(env_name, "").strip()
+        if not raw_url:
+            continue
+        with contextlib.suppress(ValueError):
+            password = urlsplit(raw_url).password
+            if password:
+                secrets.add(password)
+    _LOG_SECRETS = tuple(sorted((secret for secret in secrets if len(secret) >= 4), key=len, reverse=True))
 
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
@@ -102,6 +138,11 @@ def configure_logging() -> logging.Logger:
     file_handler.setFormatter(file_formatter)
     root_logger.addHandler(file_handler)
 
+    # HTTPX logs the full Telegram Bot API URL (including the token) at INFO.
+    # Keep transport loggers quiet even when application debug logging is enabled.
+    for logger_name in ("httpx", "httpcore", "transmission-rpc"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
     logger = logging.getLogger("tg-transmission-bot")
     logger.info("Error logs will be written to %s", log_file_path)
     return logger
@@ -114,6 +155,8 @@ TG_MAX_MESSAGE = 4096
 TORRENT_ID_RE = re.compile(r"\b(\d{1,9})\b")
 _TR_CLIENT: Optional[Client] = None
 _TR_CLIENT_LOCK = threading.Lock()
+_TR_CALL_LOCK: Optional[asyncio.Lock] = None
+_OUTBOX_DRAIN_LOCK: Optional[asyncio.Lock] = None
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 TransmissionProtocol = Literal["http", "https"]
 
@@ -124,22 +167,25 @@ class TRCallError(Exception):
 
 @dataclass(frozen=True)
 class Config:
-    tg_token: str
+    tg_token: str = dataclass_field(repr=False)
     allowed_user_ids: Optional[set[int]]
     allow_all_users: bool
-    tg_proxy: Optional[str]
-    tg_get_updates_proxy: Optional[str]
+    tg_proxy: Optional[str] = dataclass_field(repr=False)
+    tg_get_updates_proxy: Optional[str] = dataclass_field(repr=False)
 
-    tr_url: Optional[str]
+    tr_url: Optional[str] = dataclass_field(repr=False)
     tr_protocol: TransmissionProtocol
     tr_host: str
     tr_port: int
     tr_path: str
-    tr_user: Optional[str]
-    tr_pass: Optional[str]
+    tr_user: Optional[str] = dataclass_field(repr=False)
+    tr_pass: Optional[str] = dataclass_field(repr=False)
     tr_timeout: float
 
     list_limit: int
+    state_dir: Path
+    timezone: ZoneInfo
+    timezone_name: str
 
 
 def _parse_allowed_ids(raw: str) -> Optional[set[int]]:
@@ -202,6 +248,14 @@ def _parse_bool_env(name: str, *, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _parse_timezone_env() -> tuple[str, ZoneInfo]:
+    timezone_name = os.environ.get("BOT_TIMEZONE", "UTC").strip() or "UTC"
+    try:
+        return timezone_name, ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise RuntimeError(f"BOT_TIMEZONE has unknown timezone: {timezone_name}") from exc
+
+
 def _normalize_proxy_url(raw_url: Optional[str], *, env_name: str) -> Optional[str]:
     if not raw_url:
         return None
@@ -212,9 +266,7 @@ def _normalize_proxy_url(raw_url: Optional[str], *, env_name: str) -> Optional[s
         raise RuntimeError(f"{env_name} must be a valid proxy URL")
 
     if scheme == "mtproto":
-        raise RuntimeError(
-            f"{env_name} does not support mtproto:// for Telegram Bot API; use http(s):// or socks5://"
-        )
+        raise RuntimeError(f"{env_name} does not support mtproto:// for Telegram Bot API; use http(s):// or socks5://")
 
     if scheme not in SUPPORTED_PROXY_SCHEMES:
         supported = ", ".join(sorted(SUPPORTED_PROXY_SCHEMES))
@@ -253,18 +305,17 @@ def load_config() -> Config:
     list_limit = _parse_int_env("LIST_LIMIT", "25", min_value=1)
     allowed_user_ids = _parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
     allow_all_users = _parse_bool_env("ALLOW_ALL_USERS", default=False)
+    timezone_name, bot_timezone = _parse_timezone_env()
+    state_dir_raw = os.environ.get("STATE_DIR", "").strip()
+    state_dir = Path(state_dir_raw).expanduser() if state_dir_raw else Path(__file__).resolve().parent
 
     if allowed_user_ids is None:
         if allow_all_users:
             log.warning(
-                "ALLOWED_USER_IDS is empty and ALLOW_ALL_USERS is enabled; "
-                "every private Telegram user is allowed"
+                "ALLOWED_USER_IDS is empty and ALLOW_ALL_USERS is enabled; every private Telegram user is allowed"
             )
         else:
-            log.warning(
-                "ALLOWED_USER_IDS is empty; access is denied until at least "
-                "one Telegram user id is configured"
-            )
+            log.warning("ALLOWED_USER_IDS is empty; access is denied until at least one Telegram user id is configured")
 
     return Config(
         tg_token=tg_token,
@@ -281,10 +332,14 @@ def load_config() -> Config:
         tr_pass=os.environ.get("TR_PASS", "").strip() or None,
         tr_timeout=tr_timeout,
         list_limit=list_limit,
+        state_dir=state_dir,
+        timezone=bot_timezone,
+        timezone_name=timezone_name,
     )
 
 
 CFG: Optional[Config] = None
+STATE_STORE: Optional[SQLiteStateStore] = None
 
 
 def get_config() -> Config:
@@ -293,15 +348,36 @@ def get_config() -> Config:
     return CFG
 
 
+def get_state_store() -> SQLiteStateStore:
+    if STATE_STORE is None:
+        raise RuntimeError("State store is not initialized")
+    return STATE_STORE
+
+
+def bot_now() -> datetime:
+    return datetime.now(get_config().timezone)
+
+
 def initialize_runtime() -> None:
-    global CFG, CONFIRM_DEL_KEEP_FLOW, _TR_CLIENT, log
+    global CFG, CONFIRM_DEL_KEEP_FLOW, STATE_STORE, _OUTBOX_DRAIN_LOCK, _TR_CALL_LOCK, _TR_CLIENT, log
 
     load_dotenv_file(Path(__file__).resolve().with_name(".env"))
     log = configure_logging()
     CFG = load_config()
+    CFG.state_dir.mkdir(parents=True, exist_ok=True)
+    STATE_STORE = SQLiteStateStore(
+        CFG.state_dir / "bot-state.sqlite3",
+        legacy_traffic_path=CFG.state_dir / "traffic_anchors.json",
+        legacy_torrent_history_path=CFG.state_dir / "torrent_history.json",
+        logger=log,
+    )
+    STATE_STORE.initialize()
     CONFIRM_DEL_KEEP_FLOW = _parse_bool_env("CONFIRM_DEL_KEEP", default=False)
+    _TR_CALL_LOCK = None
+    _OUTBOX_DRAIN_LOCK = None
     with _TR_CLIENT_LOCK:
         _TR_CLIENT = None
+
 
 MENU_MAIN = "MAIN"
 MENU_TORRENTS = "TORRENTS"
@@ -387,20 +463,14 @@ LAST_EPHEMERAL_MESSAGE_KEY = "last_ephemeral_message_id"
 PENDING_CTRL_ACTION_KEY = "pending_ctrl_action"
 NOTIFY_ENABLED_CHATS_KEY = "notify_enabled_chat_ids"
 NOTIFY_KNOWN_CHATS_KEY = "notify_known_chat_ids"
-NOTIFY_COMPLETED_CACHE_KEY = "notify_completed_cache"
-NOTIFY_COMPLETION_PENDING_KEY = "notify_completion_pending"
-NOTIFY_INITIALIZED_KEY = "notify_initialized"
 NOTIFY_START_PENDING_KEY = "notify_start_pending"
 NOTIFY_START_TASKS_KEY = "notify_start_tasks"
-TRAFFIC_LAST_SNAPSHOT_DAY_KEY = "traffic_last_snapshot_day"
 TORRENT_HISTORY_LAST_PAGE_KEY = "torrent_history_last_page"
 
 NOTIFY_POLL_INTERVAL_SEC = 60
 NOTIFY_START_QUICK_DELAYS_SEC = (0.0, 2.0, 5.0, 15.0, 30.0)
 NOTIFY_NO_PEERS_DELAY_SEC = 10 * 60
-TRAFFIC_ANCHORS_PATH = Path(__file__).resolve().with_name("traffic_anchors.json")
 TRAFFIC_STATE_LOCK = asyncio.Lock()
-TORRENT_HISTORY_PATH = Path(__file__).resolve().with_name("torrent_history.json")
 TORRENT_HISTORY_LOCK = asyncio.Lock()
 TORRENT_HISTORY_FIELDS = (
     "id",
@@ -644,30 +714,54 @@ def get_client() -> Client:
     return _TR_CLIENT
 
 
-async def tr_call(fn: Callable[[Client], Any]) -> Any:
+def _reset_client() -> None:
+    global _TR_CLIENT
+    with _TR_CLIENT_LOCK:
+        _TR_CLIENT = None
+
+
+def _get_tr_call_lock() -> asyncio.Lock:
+    global _TR_CALL_LOCK
+    if _TR_CALL_LOCK is None:
+        _TR_CALL_LOCK = asyncio.Lock()
+    return _TR_CALL_LOCK
+
+
+async def tr_call(
+    fn: Callable[[Client], Any],
+    *,
+    retry_on_connection: bool = True,
+    operation: str = "rpc",
+) -> Any:
     def _run() -> Any:
         client = get_client()
         return fn(client)
 
-    def _reset_client() -> None:
-        global _TR_CLIENT
-        with _TR_CLIENT_LOCK:
-            _TR_CLIENT = None
-
     def _call() -> Any:
         try:
             return _run()
-        except TransmissionError:
-            # Recreate client once on Transmission RPC failure and retry.
+        except TransmissionAuthError as exc:
+            log.warning("Transmission authentication failed during %s", operation)
+            raise TRCallError("Transmission authentication failed") from exc
+        except TransmissionConnectError as exc:
             _reset_client()
+            if not retry_on_connection:
+                log.warning("Transmission connection failed during non-retryable %s", operation)
+                raise TRCallError("Transmission RPC connection failed") from exc
+
+            log.warning("Transmission connection failed during %s; retrying once", operation)
             try:
                 return _run()
-            except Exception as exc:
-                raise TRCallError("Transmission RPC request failed") from exc
-        except (ConnectionError, TimeoutError, OSError) as exc:
-            raise TRCallError("Transmission RPC connection failed") from exc
+            except TransmissionAuthError as retry_exc:
+                raise TRCallError("Transmission authentication failed") from retry_exc
+            except TransmissionError as retry_exc:
+                raise TRCallError("Transmission RPC connection failed after retry") from retry_exc
+        except TransmissionError as exc:
+            log.warning("Transmission RPC rejected %s: %s", operation, exc)
+            raise TRCallError("Transmission RPC request failed") from exc
 
-    return await asyncio.to_thread(_call)
+    async with _get_tr_call_lock():
+        return await asyncio.to_thread(_call)
 
 
 def build_telegram_application(
@@ -676,18 +770,16 @@ def build_telegram_application(
     post_shutdown: Callable[[Application], Coroutine[Any, Any, None]],
 ) -> Application:
     cfg = get_config()
-    builder = (
-        ApplicationBuilder()
-        .token(cfg.tg_token)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-    )
+    builder = ApplicationBuilder().token(cfg.tg_token).post_init(post_init).post_shutdown(post_shutdown)
 
     tg_proxy = _normalize_proxy_url(cfg.tg_proxy, env_name="TG_PROXY")
-    tg_get_updates_proxy = _normalize_proxy_url(
-        cfg.tg_get_updates_proxy,
-        env_name="TG_GET_UPDATES_PROXY",
-    ) or tg_proxy
+    tg_get_updates_proxy = (
+        _normalize_proxy_url(
+            cfg.tg_get_updates_proxy,
+            env_name="TG_GET_UPDATES_PROXY",
+        )
+        or tg_proxy
+    )
 
     if not tg_proxy and not tg_get_updates_proxy:
         log.info("Telegram proxy is not configured; using direct connection")
@@ -766,6 +858,7 @@ def _build_single_torrent_message(header: str, lines: Sequence[str], tail: str) 
         return f"{message}{suffix}"
     return message
 
+
 async def reply_chunks(
     update: Update,
     text: str,
@@ -818,26 +911,15 @@ async def _send_with_timeout_retry(
     raise last_error if last_error is not None else RuntimeError(f"{op_name} failed without TimedOut exception")
 
 
-async def _send_html_message_with_retry(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    text: str,
-    *,
-    op_name: str,
-) -> None:
-    await _send_with_timeout_retry(
-        lambda: ctx.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML),
-        op_name=op_name,
-    )
-
-
 STATUS_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить статус", callback_data=STATUS_REFRESH_CB)]])
 TORRENT_LIST_KEYBOARD = InlineKeyboardMarkup(
-    [[
-        InlineKeyboardButton("⬇️ Скачиваются", callback_data=f"{LIST_REFRESH_CB_PREFIX}downloading"),
-        InlineKeyboardButton("📋 Все", callback_data=f"{LIST_REFRESH_CB_PREFIX}all"),
-        InlineKeyboardButton("✅ Завершённые", callback_data=f"{LIST_REFRESH_CB_PREFIX}done"),
-    ]]
+    [
+        [
+            InlineKeyboardButton("⬇️ Скачиваются", callback_data=f"{LIST_REFRESH_CB_PREFIX}downloading"),
+            InlineKeyboardButton("📋 Все", callback_data=f"{LIST_REFRESH_CB_PREFIX}all"),
+            InlineKeyboardButton("✅ Завершённые", callback_data=f"{LIST_REFRESH_CB_PREFIX}done"),
+        ]
+    ]
 )
 
 TRAFFIC_OVERVIEW_KEYBOARD = InlineKeyboardMarkup(
@@ -880,7 +962,77 @@ def _notifications_enabled(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool
     return chat_id in enabled_chats
 
 
-def _register_torrent_start_watch(
+def _notification_torrent_key(torrent: Any) -> Optional[str]:
+    return _torrent_history_key(torrent)
+
+
+async def _enqueue_notification(
+    *,
+    event_key: str,
+    chat_id: int,
+    kind: str,
+    text: str,
+) -> bool:
+    return await asyncio.to_thread(
+        get_state_store().enqueue_outbox,
+        event_key,
+        chat_id,
+        kind,
+        text,
+    )
+
+
+def _notification_retry_delay(attempts: int) -> float:
+    return float(min(60 * 60, 5 * (2 ** min(max(0, attempts - 1), 9))))
+
+
+async def _deliver_outbox_item(ctx: ContextTypes.DEFAULT_TYPE, item: OutboxItem) -> None:
+    enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
+    if not isinstance(enabled_chats, set) or item.chat_id not in enabled_chats:
+        await asyncio.to_thread(get_state_store().cancel_pending_outbox, item.chat_id)
+        return
+
+    try:
+        # A send timeout is ambiguous: do not immediately send a duplicate. The
+        # durable outbox retries later with backoff until Telegram confirms it.
+        await ctx.bot.send_message(chat_id=item.chat_id, text=item.text, parse_mode=ParseMode.HTML)
+    except Forbidden:
+        enabled_chats.discard(item.chat_id)
+        await asyncio.to_thread(get_state_store().set_notification_enabled, item.chat_id, False)
+        log.warning("Notifications disabled because chat %s rejected the bot", item.chat_id)
+    except TelegramError as exc:
+        attempts = item.attempts + 1
+        next_attempt_at = time_module.time() + _notification_retry_delay(attempts)
+        await asyncio.to_thread(
+            get_state_store().mark_outbox_failed,
+            item.id,
+            attempts,
+            next_attempt_at,
+            error=_redact_log_text(str(exc)),
+        )
+        log.warning(
+            "Notification delivery failed for chat %s; retry %d scheduled",
+            item.chat_id,
+            attempts,
+        )
+    else:
+        await asyncio.to_thread(get_state_store().mark_outbox_delivered, item.id)
+
+
+async def _drain_notification_outbox(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global _OUTBOX_DRAIN_LOCK
+    if _OUTBOX_DRAIN_LOCK is None:
+        _OUTBOX_DRAIN_LOCK = asyncio.Lock()
+
+    async with _OUTBOX_DRAIN_LOCK:
+        while True:
+            items = await asyncio.to_thread(get_state_store().claim_due_outbox, time_module.time(), 1)
+            if not items:
+                return
+            await _deliver_outbox_item(ctx, items[0])
+
+
+async def _register_torrent_start_watch(
     ctx: ContextTypes.DEFAULT_TYPE,
     chat_id: Optional[int],
     torrent: Any,
@@ -896,47 +1048,26 @@ def _register_torrent_start_watch(
         ctx.application.bot_data[NOTIFY_START_PENDING_KEY] = pending
 
     torrent_id = int(getattr(torrent, "id", 0))
-    if torrent_id <= 0:
+    torrent_key = _notification_torrent_key(torrent)
+    if torrent_id <= 0 or torrent_key is None:
         return
 
-    now_value = now_ts if now_ts is not None else asyncio.get_running_loop().time()
+    now_value = now_ts if now_ts is not None else time_module.time()
+    name = str(getattr(torrent, "name", "") or "<без названия>")
+    await asyncio.to_thread(
+        get_state_store().add_start_watch,
+        torrent_key,
+        chat_id,
+        torrent_id,
+        name,
+        added_at=now_value,
+    )
     state = pending.get(torrent_id)
     if not isinstance(state, dict):
         pending[torrent_id] = {
             "added_at": now_value,
-            "name": str(getattr(torrent, "name", "") or "<без названия>"),
-            "chat_ids": {chat_id},
-        }
-        return
-
-    chat_ids = state.get("chat_ids")
-    if not isinstance(chat_ids, set):
-        chat_ids = set()
-        state["chat_ids"] = chat_ids
-    chat_ids.add(chat_id)
-
-
-def _register_torrent_completion_watch(
-    ctx: ContextTypes.DEFAULT_TYPE,
-    chat_id: Optional[int],
-    torrent: Any,
-) -> None:
-    if chat_id is None:
-        return
-
-    pending = ctx.application.bot_data.setdefault(NOTIFY_COMPLETION_PENDING_KEY, {})
-    if not isinstance(pending, dict):
-        pending = {}
-        ctx.application.bot_data[NOTIFY_COMPLETION_PENDING_KEY] = pending
-
-    torrent_id = int(getattr(torrent, "id", 0))
-    if torrent_id <= 0:
-        return
-
-    state = pending.get(torrent_id)
-    if not isinstance(state, dict):
-        pending[torrent_id] = {
-            "name": str(getattr(torrent, "name", "") or "<без названия>"),
+            "name": name,
+            "torrent_key": torrent_key,
             "chat_ids": {chat_id},
         }
         return
@@ -968,11 +1099,7 @@ def _pop_pending_torrent_start(ctx: ContextTypes.DEFAULT_TYPE, torrent_id: int) 
 
 def _build_torrent_start_notification_text(torrent_id: int, name: str) -> str:
     safe_name = html.escape(name or "<без названия>")
-    return (
-        "▶️ <b>Скачивание началось</b>\n"
-        f"Торрент: <b>{safe_name}</b>\n"
-        f"ID: <b>{torrent_id}</b>"
-    )
+    return f"▶️ <b>Скачивание началось</b>\nТоррент: <b>{safe_name}</b>\nID: <b>{torrent_id}</b>"
 
 
 async def _send_torrent_start_notification(
@@ -982,8 +1109,8 @@ async def _send_torrent_start_notification(
     torrent: Any,
 ) -> None:
     enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
-    if not isinstance(enabled_chats, set) or not enabled_chats:
-        return
+    if not isinstance(enabled_chats, set):
+        enabled_chats = set()
 
     chat_ids = state.get("chat_ids")
     if not isinstance(chat_ids, set) or not chat_ids:
@@ -991,19 +1118,25 @@ async def _send_torrent_start_notification(
 
     name = str(state.get("name") or getattr(torrent, "name", "<без названия>"))
     text = _build_torrent_start_notification_text(torrent_id, name)
+    torrent_key = str(state.get("torrent_key") or _notification_torrent_key(torrent) or f"id:{torrent_id}")
+    added_at = float(state.get("added_at", time_module.time()))
 
     for chat_id in list(chat_ids):
-        if chat_id not in enabled_chats:
-            continue
-        try:
-            await _send_html_message_with_retry(
-                ctx,
-                chat_id,
-                text,
-                op_name="notify_started.send_message",
+        if chat_id in enabled_chats:
+            await _enqueue_notification(
+                event_key=f"start:{torrent_key}:{int(added_at * 1000)}",
+                chat_id=chat_id,
+                kind="start",
+                text=text,
             )
-        except TelegramError:
-            log.warning("Failed to send start notification to chat %s", chat_id, exc_info=True)
+        await asyncio.to_thread(
+            get_state_store().update_start_watch,
+            torrent_key,
+            chat_id,
+            start_notified=True,
+        )
+
+    await _drain_notification_outbox(ctx)
 
 
 async def _notify_torrent_start_soon(
@@ -1040,10 +1173,13 @@ async def _notify_torrent_start_soon(
         torrent = None
 
 
-def _finish_torrent_start_task(app: Application, task: asyncio.Task[None]) -> None:
+def _finish_torrent_start_task(app: Application, torrent_id: int, task: asyncio.Task[None]) -> None:
     tasks = app.bot_data.get(NOTIFY_START_TASKS_KEY)
     if isinstance(tasks, set):
         tasks.discard(task)
+    pending = app.bot_data.get(NOTIFY_START_PENDING_KEY)
+    if isinstance(pending, dict):
+        pending.pop(torrent_id, None)
 
     with contextlib.suppress(asyncio.CancelledError):
         exc = task.exception()
@@ -1062,12 +1198,15 @@ def _schedule_torrent_start_watch(ctx: ContextTypes.DEFAULT_TYPE, torrent: Any) 
         ctx.application.bot_data[NOTIFY_START_TASKS_KEY] = tasks
 
     task_ctx = cast(ContextTypes.DEFAULT_TYPE, SimpleNamespace(application=ctx.application, bot=ctx.bot))
-    task = asyncio.create_task(_notify_torrent_start_soon(task_ctx, torrent_id, torrent))
+    task = ctx.application.create_task(
+        _notify_torrent_start_soon(task_ctx, torrent_id, torrent),
+        name=f"torrent-start-watch-{torrent_id}",
+    )
     tasks.add(task)
-    task.add_done_callback(lambda done_task: _finish_torrent_start_task(ctx.application, done_task))
+    task.add_done_callback(lambda done_task: _finish_torrent_start_task(ctx.application, torrent_id, done_task))
 
 
-def _ensure_chat_notifications_initialized(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
+async def _ensure_chat_notifications_initialized(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> None:
     if chat_id is None:
         return
 
@@ -1076,8 +1215,12 @@ def _ensure_chat_notifications_initialized(ctx: ContextTypes.DEFAULT_TYPE, chat_
     if chat_id in known_chats:
         return
 
+    enabled = await asyncio.to_thread(get_state_store().ensure_chat, chat_id, default_enabled=True)
     known_chats.add(chat_id)
-    enabled_chats.add(chat_id)
+    if enabled:
+        enabled_chats.add(chat_id)
+    else:
+        enabled_chats.discard(chat_id)
 
 
 def _ctrl_keyboard_for_chat(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> ReplyKeyboardMarkup:
@@ -1296,8 +1439,7 @@ def _build_status_text(stats: Any, free_space: Optional[int], torrents: Sequence
         f"⇣ <b>{fmt_bytes(cur.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cur.uploaded_bytes)}</b>"
     )
     total_traffic_text = (
-        f"Трафик (всего): "
-        f"⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>"
+        f"Трафик (всего): ⇣ <b>{fmt_bytes(cum.downloaded_bytes)}</b> | ⇡ <b>{fmt_bytes(cum.uploaded_bytes)}</b>"
     )
     return (
         "📊 <b>Transmission — статус</b>\n"
@@ -1307,62 +1449,16 @@ def _build_status_text(stats: Any, free_space: Optional[int], torrents: Sequence
         f"{free_space_text}\n"
         f"{session_traffic_text}\n"
         f"{total_traffic_text}\n"
-        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"🕒 {bot_now().strftime('%Y-%m-%d %H:%M:%S %Z')}"
     )
 
 
 def _read_traffic_state() -> tuple[dict[str, dict[str, int | str]], list[dict[str, int | str]]]:  # noqa: C901
-    try:
-        data = json.loads(TRAFFIC_ANCHORS_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}, []
-    except (OSError, ValueError, TypeError):
-        return {}, []
-
-    if not isinstance(data, dict):
-        return {}, []
-
-    anchors: dict[str, dict[str, int | str]] = {}
-    for period in ("day", "week", "month"):
-        row = data.get(period)
-        if not isinstance(row, dict):
-            continue
-        key = row.get("key")
-        downloaded = row.get("downloaded")
-        uploaded = row.get("uploaded")
-        if isinstance(key, str) and isinstance(downloaded, int) and isinstance(uploaded, int):
-            anchors[period] = {
-                "key": key,
-                "downloaded": max(0, downloaded),
-                "uploaded": max(0, uploaded),
-            }
-
-    raw_history = data.get("history") if isinstance(data, dict) else None
-    days = raw_history.get("days") if isinstance(raw_history, dict) else None
-    if not isinstance(days, list):
-        return anchors, []
-
-    history: list[dict[str, int | str]] = []
-    for item in days:
-        if not isinstance(item, dict):
-            continue
-        date = item.get("date")
-        downloaded = item.get("downloaded")
-        uploaded = item.get("uploaded")
-        if isinstance(date, str) and isinstance(downloaded, int) and isinstance(uploaded, int):
-            history.append({
-                "date": date,
-                "downloaded": max(0, downloaded),
-                "uploaded": max(0, uploaded),
-            })
-    return anchors, history
+    return get_state_store().load_traffic_state()
 
 
 def _persist_traffic_state(anchors: dict[str, dict[str, int | str]], history: list[dict[str, int | str]]) -> None:
-    payload = json.dumps({**anchors, "history": {"days": history}}, ensure_ascii=False, separators=(",", ":"))
-    tmp_path = TRAFFIC_ANCHORS_PATH.with_suffix(".tmp")
-    tmp_path.write_text(payload, encoding="utf-8")
-    tmp_path.replace(TRAFFIC_ANCHORS_PATH)
+    get_state_store().save_traffic_state(anchors, history)
 
 
 def _period_keys(now: datetime) -> dict[str, str]:
@@ -1372,6 +1468,58 @@ def _period_keys(now: datetime) -> dict[str, str]:
         "week": f"{iso_year}-W{iso_week:02d}",
         "month": now.strftime("%Y-%m"),
     }
+
+
+def _normalize_traffic_counters(
+    anchors: dict[str, dict[str, int | str]],
+    downloaded: int,
+    uploaded: int,
+) -> tuple[int, int, bool]:
+    counter = anchors.get("_counter")
+    if not isinstance(counter, dict):
+        logical_downloaded = downloaded
+        logical_uploaded = uploaded
+    else:
+        last_downloaded = _non_negative_int(counter.get("last_downloaded"))
+        last_uploaded = _non_negative_int(counter.get("last_uploaded"))
+        last_downloaded = downloaded if last_downloaded is None else last_downloaded
+        last_uploaded = uploaded if last_uploaded is None else last_uploaded
+        previous_logical_downloaded = _non_negative_int(counter.get("logical_downloaded"))
+        previous_logical_uploaded = _non_negative_int(counter.get("logical_uploaded"))
+        previous_logical_downloaded = (
+            last_downloaded if previous_logical_downloaded is None else previous_logical_downloaded
+        )
+        previous_logical_uploaded = last_uploaded if previous_logical_uploaded is None else previous_logical_uploaded
+        download_delta = downloaded - last_downloaded if downloaded >= last_downloaded else downloaded
+        upload_delta = uploaded - last_uploaded if uploaded >= last_uploaded else uploaded
+        logical_downloaded = previous_logical_downloaded + max(0, download_delta)
+        logical_uploaded = previous_logical_uploaded + max(0, upload_delta)
+
+    updated_counter: dict[str, int | str] = {
+        "key": "logical-v1",
+        "last_downloaded": downloaded,
+        "last_uploaded": uploaded,
+        "logical_downloaded": logical_downloaded,
+        "logical_uploaded": logical_uploaded,
+    }
+    changed = counter != updated_counter
+    anchors["_counter"] = updated_counter
+    return logical_downloaded, logical_uploaded, changed
+
+
+def _effective_traffic_totals(
+    anchors: dict[str, dict[str, int | str]],
+    fallback_downloaded: int,
+    fallback_uploaded: int,
+) -> tuple[int, int]:
+    counter = anchors.get("_counter")
+    if not isinstance(counter, dict):
+        return fallback_downloaded, fallback_uploaded
+    logical_downloaded = counter.get("logical_downloaded")
+    logical_uploaded = counter.get("logical_uploaded")
+    if not isinstance(logical_downloaded, int) or not isinstance(logical_uploaded, int):
+        return fallback_downloaded, fallback_uploaded
+    return logical_downloaded, logical_uploaded
 
 
 def _ensure_traffic_anchors(
@@ -1424,18 +1572,24 @@ async def update_traffic_state(
     uploaded: int,
 ) -> tuple[dict[str, dict[str, int | str]], list[dict[str, int | str]]]:
     async with TRAFFIC_STATE_LOCK:
-        anchors, history = _read_traffic_state()
-        anchors_changed = _ensure_traffic_anchors(anchors, now, downloaded, uploaded)
-        history_changed = _ensure_daily_traffic_history(history, now, downloaded, uploaded)
-        if anchors_changed or history_changed:
+        anchors, history = await asyncio.to_thread(_read_traffic_state)
+        effective_downloaded, effective_uploaded, counters_changed = _normalize_traffic_counters(
+            anchors,
+            downloaded,
+            uploaded,
+        )
+        anchors_changed = _ensure_traffic_anchors(anchors, now, effective_downloaded, effective_uploaded)
+        history_changed = _ensure_daily_traffic_history(history, now, effective_downloaded, effective_uploaded)
+        if counters_changed or anchors_changed or history_changed:
             try:
-                _persist_traffic_state(anchors, history)
-            except OSError:
+                await asyncio.to_thread(_persist_traffic_state, anchors, history)
+            except (OSError, sqlite3.Error):
                 log.warning("Failed to persist traffic state", exc_info=True)
             else:
                 period_key = _period_keys(now)["day"]
                 log.debug("Traffic state persisted: period_key=%s history_size=%d", period_key, len(history))
         return anchors, history
+
 
 def _weekday_short_ru(date_value: datetime) -> str:
     labels = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
@@ -1660,8 +1814,7 @@ def _build_last_4_weeks_text(now: datetime, downloaded: int, uploaded: int, hist
 
     for day in points:
         lines.append(
-            f"{day['date']}: ⇣ <b>{fmt_bytes(int(day['downloaded']))}</b> "
-            f"| ⇡ <b>{fmt_bytes(int(day['uploaded']))}</b>"
+            f"{day['date']}: ⇣ <b>{fmt_bytes(int(day['downloaded']))}</b> | ⇡ <b>{fmt_bytes(int(day['uploaded']))}</b>"
         )
 
     lines.append(f"🕒 {now.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1696,10 +1849,7 @@ def _smooth_chart_points(
             t2 = t * t
             t3 = t2 * t
             y_value = 0.5 * (
-                (2 * p1)
-                + (-p0 + p2) * t
-                + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
-                + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
+                (2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3
             )
             smooth_x.append(x1 + (x2 - x1) * t)
             smooth_y.append(max(0.0, min(local_max, max(local_min, y_value))))
@@ -1922,6 +2072,7 @@ def _build_traffic_stats_text(
     anchors: dict[str, dict[str, int | str]],
     history: list[dict[str, int | str]],
 ) -> str:
+    downloaded, uploaded = _effective_traffic_totals(anchors, downloaded, uploaded)
     labels = (("day", "За день"), ("month", "За месяц"))
     lines = ["📈 <b>Статистика трафика</b>"]
 
@@ -1939,40 +2090,11 @@ def _build_traffic_stats_text(
 
 
 def _read_torrent_history_state() -> dict[str, dict[str, Any]]:
-    try:
-        data = json.loads(TORRENT_HISTORY_PATH.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    except (OSError, ValueError, TypeError):
-        return {}
-
-    if not isinstance(data, dict):
-        return {}
-
-    raw_items = data.get("items")
-    if not isinstance(raw_items, dict):
-        return {}
-
-    items: dict[str, dict[str, Any]] = {}
-    for key, value in raw_items.items():
-        if isinstance(key, str) and isinstance(value, dict):
-            items[key] = dict(value)
-    return items
+    return get_state_store().load_torrent_history()
 
 
 def _persist_torrent_history_state(items: dict[str, dict[str, Any]]) -> None:
-    payload = json.dumps(
-        {
-            "version": 1,
-            "updated_at": int(time_module.time()),
-            "items": items,
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    tmp_path = TORRENT_HISTORY_PATH.with_suffix(".tmp")
-    tmp_path.write_text(payload, encoding="utf-8")
-    tmp_path.replace(TORRENT_HISTORY_PATH)
+    get_state_store().save_torrent_history(items)
 
 
 def _history_entry_int(entry: Optional[dict[str, Any]], field: str, default: int = 0) -> int:
@@ -2190,7 +2312,7 @@ async def sync_torrent_history(
 ) -> list[dict[str, Any]]:
     now_ts = int(time_module.time())
     async with TORRENT_HISTORY_LOCK:
-        items = _read_torrent_history_state()
+        items = await asyncio.to_thread(_read_torrent_history_state)
         seen_keys: set[str] = set()
         changed = False
 
@@ -2205,9 +2327,7 @@ async def sync_torrent_history(
             if fallback_entry is not None:
                 changed = True
                 existing = (
-                    fallback_entry
-                    if existing is None
-                    else _merge_torrent_history_entries(existing, fallback_entry)
+                    fallback_entry if existing is None else _merge_torrent_history_entries(existing, fallback_entry)
                 )
 
             updated = _torrent_history_entry_from_torrent(torrent, existing, now_ts)
@@ -2223,8 +2343,8 @@ async def sync_torrent_history(
 
         if changed:
             try:
-                _persist_torrent_history_state(items)
-            except OSError:
+                await asyncio.to_thread(_persist_torrent_history_state, items)
+            except (OSError, sqlite3.Error):
                 log.warning("Failed to persist torrent history", exc_info=True)
 
         return list(items.values())
@@ -2237,7 +2357,7 @@ async def mark_torrent_history_removed(torrent: Any, *, with_data: bool) -> None
         return
 
     async with TORRENT_HISTORY_LOCK:
-        items = _read_torrent_history_state()
+        items = await asyncio.to_thread(_read_torrent_history_state)
         entry = _torrent_history_entry_from_torrent(torrent, items.get(key), now_ts)
         if entry is None:
             return
@@ -2248,14 +2368,15 @@ async def mark_torrent_history_removed(torrent: Any, *, with_data: bool) -> None
         items[key] = entry
 
         try:
-            _persist_torrent_history_state(items)
-        except OSError:
+            await asyncio.to_thread(_persist_torrent_history_state, items)
+        except (OSError, sqlite3.Error):
             log.warning("Failed to mark torrent history entry as removed", exc_info=True)
 
 
 async def load_torrent_history_entries() -> list[dict[str, Any]]:
     async with TORRENT_HISTORY_LOCK:
-        return list(_read_torrent_history_state().values())
+        items = await asyncio.to_thread(_read_torrent_history_state)
+        return list(items.values())
 
 
 def _shorten_text(value: str, max_len: int) -> str:
@@ -2267,7 +2388,7 @@ def _shorten_text(value: str, max_len: int) -> str:
 def _format_history_ts(value: Optional[int]) -> str:
     if value is None:
         return "неизвестно"
-    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(value, tz=get_config().timezone).strftime("%Y-%m-%d %H:%M")
 
 
 def _torrent_status_label_ru(status: str) -> str:
@@ -2339,9 +2460,7 @@ def _build_torrent_history_text(
     total_downloaded = sum(_history_entry_int(entry, "downloaded_ever") for entry in sorted_entries)
     removed_count = sum(1 for entry in sorted_entries if _history_entry_removed(entry))
     active_count = total - removed_count
-    lines.append(
-        f"Всего: <b>{total}</b> | В Transmission: <b>{active_count}</b> | Удалены: <b>{removed_count}</b>"
-    )
+    lines.append(f"Всего: <b>{total}</b> | В Transmission: <b>{active_count}</b> | Удалены: <b>{removed_count}</b>")
     lines.append(f"Суммарно: ⇣ <b>{fmt_bytes(total_downloaded)}</b> | ⇡ <b>{fmt_bytes(total_uploaded)}</b>")
     lines.append(f"Страница <b>{current_page + 1}</b>/<b>{total_pages}</b>")
 
@@ -2436,7 +2555,7 @@ async def send_traffic_stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> No
         await reply_chunks(update, f"❌ Ошибка Transmission: {html.escape(str(exc))}", reply_markup=KB_MAIN)
         return
 
-    now = datetime.now()
+    now = bot_now()
     downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
     uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
 
@@ -2585,10 +2704,11 @@ async def on_traffic_view(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await _edit_traffic_message(query, f"❌ Ошибка Transmission: {html.escape(str(exc))}")
         return
 
-    now = datetime.now()
+    now = bot_now()
     downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
     uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
     anchors, history = await update_traffic_state(now, downloaded, uploaded)
+    downloaded, uploaded = _effective_traffic_totals(anchors, downloaded, uploaded)
 
     if mode == "refresh":
         text = _build_traffic_stats_text(now, downloaded, uploaded, anchors, history)
@@ -2725,7 +2845,7 @@ async def send_torrent_list(  # noqa: C901
     await sync_torrent_history(torrents, mark_missing=True)
     items = torrents
     if mode == "downloading":
-        items = [t for t in items if not _is_torrent_completed(t)]
+        items = [t for t in items if _is_downloading(str(getattr(t, "status", "")))]
     elif mode == "stopped":
         items = [t for t in items if str(t.status) == "stopped"]
     elif mode == "done":
@@ -2738,6 +2858,7 @@ async def send_torrent_list(  # noqa: C901
     total = len(items)
     max_items = get_config().list_limit
     if total > max_items:
+
         def shortlist_key(torrent: Any) -> tuple[int, float, str]:
             status = str(torrent.status)
             name = (torrent.name or "").lower()
@@ -2806,14 +2927,17 @@ async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
     free_space_before = await _get_download_dir_free_space()
 
     try:
-        torrent = await tr_call(lambda c: c.add_torrent(link))
+        torrent = await tr_call(
+            lambda c: c.add_torrent(link),
+            retry_on_connection=False,
+            operation="add_torrent_url",
+        )
     except (TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Не удалось добавить: {html.escape(str(exc))}", reply_markup=KB_ADD)
         return
 
     chat_id = update.effective_chat.id if update.effective_chat else None
-    _register_torrent_start_watch(ctx, chat_id, torrent)
-    _register_torrent_completion_watch(ctx, chat_id, torrent)
+    await _register_torrent_start_watch(ctx, chat_id, torrent)
     await sync_torrent_history([torrent], mark_missing=False)
 
     await reply_chunks(
@@ -2861,7 +2985,7 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             with tmp_path.open("rb") as rf:
                 return client.add_torrent(rf)
 
-        torrent = await tr_call(_add)
+        torrent = await tr_call(_add, retry_on_connection=False, operation="add_torrent_file")
 
     except (TelegramError, OSError, TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Не удалось добавить .torrent: {html.escape(str(exc))}", reply_markup=KB_ADD)
@@ -2871,8 +2995,7 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             tmp_path.unlink(missing_ok=True)
 
     chat_id = update.effective_chat.id if update.effective_chat else None
-    _register_torrent_start_watch(ctx, chat_id, torrent)
-    _register_torrent_completion_watch(ctx, chat_id, torrent)
+    await _register_torrent_start_watch(ctx, chat_id, torrent)
     await sync_torrent_history([torrent], mark_missing=False)
 
     await reply_chunks(
@@ -2893,21 +3016,37 @@ async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: st
 
     try:
         if action == "pause":
-            await tr_call(lambda c: c.stop_torrent(torrent_id))
+            await tr_call(
+                lambda c: c.stop_torrent(torrent_id),
+                retry_on_connection=False,
+                operation="stop_torrent",
+            )
             msg = f"⏸️ Остановлено: ID {torrent_id}"
         elif action == "start":
-            await tr_call(lambda c: c.start_torrent(torrent_id))
+            await tr_call(
+                lambda c: c.start_torrent(torrent_id),
+                retry_on_connection=False,
+                operation="start_torrent",
+            )
             msg = f"▶️ Запущено: ID {torrent_id}"
         elif action == "del_keep":
             torrent = await tr_call(lambda c: c.get_torrent(torrent_id, arguments=TORRENT_HISTORY_FIELDS))
             await sync_torrent_history([torrent], mark_missing=False)
-            await tr_call(lambda c: c.remove_torrent(torrent_id, delete_data=False))
+            await tr_call(
+                lambda c: c.remove_torrent(torrent_id, delete_data=False),
+                retry_on_connection=False,
+                operation="remove_torrent_keep_data",
+            )
             await mark_torrent_history_removed(torrent, with_data=False)
             msg = f"🗑️ Удалено (данные сохранены): ID {torrent_id} | {torrent.name}"
         elif action == "del_data":
             torrent = await tr_call(lambda c: c.get_torrent(torrent_id, arguments=TORRENT_HISTORY_FIELDS))
             await sync_torrent_history([torrent], mark_missing=False)
-            await tr_call(lambda c: c.remove_torrent(torrent_id, delete_data=True))
+            await tr_call(
+                lambda c: c.remove_torrent(torrent_id, delete_data=True),
+                retry_on_connection=False,
+                operation="remove_torrent_with_data",
+            )
             await mark_torrent_history_removed(torrent, with_data=True)
             msg = f"💥 Удалено вместе с данными: ID {torrent_id} | {torrent.name}"
         else:
@@ -3036,7 +3175,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await reply_chunks(update, "⛔️ Доступ запрещён.")
         return
 
-    _ensure_chat_notifications_initialized(ctx, update.effective_chat.id if update.effective_chat else None)
+    await _ensure_chat_notifications_initialized(ctx, update.effective_chat.id if update.effective_chat else None)
 
     set_menu(ctx, MENU_MAIN)
     set_wait(ctx, WAIT_NONE)
@@ -3081,7 +3220,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not user_allowed(update):
         return
 
-    _ensure_chat_notifications_initialized(ctx, update.effective_chat.id if update.effective_chat else None)
+    await _ensure_chat_notifications_initialized(ctx, update.effective_chat.id if update.effective_chat else None)
 
     wait = get_wait(ctx)
     menu = get_menu(ctx)
@@ -3148,12 +3287,14 @@ async def _toggle_notifications(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
         return
 
     enabled_chats = ctx.application.bot_data.setdefault(NOTIFY_ENABLED_CHATS_KEY, set())
-    if chat_id in enabled_chats:
-        enabled_chats.remove(chat_id)
-        status_text = "🔕 Уведомления о завершении торрентов выключены."
+    enabled = await asyncio.to_thread(get_state_store().toggle_chat, chat_id)
+    if not enabled:
+        enabled_chats.discard(chat_id)
+        await asyncio.to_thread(get_state_store().cancel_pending_outbox, chat_id)
+        status_text = "🔕 Уведомления о торрентах выключены."
     else:
         enabled_chats.add(chat_id)
-        status_text = "🔔 Уведомления о завершении торрентов включены."
+        status_text = "🔔 Уведомления о торрентах включены."
 
     await send_ephemeral(update, ctx, status_text, reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id))
 
@@ -3323,7 +3464,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:  # no
 
     chat = update.effective_chat
     chat_id = chat.id if chat else None
-    _ensure_chat_notifications_initialized(ctx, chat_id)
+    await _ensure_chat_notifications_initialized(ctx, chat_id)
 
     try:
         if text == "⬅️ Назад":
@@ -3364,217 +3505,203 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:  # no
         await _delete_user_message(update, ctx)
 
 
+async def _enqueue_for_enabled_chats(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    event_key: str,
+    kind: str,
+    text: str,
+) -> None:
+    enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
+    if not isinstance(enabled_chats, set):
+        return
+    for chat_id in list(enabled_chats):
+        await _enqueue_notification(
+            event_key=event_key,
+            chat_id=chat_id,
+            kind=kind,
+            text=text,
+        )
+
+
+def _build_no_peers_notification_text(torrent_id: int, name: str) -> str:
+    safe_name = html.escape(name or "<без названия>")
+    return (
+        "⚠️ <b>Торрент не начал скачиваться за 10 минут</b>\n"
+        "Возможно, сейчас нет раздающих.\n"
+        f"Торрент: <b>{safe_name}</b>\n"
+        f"ID: <b>{torrent_id}</b>"
+    )
+
+
+async def _process_torrent_notifications(  # noqa: C901
+    ctx: ContextTypes.DEFAULT_TYPE,
+    torrents: Sequence[Any],
+) -> None:
+    store = get_state_store()
+    now_ts = time_module.time()
+    snapshots, watches = await asyncio.gather(
+        asyncio.to_thread(store.get_snapshots),
+        asyncio.to_thread(store.list_start_watches),
+    )
+    watches_by_key: dict[str, list[StartWatch]] = {}
+    for watch in watches:
+        watches_by_key.setdefault(watch.torrent_key, []).append(watch)
+
+    current_by_key: dict[str, Any] = {}
+    next_snapshots: list[Snapshot] = []
+    for torrent in torrents:
+        torrent_key = _notification_torrent_key(torrent)
+        if torrent_key is None:
+            continue
+        current_by_key[torrent_key] = torrent
+        previous = snapshots.get(torrent_key)
+        completed = _is_torrent_completed(torrent)
+        started = _torrent_start_detected(torrent)
+        generation = previous.generation if previous is not None else 0
+        watched_completion_pending = any(not watch.completion_notified for watch in watches_by_key.get(torrent_key, ()))
+        completion_transition = completed and (
+            (previous is not None and previous.present and not previous.completed) or watched_completion_pending
+        )
+        if completion_transition:
+            generation += 1
+            torrent_id = int(getattr(torrent, "id", 0))
+            name = str(getattr(torrent, "name", "") or "<без названия>")
+            await _enqueue_for_enabled_chats(
+                ctx,
+                event_key=f"completion:{torrent_key}:{generation}",
+                kind="completion",
+                text=_build_completion_notification_text(torrent_id, name, torrent),
+            )
+
+        next_snapshots.append(
+            Snapshot(
+                torrent_key=torrent_key,
+                completed=completed,
+                started=started,
+                present=True,
+                generation=generation,
+                updated_at=now_ts,
+            )
+        )
+
+    for torrent_key, previous in snapshots.items():
+        if torrent_key in current_by_key:
+            continue
+        next_snapshots.append(
+            Snapshot(
+                torrent_key=torrent_key,
+                completed=previous.completed,
+                started=previous.started,
+                present=False,
+                generation=previous.generation,
+                updated_at=now_ts,
+            )
+        )
+
+    enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
+    if not isinstance(enabled_chats, set):
+        enabled_chats = set()
+
+    for watch in watches:
+        torrent = current_by_key.get(watch.torrent_key)
+        if torrent is None:
+            await asyncio.to_thread(store.delete_start_watch, watch.torrent_key, watch.chat_id)
+            continue
+
+        completed = _is_torrent_completed(torrent)
+        started = _torrent_start_detected(torrent)
+        start_notified = watch.start_notified
+        no_peers_notified = watch.no_peers_notified
+
+        if completed:
+            # Completion was enqueued above for every currently enabled chat.
+            await asyncio.to_thread(store.delete_start_watch, watch.torrent_key, watch.chat_id)
+            continue
+
+        if started and not start_notified:
+            if watch.chat_id in enabled_chats:
+                await _enqueue_notification(
+                    event_key=f"start:{watch.torrent_key}:{int(watch.added_at * 1000)}",
+                    chat_id=watch.chat_id,
+                    kind="start",
+                    text=_build_torrent_start_notification_text(watch.torrent_id, watch.name),
+                )
+            start_notified = True
+        elif not started and not no_peers_notified and now_ts - watch.added_at >= NOTIFY_NO_PEERS_DELAY_SEC:
+            if watch.chat_id in enabled_chats:
+                await _enqueue_notification(
+                    event_key=f"no-peers:{watch.torrent_key}:{int(watch.added_at * 1000)}",
+                    chat_id=watch.chat_id,
+                    kind="no_peers",
+                    text=_build_no_peers_notification_text(watch.torrent_id, watch.name),
+                )
+            no_peers_notified = True
+
+        if start_notified != watch.start_notified or no_peers_notified != watch.no_peers_notified:
+            await asyncio.to_thread(
+                store.update_start_watch,
+                watch.torrent_key,
+                watch.chat_id,
+                start_notified=start_notified,
+                no_peers_notified=no_peers_notified,
+            )
+
+    # Events are inserted before the snapshot. If the process stops between
+    # these operations, the next tick repeats the same idempotent event keys.
+    await asyncio.to_thread(store.save_snapshots, next_snapshots)
+
+
+async def _monitor_tick(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _drain_notification_outbox(ctx)
+
+    try:
+        torrents = await tr_call(
+            lambda c: c.get_torrents(arguments=TORRENT_HISTORY_FIELDS),
+            operation="monitor.get_torrents",
+        )
+    except TRCallError:
+        log.warning("Skipping torrent monitor tick because Transmission is unavailable", exc_info=True)
+    else:
+        await sync_torrent_history(torrents, mark_missing=True)
+        await _process_torrent_notifications(ctx, torrents)
+
+    try:
+        stats = await tr_call(lambda c: c.session_stats(), operation="monitor.session_stats")
+    except TRCallError:
+        log.warning("Skipping traffic snapshot because Transmission is unavailable", exc_info=True)
+    else:
+        downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
+        uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
+        await update_traffic_state(bot_now(), downloaded, uploaded)
+
+    await _drain_notification_outbox(ctx)
+
+
 def main() -> None:  # noqa: C901
     initialize_runtime()
 
-    async def notify_completed_torrents(ctx: ContextTypes.DEFAULT_TYPE) -> None:  # noqa: C901
-        enabled_chats = ctx.application.bot_data.get(NOTIFY_ENABLED_CHATS_KEY)
-        if not isinstance(enabled_chats, set) or not enabled_chats:
-            return
-
-        now_ts = asyncio.get_running_loop().time()
-
-        try:
-            torrents = await tr_call(lambda c: c.get_torrents())
-        except (TransmissionError, TRCallError):
-            log.warning("Skipping completion notifications due to Transmission error", exc_info=True)
-            return
-
-        await sync_torrent_history(torrents, mark_missing=True)
-        torrents_by_id = {int(t.id): t for t in torrents}
-        completed_now = {
-            torrent_id: (getattr(torrent, "name", None) or "<без названия>")
-            for torrent_id, torrent in torrents_by_id.items()
-            if _is_torrent_completed(torrent)
-        }
-
-        initialized = bool(ctx.application.bot_data.get(NOTIFY_INITIALIZED_KEY))
-        prev_completed = ctx.application.bot_data.get(NOTIFY_COMPLETED_CACHE_KEY, {})
-        if not isinstance(prev_completed, dict):
-            prev_completed = {}
-
-        if not initialized:
-            ctx.application.bot_data[NOTIFY_INITIALIZED_KEY] = True
-            new_ids: list[int] = []
-        else:
-            new_ids = sorted(set(completed_now) - set(prev_completed))
-
-        ctx.application.bot_data[NOTIFY_COMPLETED_CACHE_KEY] = completed_now
-
-        notified_completion_chats: dict[int, set[int]] = {}
-        pending_completion = ctx.application.bot_data.get(NOTIFY_COMPLETION_PENDING_KEY)
-        if isinstance(pending_completion, dict) and pending_completion:
-            expired_completion_ids: list[int] = []
-            for torrent_id, state in list(pending_completion.items()):
-                if not isinstance(state, dict):
-                    expired_completion_ids.append(torrent_id)
-                    continue
-
-                torrent = torrents_by_id.get(torrent_id)
-                if torrent is None:
-                    expired_completion_ids.append(torrent_id)
-                    continue
-
-                if torrent_id not in completed_now:
-                    continue
-
-                chat_ids = state.get("chat_ids")
-                if not isinstance(chat_ids, set) or not chat_ids:
-                    expired_completion_ids.append(torrent_id)
-                    continue
-
-                text = _build_completion_notification_text(
-                    torrent_id,
-                    str(state.get("name") or completed_now.get(torrent_id, "<без названия>")),
-                    torrent,
-                )
-                sent_chat_ids: set[int] = set()
-                for chat_id in list(chat_ids):
-                    if chat_id not in enabled_chats:
-                        continue
-                    try:
-                        await _send_html_message_with_retry(
-                            ctx,
-                            chat_id,
-                            text,
-                            op_name="notify_completed.send_message",
-                        )
-                    except TelegramError:
-                        log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
-                    else:
-                        sent_chat_ids.add(chat_id)
-
-                if sent_chat_ids:
-                    notified_completion_chats[torrent_id] = sent_chat_ids
-                expired_completion_ids.append(torrent_id)
-
-            for torrent_id in expired_completion_ids:
-                pending_completion.pop(torrent_id, None)
-
-        for torrent_id in new_ids:
-            torrent = torrents_by_id.get(torrent_id)
-            text = _build_completion_notification_text(
-                torrent_id,
-                completed_now.get(torrent_id, "<без названия>"),
-                torrent,
-            )
-            already_notified = notified_completion_chats.get(torrent_id, set())
-            for chat_id in list(enabled_chats):
-                if chat_id in already_notified:
-                    continue
-                try:
-                    await _send_html_message_with_retry(
-                        ctx,
-                        chat_id,
-                        text,
-                        op_name="notify_completed.send_message",
-                    )
-                except TelegramError:
-                    log.warning("Failed to send completion notification to chat %s", chat_id, exc_info=True)
-
-        pending_start = ctx.application.bot_data.get(NOTIFY_START_PENDING_KEY)
-        if not isinstance(pending_start, dict) or not pending_start:
-            return
-
-        expired_ids: list[int] = []
-
-        for torrent_id, state in list(pending_start.items()):
-            if not isinstance(state, dict):
-                expired_ids.append(torrent_id)
-                continue
-
-            torrent = torrents_by_id.get(torrent_id)
-            if torrent is None:
-                expired_ids.append(torrent_id)
-                continue
-
-            if _torrent_start_detected(torrent):
-                state_to_notify = _pop_pending_torrent_start(ctx, torrent_id)
-                if state_to_notify is not None:
-                    await _send_torrent_start_notification(ctx, torrent_id, state_to_notify, torrent)
-                continue
-
-            added_at = state.get("added_at")
-            if not isinstance(added_at, (int, float)):
-                expired_ids.append(torrent_id)
-                continue
-
-            if now_ts - float(added_at) < NOTIFY_NO_PEERS_DELAY_SEC:
-                continue
-
-            chat_ids = state.get("chat_ids")
-            if not isinstance(chat_ids, set) or not chat_ids:
-                expired_ids.append(torrent_id)
-                continue
-
-            safe_name = html.escape(str(state.get("name") or getattr(torrent, "name", "<без названия>")))
-            text = (
-                "⚠️ <b>Торрент не начал скачиваться за 10 минут</b>\n"
-                f"Возможно, сейчас нет раздающих.\n"
-                f"Торрент: <b>{safe_name}</b>\n"
-                f"ID: <b>{torrent_id}</b>"
-            )
-
-            for chat_id in list(chat_ids):
-                if chat_id not in enabled_chats:
-                    continue
-                try:
-                    await _send_html_message_with_retry(
-                        ctx,
-                        chat_id,
-                        text,
-                        op_name="notify_no_peers.send_message",
-                    )
-                except TelegramError:
-                    log.warning("Failed to send no-peers notification to chat %s", chat_id, exc_info=True)
-
-            expired_ids.append(torrent_id)
-
-        for torrent_id in expired_ids:
-            pending_start.pop(torrent_id, None)
-
-    async def snapshot_traffic_anchors(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        now = datetime.now()
-        day_key = now.strftime("%Y-%m-%d")
-        last_snapshot_day = ctx.application.bot_data.get(TRAFFIC_LAST_SNAPSHOT_DAY_KEY)
-        if last_snapshot_day == day_key:
-            return
-
-        try:
-            stats = await tr_call(lambda c: c.session_stats())
-        except (TransmissionError, TRCallError):
-            log.warning("Skipping traffic anchor snapshot due to Transmission error", exc_info=True)
-            return
-
-        downloaded = int(max(0, getattr(stats.cumulative_stats, "downloaded_bytes", 0)))
-        uploaded = int(max(0, getattr(stats.cumulative_stats, "uploaded_bytes", 0)))
-        await update_traffic_state(now, downloaded, uploaded)
-        ctx.application.bot_data[TRAFFIC_LAST_SNAPSHOT_DAY_KEY] = day_key
-
-    async def snapshot_torrent_history(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        try:
-            torrents = await tr_call(lambda c: c.get_torrents(arguments=TORRENT_HISTORY_FIELDS))
-        except (TransmissionError, TRCallError):
-            log.warning("Skipping torrent history snapshot due to Transmission error", exc_info=True)
-            return
-
-        await sync_torrent_history(torrents, mark_missing=True)
-
-    async def notify_completed_torrents_fallback(app: Application) -> None:
+    async def monitor_fallback(app: Application) -> None:
         while True:
             fake_ctx = cast(ContextTypes.DEFAULT_TYPE, SimpleNamespace(application=app, bot=app.bot))
-            await notify_completed_torrents(fake_ctx)
-            await snapshot_traffic_anchors(fake_ctx)
-            await snapshot_torrent_history(fake_ctx)
+            try:
+                await _monitor_tick(fake_ctx)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Unexpected error in fallback monitor tick")
             await asyncio.sleep(NOTIFY_POLL_INTERVAL_SEC)
 
     async def on_post_init(app: Application) -> None:
+        enabled_chats = await asyncio.to_thread(get_state_store().list_enabled_chats)
+        app.bot_data[NOTIFY_ENABLED_CHATS_KEY] = enabled_chats
+        app.bot_data[NOTIFY_KNOWN_CHATS_KEY] = set(enabled_chats)
         if app.job_queue is None:
-            app.bot_data["notify_poll_task"] = asyncio.create_task(notify_completed_torrents_fallback(app))
-            log.warning(
-                "python-telegram-bot job queue is unavailable; using fallback polling task "
-                "for completion notifications, traffic snapshots, and torrent history snapshots."
+            app.bot_data["notify_poll_task"] = app.create_task(
+                monitor_fallback(app),
+                name="transmission-monitor-fallback",
             )
+            log.warning("python-telegram-bot job queue is unavailable; using fallback monitor task.")
 
     async def on_post_shutdown(app: Application) -> None:
         task = app.bot_data.pop("notify_poll_task", None)
@@ -3582,15 +3709,15 @@ def main() -> None:  # noqa: C901
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
         start_tasks = app.bot_data.pop(NOTIFY_START_TASKS_KEY, None)
         if isinstance(start_tasks, set):
-            for start_task in list(start_tasks):
-                if isinstance(start_task, asyncio.Task):
-                    start_task.cancel()
-            for start_task in list(start_tasks):
-                if isinstance(start_task, asyncio.Task):
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await start_task
+            active_tasks = [task for task in start_tasks if isinstance(task, asyncio.Task)]
+            for start_task in active_tasks:
+                start_task.cancel()
+            for start_task in active_tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await start_task
 
     app = build_telegram_application(post_init=on_post_init, post_shutdown=on_post_shutdown)
 
@@ -3598,20 +3725,14 @@ def main() -> None:  # noqa: C901
         log.info("Job queue is unavailable; fallback polling task will be used.")
     else:
         app.job_queue.run_repeating(
-            notify_completed_torrents,
-            interval=NOTIFY_POLL_INTERVAL_SEC,
-            first=NOTIFY_POLL_INTERVAL_SEC,
-        )
-        app.job_queue.run_daily(snapshot_traffic_anchors, time=time(hour=0, minute=0, second=0))
-        app.job_queue.run_repeating(
-            snapshot_torrent_history,
+            _monitor_tick,
             interval=NOTIFY_POLL_INTERVAL_SEC,
             first=5.0,
+            name="transmission-monitor",
         )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-
     app.add_handler(CallbackQueryHandler(on_status_refresh, pattern=f"^{STATUS_REFRESH_CB}$"))
     app.add_handler(
         CallbackQueryHandler(
@@ -3634,7 +3755,8 @@ def main() -> None:  # noqa: C901
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    log.info("Bot started")
+    cfg = get_config()
+    log.info("Bot started (timezone=%s, state_dir=%s)", cfg.timezone_name, cfg.state_dir)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

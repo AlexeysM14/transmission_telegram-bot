@@ -6,12 +6,13 @@ import contextlib
 import grp
 import json
 import os
-import pwd
+import shutil
 import socket
 
 # CLI intentionally runs fixed system commands.
 import subprocess  # nosec B404
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -19,25 +20,83 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
-ROOT = Path(__file__).resolve().parent
-ENV_FILE = ROOT / ".env"
 SERVICE_NAME = "transmission3-bot"
-SERVICE_USER = os.environ.get("SERVICE_USER", SERVICE_NAME)
-SERVICE_GROUP = os.environ.get("SERVICE_GROUP", SERVICE_USER)
+INSTALL_CONFIG_FILE = Path(f"/etc/{SERVICE_NAME}/install.conf")
+DEFAULT_REPO_URL = "https://github.com/AlexeysM14/transmission_telegram-bot.git"
+DEFAULT_CLI_IMPL_PATH = Path(f"/usr/local/libexec/{SERVICE_NAME}")
 TELEGRAM_API_BASE = "https://api.telegram.org"
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 
 
-def run(cmd: list[str], *, check: bool = True) -> int:
-    print(f"\n$ {' '.join(cmd)}")
-    proc = subprocess.run(cmd, cwd=ROOT)  # nosec B603
+def load_install_settings() -> dict[str, str]:
+    if not INSTALL_CONFIG_FILE.exists():
+        return {}
+
+    stat = INSTALL_CONFIG_FILE.stat()
+    if os.geteuid() == 0 and (stat.st_uid != 0 or stat.st_mode & 0o022):
+        raise RuntimeError(f"Unsafe ownership or permissions on {INSTALL_CONFIG_FILE}")
+
+    values: dict[str, str] = {}
+    for line in INSTALL_CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+INSTALL_SETTINGS = load_install_settings()
+SCRIPT_ROOT = Path(__file__).resolve().parent
+ROOT = Path(INSTALL_SETTINGS.get("INSTALL_DIR", SCRIPT_ROOT))
+ENV_FILE = Path(INSTALL_SETTINGS.get("ENV_FILE", ROOT / ".env"))
+STATE_DIR = Path(INSTALL_SETTINGS.get("STATE_DIR", ROOT))
+LOG_DIR = Path(INSTALL_SETTINGS.get("LOG_DIR", ROOT))
+REPO_URL = INSTALL_SETTINGS.get("REPO_URL", DEFAULT_REPO_URL)
+CLI_IMPL_PATH = Path(INSTALL_SETTINGS.get("CLI_IMPL_PATH", DEFAULT_CLI_IMPL_PATH))
+SERVICE_USER = INSTALL_SETTINGS.get("SERVICE_USER", os.environ.get("SERVICE_USER", SERVICE_NAME))
+SERVICE_GROUP = INSTALL_SETTINGS.get("SERVICE_GROUP", os.environ.get("SERVICE_GROUP", SERVICE_USER))
+
+
+def sanitized_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in tuple(env):
+        if key.startswith(("PYTHON", "PIP_", "GIT_", "LD_", "DYLD_", "APT_", "DPKG_")):
+            env.pop(key, None)
+    env["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONSAFEPATH"] = "1"
+    env["PIP_CONFIG_FILE"] = "/dev/null"
+    return env
+
+
+def run(
+    cmd: list[str],
+    *,
+    check: bool = True,
+    env: Optional[dict[str, str]] = None,
+    cwd: Optional[Path] = None,
+    display_cmd: Optional[list[str]] = None,
+) -> int:
+    print(f"\n$ {' '.join(display_cmd or cmd)}")
+    proc = subprocess.run(  # nosec B603
+        cmd,
+        cwd=cwd or ROOT,
+        env=env or sanitized_subprocess_env(),
+    )
     if check and proc.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
     return proc.returncode
 
 
 def run_capture(cmd: list[str]) -> tuple[int, str, str]:
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)  # nosec B603
+    proc = subprocess.run(  # nosec B603
+        cmd,
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=sanitized_subprocess_env(),
+    )
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -90,31 +149,125 @@ def secure_env_file() -> None:
     if not ENV_FILE.exists():
         return
 
-    if os.geteuid() == 0:
-        try:
-            uid = pwd.getpwnam(SERVICE_USER).pw_uid
-            gid = grp.getgrnam(SERVICE_GROUP).gr_gid
-        except KeyError:
-            pass
-        else:
-            os.chown(ENV_FILE, uid, gid)
+    if os.geteuid() != 0:
+        raise PermissionError(f"Run this command with sudo to secure {ENV_FILE}")
 
-    os.chmod(ENV_FILE, 0o600)
+    try:
+        gid = grp.getgrnam(SERVICE_GROUP).gr_gid
+    except KeyError as exc:
+        raise RuntimeError(f"Service group does not exist: {SERVICE_GROUP}") from exc
+
+    os.chown(ENV_FILE, 0, gid)
+    os.chmod(ENV_FILE, 0o640)
+
+
+def require_root_for_update() -> None:
+    if os.geteuid() != 0:
+        raise PermissionError("Code and configuration updates require sudo")
+
+
+def assert_secure_regular_file(path: Path, *, label: str) -> None:
+    resolved = path.resolve(strict=True)
+    stat = resolved.stat()
+    if not resolved.is_file():
+        raise RuntimeError(f"{label} is not a regular file: {resolved}")
+    if stat.st_uid != 0 or stat.st_mode & 0o022:
+        raise RuntimeError(f"Refusing to use service-writable {label}: {resolved}")
+
+
+def assert_secure_directory(path: Path, *, label: str) -> None:
+    resolved = path.resolve(strict=True)
+    stat = resolved.stat()
+    if not resolved.is_dir():
+        raise RuntimeError(f"{label} is not a directory: {resolved}")
+    if stat.st_uid != 0 or stat.st_mode & 0o022:
+        raise RuntimeError(f"Refusing to use service-writable {label}: {resolved}")
+
+
+def trusted_system_executable(name: str) -> str:
+    executable = shutil.which(name, path="/usr/sbin:/usr/bin:/sbin:/bin")
+    if not executable:
+        raise RuntimeError(f"Required system executable was not found: {name}")
+    assert_secure_regular_file(Path(executable), label=name)
+    return executable
+
+
+def git_env() -> dict[str, str]:
+    env = sanitized_subprocess_env()
+    for key in tuple(env):
+        if key.startswith("GIT_"):
+            env.pop(key)
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG": "/dev/null",
+        }
+    )
+    return env
+
+
+def run_clean_git_clone(destination: Path) -> None:
+    git = trusted_system_executable("git")
+    run(
+        [
+            git,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.ext.allow=never",
+            "clone",
+            "--quiet",
+            "--depth",
+            "1",
+            "--no-hardlinks",
+            REPO_URL,
+            str(destination),
+        ],
+        env=git_env(),
+        cwd=destination.parent,
+        display_cmd=[git, "clone", "<configured repository>", str(destination)],
+    )
+
+
+def assert_secure_tree(root: Path) -> None:
+    for directory, dir_names, file_names in os.walk(root, followlinks=False):
+        paths = [Path(directory), *(Path(directory) / name for name in dir_names + file_names)]
+        for path in paths:
+            stat = path.lstat()
+            if stat.st_uid != 0 or (not path.is_symlink() and stat.st_mode & 0o022):
+                raise RuntimeError(f"Refusing to use service-writable path: {path}")
 
 
 def do_update_from_github() -> None:
-    safe_directory = str(ROOT)
-    run(["git", "-c", f"safe.directory={safe_directory}", "fetch", "--all"])
-    run(["git", "-c", f"safe.directory={safe_directory}", "pull", "--ff-only"])
+    require_root_for_update()
+    install_parent = ROOT.parent.resolve(strict=True)
+    assert_secure_directory(install_parent, label="installation parent")
+    bootstrap_root = Path(tempfile.mkdtemp(prefix=f".{SERVICE_NAME}.updater-", dir=install_parent))
+    clean_checkout = bootstrap_root / "checkout"
+    try:
+        run_clean_git_clone(clean_checkout)
+        assert_secure_tree(clean_checkout)
+        installer = clean_checkout / "install.sh"
+        assert_secure_regular_file(installer, label="clean installer")
+        bash = trusted_system_executable("bash")
+        deploy_env = sanitized_subprocess_env()
+        deploy_env.update(
+            {
+                "INSTALL_DIR": str(ROOT),
+                "SERVICE_USER": SERVICE_USER,
+                "SERVICE_GROUP": SERVICE_GROUP,
+                "REPO_URL": REPO_URL,
+                "START_SERVICE": "1",
+            }
+        )
+        run([bash, str(installer)], env=deploy_env, cwd=clean_checkout)
+    finally:
+        shutil.rmtree(bootstrap_root, ignore_errors=True)
 
-    venv_python = ROOT / ".venv" / "bin" / "python"
-    if venv_python.exists():
-        run([str(venv_python), "-m", "pip", "install", "-r", "requirements.txt"])
-    else:
-        run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-
-    print("✅ Update complete. Restarting bot service...")
-    restart_bot_service()
+    print("✅ Clean release installed and service health check passed.")
 
 
 def restart_bot_service() -> None:
@@ -173,7 +326,7 @@ def unset_env_key(key: str) -> None:
 
 def get_log_file_path() -> Path:
     env = load_env()
-    raw = env.get("LOG_FILE", "bot-errors.log").strip()
+    raw = env.get("LOG_FILE", str(LOG_DIR / "bot-errors.log")).strip()
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = ROOT / path
@@ -376,7 +529,7 @@ def print_status() -> int:  # noqa: C901
     print(f"TG_PROXY: {mask_proxy_url(tg_proxy)}")
     print(f"TG_GET_UPDATES_PROXY: {mask_proxy_url(tg_updates_proxy)}")
     print(f"effective getUpdates proxy: {mask_proxy_url(effective_updates_proxy)}")
-    print(f"Transmission RPC URL: {build_transmission_url(env)}")
+    print(f"Transmission RPC URL: {mask_proxy_url(build_transmission_url(env))}")
     print(f"TR_TIMEOUT: {timeout:g}s")
 
     print("\n[systemd]")
@@ -541,6 +694,7 @@ def menu() -> None:  # noqa: C901
 
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "update":
+        require_root_for_update()
         menu()
         return 0
     if len(sys.argv) == 2 and sys.argv[1] == "status":

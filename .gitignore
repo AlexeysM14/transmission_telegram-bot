@@ -8,3 +8,6 @@ traffic_anchors.json
 traffic_anchors.tmp
 torrent_history.json
 torrent_history.tmp
+bot-state.sqlite3
+bot-state.sqlite3-shm
+bot-state.sqlite3-wal

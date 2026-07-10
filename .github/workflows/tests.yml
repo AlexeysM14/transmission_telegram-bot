@@ -6,16 +6,24 @@ on:
       - main
     paths:
       - 'bot.py'
+      - 'state_store.py'
       - 'transmission3-bot'
       - 'install.sh'
       - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'pyrightconfig.json'
+      - 'tests/**'
       - '.github/workflows/tests.yml'
   pull_request:
     paths:
       - 'bot.py'
+      - 'state_store.py'
       - 'transmission3-bot'
       - 'install.sh'
       - 'requirements.txt'
+      - 'pyproject.toml'
+      - 'pyrightconfig.json'
+      - 'tests/**'
       - '.github/workflows/tests.yml'
   workflow_dispatch:
 
@@ -23,9 +31,16 @@ concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   tests:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.9', '3.11']
 
     steps:
       - name: Checkout
@@ -34,7 +49,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
           cache: 'pip'
           cache-dependency-path: requirements.txt
 
@@ -42,16 +57,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --disable-pip-version-check -r requirements.txt
-          pip install --disable-pip-version-check ruff bandit
+          pip install --disable-pip-version-check ruff bandit pyright pytest pytest-asyncio
 
       - name: Syntax check
-        run: python -m compileall -q bot.py transmission3-bot
+        run: python -m compileall -q bot.py state_store.py transmission3-bot tests
 
       - name: Shell syntax check
         run: bash -n install.sh
 
       - name: Lint
-        run: ruff check bot.py transmission3-bot
+        run: ruff check bot.py state_store.py transmission3-bot tests
+
+      - name: Type check
+        run: pyright
+
+      - name: Unit tests
+        run: pytest -q
 
       - name: Security scan
-        run: bandit -q -r bot.py transmission3-bot
+        run: bandit -q -r bot.py state_store.py transmission3-bot
