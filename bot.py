@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import heapq
 import html
 import io
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import tempfile
 import threading
@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, ReplyKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import Forbidden, TelegramError, TimedOut
+from telegram.error import BadRequest, Forbidden, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -524,27 +524,34 @@ def kb_torrents() -> ReplyKeyboardMarkup:
     )
 
 
-def kb_add() -> ReplyKeyboardMarkup:
-    return kb([["🧲 Магнет/URL", "📄 .torrent файл"], ["⬅️ Назад"]])
+def kb_add(*, input_active: bool = False) -> ReplyKeyboardMarkup:
+    rows = [["🧲 Магнет/URL", "📄 .torrent файл"]]
+    if input_active:
+        rows.append([CANCEL_INPUT_BUTTON])
+    rows.append(["⬅️ Назад"])
+    return kb(rows)
 
 
-def kb_ctrl(notify_enabled: bool = True) -> ReplyKeyboardMarkup:
+def kb_ctrl(notify_enabled: bool = True, *, input_active: bool = False) -> ReplyKeyboardMarkup:
     notify_label = "🔔 Уведомления: ВКЛ" if notify_enabled else "🔕 Уведомления: ВЫКЛ"
-    return kb(
-        [
-            ["⏸️ Пауза", "▶️ Старт"],
-            ["🗑️ Удалить (оставить данные)"],
-            ["💥 Удалить (с данными)"],
-            [notify_label],
-            ["⬅️ Назад"],
-        ]
-    )
+    rows = [
+        ["⏸️ Пауза", "▶️ Старт"],
+        ["🗑️ Удалить (оставить данные)"],
+        ["💥 Удалить (с данными)"],
+        [notify_label],
+    ]
+    if input_active:
+        rows.append([CANCEL_INPUT_BUTTON])
+    rows.append(["⬅️ Назад"])
+    return kb(rows)
 
 
 KB_MAIN = kb_main()
 KB_TORRENTS = kb_torrents()
 KB_ADD = kb_add()
+KB_ADD_INPUT = kb_add(input_active=True)
 KB_CTRL = kb_ctrl(True)
+KB_CTRL_INPUT = kb_ctrl(True, input_active=True)
 
 STATUS_REFRESH_CB = "status_refresh"
 LIST_REFRESH_CB_PREFIX = "list_refresh:"
@@ -562,6 +569,15 @@ NOTIFY_KNOWN_CHATS_KEY = "notify_known_chat_ids"
 NOTIFY_START_PENDING_KEY = "notify_start_pending"
 NOTIFY_START_TASKS_KEY = "notify_start_tasks"
 TORRENT_HISTORY_LAST_PAGE_KEY = "torrent_history_last_page"
+TORRENT_LIST_LAST_MODE_KEY = "last_list_mode"
+TORRENT_LIST_LAST_QUERY_KEY = "last_list_query"
+TORRENT_LIST_SEARCH_REVISION_KEY = "last_list_search_revision"
+
+TORRENT_LIST_PAGE_SIZE_MAX = 8
+TORRENT_LIST_MODES = frozenset({"all", "downloading", "stopped", "done"})
+TORRENT_LIST_VIEW_MODES = frozenset({*TORRENT_LIST_MODES, "search"})
+TORRENT_LIST_SEARCH_VIEW_PREFIX = "search."
+TORRENT_LIST_SEARCH_REVISION_RE = re.compile(r"^[0-9a-f]{8}$")
 
 NOTIFY_POLL_INTERVAL_SEC = 60
 NOTIFY_START_QUICK_DELAYS_SEC = (0.0, 2.0, 5.0, 15.0, 30.0)
@@ -681,7 +697,15 @@ def fmt_bytes(n: int | float) -> str:
     while x >= 1024 and i < len(units) - 1:
         x /= 1024
         i += 1
-    return f"{int(x)} {units[i]}" if i == 0 else f"{x:.3f} {units[i]}"
+    if i == 0:
+        value = str(int(x))
+    elif x >= 100:
+        value = f"{x:.0f}"
+    elif x >= 10:
+        value = f"{x:.1f}"
+    else:
+        value = f"{x:.2f}"
+    return f"{value} {units[i]}"
 
 
 def fmt_rate(bps: int | float) -> str:
@@ -1045,10 +1069,13 @@ STATUS_KEYBOARD = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обнови
 TORRENT_LIST_KEYBOARD = InlineKeyboardMarkup(
     [
         [
-            InlineKeyboardButton("⬇️ Скачиваются", callback_data=f"{LIST_REFRESH_CB_PREFIX}downloading"),
-            InlineKeyboardButton("📋 Все", callback_data=f"{LIST_REFRESH_CB_PREFIX}all"),
-            InlineKeyboardButton("✅ Завершённые", callback_data=f"{LIST_REFRESH_CB_PREFIX}done"),
-        ]
+            InlineKeyboardButton("📋 Все", callback_data=f"{LIST_REFRESH_CB_PREFIX}all:0"),
+            InlineKeyboardButton("⬇️ Скачиваются", callback_data=f"{LIST_REFRESH_CB_PREFIX}downloading:0"),
+        ],
+        [
+            InlineKeyboardButton("⏸️ Остановлены", callback_data=f"{LIST_REFRESH_CB_PREFIX}stopped:0"),
+            InlineKeyboardButton("✅ Завершённые", callback_data=f"{LIST_REFRESH_CB_PREFIX}done:0"),
+        ],
     ]
 )
 
@@ -1061,29 +1088,95 @@ TRAFFIC_OVERVIEW_KEYBOARD = InlineKeyboardMarkup(
 )
 
 
-def _torrent_actions_keyboard(items: Sequence[Any], mode: str) -> InlineKeyboardMarkup:
+def _list_view_callback_data(view_mode: str, page: int) -> str:
+    return f"{LIST_REFRESH_CB_PREFIX}{view_mode}:{max(0, page)}"
+
+
+def _torrent_actions_keyboard(
+    items: Sequence[Any],
+    mode: str,
+    *,
+    page: int = 0,
+    total_pages: int = 1,
+    view_mode: Optional[str] = None,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    max_rows = 8
-    for torrent in items[:max_rows]:
+    callback_mode = view_mode or mode
+    current_page = max(0, min(page, max(1, total_pages) - 1))
+
+    for torrent in items[:TORRENT_LIST_PAGE_SIZE_MAX]:
         status = str(getattr(torrent, "status", ""))
         action = "pause" if _is_active(status) else "start"
         action_icon = "⏸️" if action == "pause" else "▶️"
-        label_name = (torrent.name or "<без названия>").strip()
-        short_name = label_name[:26] + "…" if len(label_name) > 27 else label_name
+        label_name = " ".join(str(torrent.name or "<без названия>").split())
+        short_name = _shorten_text(label_name, 23)
         rows.append(
             [
                 InlineKeyboardButton(
                     f"{action_icon} {torrent.id} · {short_name}",
-                    callback_data=f"{TORRENT_ACTION_CB_PREFIX}{action}:{torrent.id}:{mode}",
+                    callback_data=(f"{TORRENT_ACTION_CB_PREFIX}{action}:{torrent.id}:{callback_mode}:{current_page}"),
                 ),
                 InlineKeyboardButton(
-                    "🗑️",
-                    callback_data=f"{TORRENT_ACTION_CB_PREFIX}del_data:{torrent.id}:{mode}",
+                    "💥",
+                    callback_data=(f"{TORRENT_ACTION_CB_PREFIX}del_data:{torrent.id}:{callback_mode}:{current_page}"),
                 ),
             ]
         )
 
-    rows.append([InlineKeyboardButton("🔄 Обновить список", callback_data=f"{LIST_REFRESH_CB_PREFIX}{mode}")])
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if current_page > 0:
+            nav.append(
+                InlineKeyboardButton(
+                    "◀️",
+                    callback_data=_list_view_callback_data(callback_mode, current_page - 1),
+                )
+            )
+        nav.append(
+            InlineKeyboardButton(
+                f"{current_page + 1}/{total_pages}",
+                callback_data=_list_view_callback_data(callback_mode, current_page),
+            )
+        )
+        if current_page + 1 < total_pages:
+            nav.append(
+                InlineKeyboardButton(
+                    "▶️",
+                    callback_data=_list_view_callback_data(callback_mode, current_page + 1),
+                )
+            )
+        rows.append(nav)
+
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    "📋 Все" if callback_mode != "all" else "• 📋 Все",
+                    callback_data=_list_view_callback_data("all", 0),
+                ),
+                InlineKeyboardButton(
+                    "⬇️ Скачиваются" if callback_mode != "downloading" else "• ⬇️ Скачиваются",
+                    callback_data=_list_view_callback_data("downloading", 0),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "⏸️ Остановлены" if callback_mode != "stopped" else "• ⏸️ Остановлены",
+                    callback_data=_list_view_callback_data("stopped", 0),
+                ),
+                InlineKeyboardButton(
+                    "✅ Завершённые" if callback_mode != "done" else "• ✅ Завершённые",
+                    callback_data=_list_view_callback_data("done", 0),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔄 Обновить",
+                    callback_data=_list_view_callback_data(callback_mode, current_page),
+                )
+            ],
+        ]
+    )
     return InlineKeyboardMarkup(rows)
 
 
@@ -1376,10 +1469,15 @@ async def _ensure_chat_notifications_initialized(ctx: ContextTypes.DEFAULT_TYPE,
         enabled_chats.discard(chat_id)
 
 
-def _ctrl_keyboard_for_chat(ctx: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]) -> ReplyKeyboardMarkup:
+def _ctrl_keyboard_for_chat(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    *,
+    input_active: bool = False,
+) -> ReplyKeyboardMarkup:
     if chat_id is None:
-        return KB_CTRL
-    return kb_ctrl(_notifications_enabled(ctx, chat_id))
+        return KB_CTRL_INPUT if input_active else KB_CTRL
+    return kb_ctrl(_notifications_enabled(ctx, chat_id), input_active=input_active)
 
 
 def _format_session_duration(seconds: int | float) -> str:
@@ -2798,6 +2896,56 @@ async def on_status_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+def _search_revision_from_view_mode(view_mode: str) -> Optional[str]:
+    if not view_mode.startswith(TORRENT_LIST_SEARCH_VIEW_PREFIX):
+        return None
+    revision = view_mode[len(TORRENT_LIST_SEARCH_VIEW_PREFIX) :]
+    return revision if TORRENT_LIST_SEARCH_REVISION_RE.fullmatch(revision) else None
+
+
+def _is_torrent_list_view_mode(view_mode: str) -> bool:
+    return view_mode in TORRENT_LIST_VIEW_MODES or _search_revision_from_view_mode(view_mode) is not None
+
+
+def _parse_list_view_payload(payload: str) -> tuple[str, int]:
+    parts = payload.split(":")
+    if len(parts) == 1:
+        view_mode, page_raw = parts[0], "0"
+    elif len(parts) == 2:
+        view_mode, page_raw = parts
+    else:
+        raise ValueError("invalid list callback payload")
+
+    if not _is_torrent_list_view_mode(view_mode) or not page_raw.isdigit():
+        raise ValueError("invalid list callback payload")
+    return view_mode, int(page_raw)
+
+
+def _resolve_list_view(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    view_mode: str,
+) -> Optional[tuple[str, Optional[str], Optional[str]]]:
+    if view_mode in TORRENT_LIST_MODES:
+        return view_mode, None, None
+
+    search_revision = _search_revision_from_view_mode(view_mode)
+    if search_revision is None:
+        return None
+
+    user_data = _require_user_data(ctx)
+    stored_mode = user_data.get(TORRENT_LIST_LAST_MODE_KEY)
+    stored_query = user_data.get(TORRENT_LIST_LAST_QUERY_KEY)
+    stored_revision = user_data.get(TORRENT_LIST_SEARCH_REVISION_KEY)
+    if (
+        stored_mode not in TORRENT_LIST_MODES
+        or not isinstance(stored_query, str)
+        or not stored_query.strip()
+        or stored_revision != search_revision
+    ):
+        return None
+    return str(stored_mode), stored_query, search_revision
+
+
 async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -2811,13 +2959,61 @@ async def on_list_refresh(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         await query.answer()
         return
 
-    mode = data[len(LIST_REFRESH_CB_PREFIX) :]
-    if mode not in {"all", "downloading", "stopped", "done"}:
+    try:
+        view_mode, page = _parse_list_view_payload(data[len(LIST_REFRESH_CB_PREFIX) :])
+    except ValueError:
         await query.answer("Неизвестный тип списка", show_alert=True)
         return
 
+    resolved_view = _resolve_list_view(ctx, view_mode)
+    if resolved_view is None:
+        await query.answer("Поиск устарел. Запусти его заново.", show_alert=True)
+        return
+
+    mode, search_query, search_revision = resolved_view
     await query.answer("Обновляю список…")
-    await send_torrent_list(update, ctx, mode=mode, edit_existing=True)
+    await send_torrent_list(
+        update,
+        ctx,
+        mode=mode,
+        query=search_query,
+        search_revision=search_revision,
+        page=page,
+        edit_existing=True,
+    )
+
+
+def _parse_torrent_action_payload(payload: str) -> tuple[str, int, str, int]:
+    parts = payload.split(":")
+    if len(parts) == 3:
+        action, torrent_id_raw, view_mode = parts
+        page_raw = "0"
+    elif len(parts) == 4:
+        action, torrent_id_raw, view_mode, page_raw = parts
+    else:
+        raise ValueError("invalid torrent action payload")
+
+    if not torrent_id_raw.isdigit() or not _is_torrent_list_view_mode(view_mode) or not page_raw.isdigit():
+        raise ValueError("invalid torrent action payload")
+    return action, int(torrent_id_raw), view_mode, int(page_raw)
+
+
+async def _set_torrent_running_state(action: str, torrent_id: int) -> str:
+    if action == "pause":
+        await tr_call(
+            lambda c: c.stop_torrent(torrent_id),
+            retry_on_connection=False,
+            operation="stop_torrent",
+        )
+        return f"⏸️ Торрент {torrent_id} остановлен"
+    if action == "start":
+        await tr_call(
+            lambda c: c.start_torrent(torrent_id),
+            retry_on_connection=False,
+            operation="start_torrent",
+        )
+        return f"▶️ Торрент {torrent_id} запущен"
+    raise ValueError("unknown torrent running-state action")
 
 
 async def on_torrent_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2826,7 +3022,6 @@ async def on_torrent_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     if not await callback_user_allowed(update):
-        await query.answer("⛔️ Доступ запрещён", show_alert=True)
         return
 
     payload = query.data or ""
@@ -2834,24 +3029,54 @@ async def on_torrent_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     try:
-        action, torrent_id_raw, mode = payload[len(TORRENT_ACTION_CB_PREFIX) :].split(":", 2)
-        torrent_id = int(torrent_id_raw)
-    except (ValueError, TypeError):
+        action, torrent_id, view_mode, page = _parse_torrent_action_payload(payload[len(TORRENT_ACTION_CB_PREFIX) :])
+    except ValueError:
         await query.answer("Некорректные данные", show_alert=True)
         return
 
     if action in {"del_keep", "del_data"}:
+        await query.answer("Готовлю подтверждение…")
         await _request_delete_confirmation(update, ctx, action=action, torrent_id=torrent_id)
-        await query.answer()
         return
 
     if action not in {"pause", "start"}:
         await query.answer("Неизвестное действие", show_alert=True)
         return
 
+    resolved_view = _resolve_list_view(ctx, view_mode)
+    if resolved_view is None:
+        await query.answer("Поиск устарел. Запусти его заново.", show_alert=True)
+        return
+    mode, search_query, search_revision = resolved_view
+
     await query.answer("Выполняю…")
-    await ctrl_action(update, ctx, action, torrent_id=torrent_id)
-    await send_torrent_list(update, ctx, mode=mode, edit_existing=False)
+    try:
+        await _set_torrent_running_state(action, torrent_id)
+    except KeyError:
+        await reply_chunks(
+            update,
+            f"❌ Торрент {torrent_id} больше не найден.",
+            reply_markup=KB_TORRENTS,
+        )
+        return
+    except (TransmissionError, TRCallError) as exc:
+        await reply_chunks(
+            update,
+            f"❌ Ошибка Transmission: {html.escape(str(exc))}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=KB_TORRENTS,
+        )
+        return
+
+    await send_torrent_list(
+        update,
+        ctx,
+        mode=mode,
+        query=search_query,
+        search_revision=search_revision,
+        page=page,
+        edit_existing=True,
+    )
 
 
 async def _edit_traffic_message(query: Any, text: str) -> None:
@@ -3011,90 +3236,200 @@ def _is_torrent_completed(torrent: Any) -> bool:
     return left_until_done == 0 and torrent_total_size(torrent) > 0
 
 
+def _torrent_list_title(mode: str) -> tuple[str, str]:
+    return {
+        "all": ("📋", "Все торренты"),
+        "downloading": ("⬇️", "Скачиваются"),
+        "stopped": ("⏸️", "Остановленные"),
+        "done": ("✅", "Завершённые"),
+    }.get(mode, ("📋", "Торренты"))
+
+
+def _format_search_query_for_display(query: str) -> str:
+    compact_query = " ".join(query.split())
+    return html.escape(_shorten_text(compact_query, 96))
+
+
+def _build_torrent_list_header(
+    mode: str,
+    *,
+    total: int,
+    page: int,
+    total_pages: int,
+    query: Optional[str],
+) -> str:
+    icon, title = _torrent_list_title(mode)
+    lines = [f"{icon} <b>{title}</b> · всего <b>{total}</b>"]
+    if query:
+        lines.append(f"🔎 Поиск: <code>{_format_search_query_for_display(query)}</code>")
+    if total_pages > 1:
+        lines.append(f"Страница <b>{page + 1}</b> из <b>{total_pages}</b>")
+    return "\n".join(lines)
+
+
+def _build_empty_torrent_list_text(mode: str, query: Optional[str]) -> str:
+    if query:
+        return (
+            "🔎 <b>Ничего не найдено</b>\n\n"
+            f"По запросу <code>{_format_search_query_for_display(query)}</code> совпадений нет. "
+            "Попробуй другое название."
+        )
+
+    messages = {
+        "downloading": "Сейчас нет активных скачиваний.",
+        "stopped": "Сейчас нет остановленных торрентов.",
+        "done": "Завершённых торрентов пока нет.",
+        "all": "В Transmission пока нет торрентов.",
+    }
+    icon, title = _torrent_list_title(mode)
+    return f"{icon} <b>{title}</b>\n\n{messages.get(mode, 'Список пуст.')}"
+
+
+async def _edit_torrent_list_message(
+    query: Any,
+    *,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    try:
+        await query.edit_message_text(
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+        raise
+
+
 async def send_torrent_list(  # noqa: C901
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
     mode: str,
     query: Optional[str] = None,
+    search_revision: Optional[str] = None,
+    page: int = 0,
     edit_existing: bool = False,
 ) -> None:
+    search_query = query.strip() if isinstance(query, str) and query.strip() else None
+    active_search_revision: Optional[str] = None
+    if search_query:
+        active_search_revision = (
+            search_revision
+            if isinstance(search_revision, str) and TORRENT_LIST_SEARCH_REVISION_RE.fullmatch(search_revision)
+            else secrets.token_hex(4)
+        )
+        view_mode = f"{TORRENT_LIST_SEARCH_VIEW_PREFIX}{active_search_revision}"
+    else:
+        view_mode = mode
+
     try:
         torrents = await tr_call(lambda c: c.get_torrents())
     except (TransmissionError, TRCallError) as exc:
-        await reply_chunks(
-            update,
-            f"❌ Ошибка Transmission: {html.escape(str(exc))}",
-            reply_markup=TORRENT_LIST_KEYBOARD,
-        )
+        error_text = f"❌ Ошибка Transmission: {html.escape(str(exc))}"
+        if edit_existing and update.callback_query is not None:
+            await _edit_torrent_list_message(
+                update.callback_query,
+                text=error_text,
+                reply_markup=TORRENT_LIST_KEYBOARD,
+            )
+        else:
+            await reply_chunks(
+                update,
+                error_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=TORRENT_LIST_KEYBOARD,
+            )
         return
 
     await sync_torrent_history(torrents, mark_missing=True)
-    items = torrents
+    items = list(torrents)
     if mode == "downloading":
         items = [t for t in items if _is_downloading(str(getattr(t, "status", "")))]
     elif mode == "stopped":
-        items = [t for t in items if str(t.status) == "stopped"]
+        items = [t for t in items if str(getattr(t, "status", "")) == "stopped"]
     elif mode == "done":
         items = [t for t in items if _is_torrent_completed(t)]
 
-    if query:
-        q = query.strip().lower()
-        items = [t for t in items if q in (t.name or "").lower()]
+    if search_query:
+        normalized_query = search_query.casefold()
+        items = [t for t in items if normalized_query in str(getattr(t, "name", "") or "").casefold()]
 
+    items = _sort_torrents(items)
     total = len(items)
-    max_items = get_config().list_limit
-    if total > max_items:
+    page_size = min(max(1, get_config().list_limit), TORRENT_LIST_PAGE_SIZE_MAX)
+    total_pages = max(1, ceil(total / page_size))
+    current_page = max(0, min(page, total_pages - 1))
+    page_start = current_page * page_size
+    page_items = items[page_start : page_start + page_size]
 
-        def shortlist_key(torrent: Any) -> tuple[int, float, str]:
-            status = str(torrent.status)
-            name = (torrent.name or "").lower()
-            return (0 if _is_active(status) else 1, -torrent_progress_percent(torrent), name)
+    user_data = _require_user_data(ctx)
+    user_data[TORRENT_LIST_LAST_MODE_KEY] = mode
+    user_data[TORRENT_LIST_LAST_QUERY_KEY] = search_query
+    user_data[TORRENT_LIST_SEARCH_REVISION_KEY] = active_search_revision
 
-        items = heapq.nsmallest(max_items, items, key=shortlist_key)
-    else:
-        items = _sort_torrents(items)
-
-    _require_user_data(ctx)["last_list_mode"] = mode
-    _require_user_data(ctx)["last_list_query"] = query
+    list_keyboard = _torrent_actions_keyboard(
+        page_items,
+        mode,
+        page=current_page,
+        total_pages=total_pages,
+        view_mode=view_mode,
+    )
 
     if total == 0:
-        await reply_chunks(update, "Пусто.", reply_markup=TORRENT_LIST_KEYBOARD)
+        empty_text = _build_empty_torrent_list_text(mode, search_query)
+        if edit_existing and update.callback_query is not None:
+            await _edit_torrent_list_message(
+                update.callback_query,
+                text=empty_text,
+                reply_markup=list_keyboard,
+            )
+        else:
+            await reply_chunks(
+                update,
+                empty_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=list_keyboard,
+            )
         return
 
-    lines = []
-    for t in items:
-        st = str(t.status)
-        safe_name = html.escape(t.name or "<без названия>")
-        size_text = fmt_bytes(torrent_total_size(t))
+    lines: list[str] = []
+    for torrent in page_items:
+        status = str(getattr(torrent, "status", "") or "").strip().lower()
+        name = _shorten_text(str(getattr(torrent, "name", "") or "<без названия>"), 82)
+        safe_name = html.escape(name)
+        torrent_id = _non_negative_int(_get_mapping_or_attr_value(torrent, ("id",)))
+        id_text = str(torrent_id) if torrent_id is not None else "?"
+        rate_download = _get_mapping_or_attr_value(torrent, ("rate_download", "rateDownload")) or 0
+        rate_upload = _get_mapping_or_attr_value(torrent, ("rate_upload", "rateUpload")) or 0
+        upload_ratio = _non_negative_float(_get_mapping_or_attr_value(torrent, ("upload_ratio", "uploadRatio")))
+        size_text = fmt_bytes(torrent_total_size(torrent))
         lines.append(
-            f"<b>{t.id}</b> {status_icon(st)} {safe_name} • <b>{size_text}</b>\n"
-            f"   {_format_progress_summary(t, hide_completed_bar=True)}\n"
-            f"   ⇣ {fmt_rate(t.rate_download)} | ⇡ {fmt_rate(t.rate_upload)} | "
-            f"Ratio {t.upload_ratio:.2f} | {html.escape(st)}"
+            f"<b>{id_text} · {safe_name}</b>\n"
+            f"{status_icon(status)} {html.escape(_torrent_status_label_ru(status))} · <b>{size_text}</b>\n"
+            f"{_format_progress_summary(torrent, hide_completed_bar=True)}\n"
+            f"⇣ {fmt_rate(rate_download)} · ⇡ {fmt_rate(rate_upload)} · "
+            f"ratio {(upload_ratio or 0.0):.2f}"
         )
 
-    header = {
-        "all": "📋 <b>Все торренты</b>",
-        "downloading": "⬇️ <b>Скачиваются</b>",
-        "stopped": "⏹️ <b>Остановленные</b>",
-        "done": "✅ <b>Завершённые</b>",
-    }.get(mode, "📋 <b>Список</b>")
-
-    tail = ""
-    if total > max_items:
-        tail = f"\n\nПоказано: {len(items)} из {total}."
-
-    list_keyboard = _torrent_actions_keyboard(items, mode) if items else TORRENT_LIST_KEYBOARD
+    header = _build_torrent_list_header(
+        mode,
+        total=total,
+        page=current_page,
+        total_pages=total_pages,
+        query=search_query,
+    )
 
     if edit_existing and update.callback_query is not None:
-        await update.callback_query.edit_message_text(
-            text=_build_single_torrent_message(header, lines, tail),
-            parse_mode=ParseMode.HTML,
+        await _edit_torrent_list_message(
+            update.callback_query,
+            text=_build_single_torrent_message(header, lines, ""),
             reply_markup=list_keyboard,
         )
         return
 
-    messages = _build_torrent_messages(header, lines, tail)
+    messages = _build_torrent_messages(header, lines, "")
     for idx, text in enumerate(messages):
         await reply_chunks(
             update,
@@ -3358,20 +3693,8 @@ async def ctrl_action(
     ctrl_keyboard = _ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None)
 
     try:
-        if action == "pause":
-            await tr_call(
-                lambda c: c.stop_torrent(torrent_id),
-                retry_on_connection=False,
-                operation="stop_torrent",
-            )
-            msg = f"⏸️ Остановлено: ID {torrent_id}"
-        elif action == "start":
-            await tr_call(
-                lambda c: c.start_torrent(torrent_id),
-                retry_on_connection=False,
-                operation="start_torrent",
-            )
-            msg = f"▶️ Запущено: ID {torrent_id}"
+        if action in {"pause", "start"}:
+            msg = await _set_torrent_running_state(action, torrent_id)
         elif action in {"del_keep", "del_data"}:
             delete_message = await _delete_torrent_action(
                 update,
@@ -3578,7 +3901,7 @@ async def cmd_help(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "• 📊 Статус — скорость и текущая активность\n"
         "• 📈 Статистика — сводка + график/детально за 7 дней и по дням текущего месяца\n"
         "• 📚 История раздач — сколько отдано и какой ratio у каждого торрента, включая удалённые\n"
-        "• 📋 Торренты — списки + поиск\n"
+        "• 📋 Торренты — постраничные списки, фильтры, поиск и быстрые действия\n"
         "• ➕ Добавить — magnet/URL или .torrent файл\n"
         "• ⚙️ Управление — пауза/старт/удаление по ID\n\n"
         "Подсказка: ID виден в списках торрентов.\n"
@@ -3625,7 +3948,13 @@ async def _handle_wait_state(update: Update, ctx: ContextTypes.DEFAULT_TYPE, wai
     if wait in {WAIT_CTRL_PAUSE, WAIT_CTRL_START, WAIT_CTRL_DEL_KEEP, WAIT_CTRL_DEL_DATA}:
         torrent_id = parse_id(text)
         if torrent_id is None:
-            await send_ephemeral(update, ctx, "Пришли числовой ID торрента (например: 12).", reply_markup=KB_CTRL)
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            await send_ephemeral(
+                update,
+                ctx,
+                "Пришли числовой ID торрента (например: 12).",
+                reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id, input_active=True),
+            )
             return True
 
         if wait == WAIT_CTRL_DEL_DATA:
@@ -3757,7 +4086,7 @@ async def _handle_menu_command(  # noqa: C901
             update,
             ctx,
             f"Пришли magnet-ссылку или URL на .torrent:\n{_build_free_space_text(free_space)}",
-            reply_markup=KB_ADD,
+            reply_markup=KB_ADD_INPUT,
         )
 
     async def _ask_add_file() -> None:
@@ -3767,16 +4096,26 @@ async def _handle_menu_command(  # noqa: C901
             update,
             ctx,
             f"Ок, пришли .torrent файлом сюда в чат.\n{_build_free_space_text(free_space)}",
-            reply_markup=KB_ADD,
+            reply_markup=KB_ADD_INPUT,
         )
 
     async def _ask_pause() -> None:
         set_wait(ctx, WAIT_CTRL_PAUSE)
-        await send_ephemeral(update, ctx, "Пришли ID торрента для остановки:", reply_markup=KB_CTRL)
+        await send_ephemeral(
+            update,
+            ctx,
+            "Пришли ID торрента для остановки:",
+            reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id, input_active=True),
+        )
 
     async def _ask_start() -> None:
         set_wait(ctx, WAIT_CTRL_START)
-        await send_ephemeral(update, ctx, "Пришли ID торрента для запуска:", reply_markup=KB_CTRL)
+        await send_ephemeral(
+            update,
+            ctx,
+            "Пришли ID торрента для запуска:",
+            reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id, input_active=True),
+        )
 
     async def _ask_del_keep() -> None:
         _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
@@ -3785,13 +4124,18 @@ async def _handle_menu_command(  # noqa: C901
             update,
             ctx,
             "Пришли ID торрента для удаления (данные останутся на диске):",
-            reply_markup=KB_CTRL,
+            reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id),
         )
 
     async def _ask_del_data() -> None:
         _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
         set_wait(ctx, WAIT_CTRL_DEL_DATA)
-        await send_ephemeral(update, ctx, "⚠️ Пришли ID торрента для удаления вместе с данными:", reply_markup=KB_CTRL)
+        await send_ephemeral(
+            update,
+            ctx,
+            "⚠️ Пришли ID торрента для удаления вместе с данными:",
+            reply_markup=_ctrl_keyboard_for_chat(ctx, chat_id),
+        )
 
     menu_handlers: dict[str, dict[str, Callable[[], Awaitable[None]]]] = {
         MENU_TORRENTS: {
@@ -3842,18 +4186,29 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:  # no
 
     try:
         if text == "⬅️ Назад":
+            pending_delete = _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
             set_menu(ctx, MENU_MAIN)
             set_wait(ctx, WAIT_NONE)
-            await send_ephemeral(update, ctx, "Ок, назад в главное меню.", reply_markup=KB_MAIN)
+            status_text = (
+                "Удаление отменено. Возвращаюсь в главное меню." if pending_delete else "Ок, назад в главное меню."
+            )
+            await send_ephemeral(update, ctx, status_text, reply_markup=KB_MAIN)
             return
 
         if text == CANCEL_INPUT_BUTTON:
-            if get_wait(ctx) in {WAIT_NONE, None}:
+            pending_delete = _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
+            if get_wait(ctx) in {WAIT_NONE, None} and pending_delete is None:
+                set_menu(ctx, MENU_MAIN)
                 await send_ephemeral(update, ctx, "Сейчас нет активного ввода 🙂", reply_markup=KB_MAIN)
                 return
             set_wait(ctx, WAIT_NONE)
-            _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
-            await send_ephemeral(update, ctx, "Ввод отменён. Выбери следующее действие.", reply_markup=KB_MAIN)
+            set_menu(ctx, MENU_MAIN)
+            status_text = (
+                "Удаление отменено. Выбери следующее действие."
+                if pending_delete
+                else "Ввод отменён. Выбери следующее действие."
+            )
+            await send_ephemeral(update, ctx, status_text, reply_markup=KB_MAIN)
             return
 
         menu = get_menu(ctx)
@@ -4116,7 +4471,7 @@ def main() -> None:  # noqa: C901
     app.add_handler(
         CallbackQueryHandler(
             on_list_refresh,
-            pattern=f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|stopped|done)$",
+            pattern=(f"^{LIST_REFRESH_CB_PREFIX}(all|downloading|stopped|done|search|search\\.[0-9a-f]{{8}})(:\\d+)?$"),
         )
     )
     app.add_handler(CallbackQueryHandler(on_torrent_action, pattern=f"^{TORRENT_ACTION_CB_PREFIX}"))
