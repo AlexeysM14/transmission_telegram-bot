@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from telegram.error import TelegramError
@@ -28,7 +29,7 @@ def _store(tmp_path: Path) -> SQLiteStateStore:
 def test_logical_traffic_counters_survive_transmission_reset(tmp_path: Path, monkeypatch) -> None:
     store = _store(tmp_path)
     monkeypatch.setattr(bot, "STATE_STORE", store)
-    monkeypatch.setattr(bot, "TRAFFIC_STATE_LOCK", asyncio.Lock())
+    monkeypatch.setattr(bot, "TRAFFIC_STATE_LOCK", None)
     now = datetime(2026, 7, 10, 12, 0, tzinfo=bot.ZoneInfo("Europe/Moscow"))
 
     async def exercise() -> None:
@@ -77,6 +78,22 @@ def test_tr_call_serializes_concurrent_rpc_calls(monkeypatch) -> None:
 
     assert asyncio.run(exercise()) == ["ok"] * 6
     assert peak_active == 1
+
+
+def test_async_state_locks_are_created_lazily_inside_the_running_loop(monkeypatch) -> None:
+    monkeypatch.setattr(bot, "TRAFFIC_STATE_LOCK", None)
+    monkeypatch.setattr(bot, "TORRENT_HISTORY_LOCK", None)
+
+    async def exercise() -> None:
+        traffic_lock = bot._get_traffic_state_lock()
+        history_lock = bot._get_torrent_history_lock()
+        assert traffic_lock is bot._get_traffic_state_lock()
+        assert history_lock is bot._get_torrent_history_lock()
+        async with traffic_lock, history_lock:
+            assert traffic_lock.locked()
+            assert history_lock.locked()
+
+    asyncio.run(exercise())
 
 
 def test_tr_call_does_not_retry_non_retryable_connection_error(monkeypatch) -> None:
@@ -173,29 +190,31 @@ def test_completion_is_enqueued_once_and_failed_delivery_remains_pending(
             self.messages.append(kwargs)
 
     application = SimpleNamespace(bot_data={bot.NOTIFY_ENABLED_CHATS_KEY: {101}})
-    processing_context = SimpleNamespace(application=application, bot=FailingBot())
+    processing_context = cast(Any, SimpleNamespace(application=application, bot=FailingBot()))
 
     asyncio.run(bot._process_torrent_notifications(processing_context, [torrent]))
 
     reopened = _store(tmp_path)
     monkeypatch.setattr(bot, "STATE_STORE", reopened)
     asyncio.run(bot._process_torrent_notifications(processing_context, [torrent]))
-    queued = reopened.list_due_outbox(now_ts=10**20)
+    queued = reopened.list_due_outbox(now_ts=10_000_000_000.0)
     assert len(queued) == 1
     assert queued[0].event_key == "completion:hash:abcdef:1"
     assert queued[0].kind == "completion"
 
-    asyncio.run(bot._deliver_outbox_item(processing_context, queued[0]))
-    pending = reopened.list_due_outbox(now_ts=10**20)
+    first_claim = reopened.claim_due_outbox(now_ts=10_000_000_000.0, limit=1)
+    asyncio.run(bot._deliver_outbox_item(processing_context, first_claim[0]))
+    pending = reopened.list_due_outbox(now_ts=10_000_000_000.0)
     assert len(pending) == 1
     assert pending[0].status == "pending"
     assert pending[0].attempts == 1
     assert pending[0].last_error == "temporary network failure"
 
     successful_bot = SuccessfulBot()
-    success_context = SimpleNamespace(application=application, bot=successful_bot)
-    asyncio.run(bot._deliver_outbox_item(success_context, pending[0]))
-    assert reopened.list_due_outbox(now_ts=10**20) == []
+    success_context = cast(Any, SimpleNamespace(application=application, bot=successful_bot))
+    retry_claim = reopened.claim_due_outbox(now_ts=10_000_000_000.0, limit=1)
+    asyncio.run(bot._deliver_outbox_item(success_context, retry_claim[0]))
+    assert reopened.list_due_outbox(now_ts=10_000_000_000.0) == []
     assert successful_bot.messages[0]["chat_id"] == 101
 
 
@@ -207,7 +226,9 @@ def test_timezone_config_prefers_bot_timezone_and_rejects_unknown_zone(monkeypat
 
     assert name == "Europe/Moscow"
     assert timezone.key == "Europe/Moscow"
-    assert datetime(2026, 1, 1, tzinfo=timezone).utcoffset().total_seconds() == 3 * 60 * 60
+    utc_offset = datetime(2026, 1, 1, tzinfo=timezone).utcoffset()
+    assert utc_offset is not None
+    assert utc_offset.total_seconds() == 3 * 60 * 60
 
     monkeypatch.setenv("BOT_TIMEZONE", "Invalid/Definitely-Unknown")
     with pytest.raises(RuntimeError, match="BOT_TIMEZONE has unknown timezone"):

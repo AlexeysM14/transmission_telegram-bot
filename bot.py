@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Coroutine, Literal, Optional, Sequence, cast
@@ -38,7 +38,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.request import HTTPXRequest
 from transmission_rpc import Client, from_url
 from transmission_rpc.error import TransmissionAuthError, TransmissionConnectError, TransmissionError
 
@@ -152,6 +151,7 @@ log = logging.getLogger("tg-transmission-bot")
 
 
 TG_MAX_MESSAGE = 4096
+TORRENT_FILE_MAX_BYTES = 10 * 1024 * 1024
 TORRENT_ID_RE = re.compile(r"\b(\d{1,9})\b")
 _TR_CLIENT: Optional[Client] = None
 _TR_CLIENT_LOCK = threading.Lock()
@@ -236,8 +236,8 @@ def _parse_float_env(name: str, default: str, *, min_exclusive: float = 0.0) -> 
     except ValueError as exc:
         raise RuntimeError(f"{name} must be a number") from exc
 
-    if value <= min_exclusive:
-        raise RuntimeError(f"{name} must be > {min_exclusive:g}")
+    if not isfinite(value) or value <= min_exclusive:
+        raise RuntimeError(f"{name} must be a finite number > {min_exclusive:g}")
     return value
 
 
@@ -245,7 +245,11 @@ def _parse_bool_env(name: str, *, default: bool = False) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
         return default
-    return raw in {"1", "true", "yes", "on"}
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be one of: 1/0, true/false, yes/no, on/off")
 
 
 def _parse_timezone_env() -> tuple[str, ZoneInfo]:
@@ -260,9 +264,16 @@ def _normalize_proxy_url(raw_url: Optional[str], *, env_name: str) -> Optional[s
     if not raw_url:
         return None
 
-    parts = urlsplit(raw_url)
+    if any(character.isspace() for character in raw_url):
+        raise RuntimeError(f"{env_name} must not contain whitespace")
+
+    try:
+        parts = urlsplit(raw_url)
+        proxy_port = parts.port
+    except ValueError as exc:
+        raise RuntimeError(f"{env_name} must be a valid proxy URL") from exc
     scheme = parts.scheme.lower()
-    if not scheme or not parts.netloc:
+    if not scheme or not parts.netloc or parts.hostname is None:
         raise RuntimeError(f"{env_name} must be a valid proxy URL")
 
     if scheme == "mtproto":
@@ -272,6 +283,30 @@ def _normalize_proxy_url(raw_url: Optional[str], *, env_name: str) -> Optional[s
         supported = ", ".join(sorted(SUPPORTED_PROXY_SCHEMES))
         raise RuntimeError(f"{env_name} has unsupported proxy scheme '{scheme}', supported: {supported}")
 
+    if proxy_port is not None and not 1 <= proxy_port <= 65535:
+        raise RuntimeError(f"{env_name} proxy port must be in 1..65535")
+
+    return raw_url
+
+
+def _validate_transmission_url(raw_url: Optional[str]) -> Optional[str]:
+    if not raw_url:
+        return None
+    if any(character.isspace() for character in raw_url):
+        raise RuntimeError("TR_URL must not contain whitespace")
+
+    try:
+        parts = urlsplit(raw_url)
+        port = parts.port
+    except ValueError as exc:
+        raise RuntimeError("TR_URL must be a valid HTTP(S) URL") from exc
+
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc or parts.hostname is None:
+        raise RuntimeError("TR_URL must be a valid HTTP(S) URL")
+    if port is not None and not 1 <= port <= 65535:
+        raise RuntimeError("TR_URL port must be in 1..65535")
+    if parts.query or parts.fragment:
+        raise RuntimeError("TR_URL must not contain a query string or fragment")
     return raw_url
 
 
@@ -279,19 +314,22 @@ def _mask_proxy_url(raw_url: Optional[str]) -> str:
     if not raw_url:
         return "direct"
 
-    parts = urlsplit(raw_url)
-    if "@" not in parts.netloc:
-        return raw_url
+    try:
+        parts = urlsplit(raw_url)
+        _ = parts.port
+    except ValueError:
+        return "<invalid URL>"
+    if not parts.scheme or not parts.netloc or not parts.hostname:
+        return "<invalid URL>"
 
-    _, _, hostinfo = parts.netloc.rpartition("@")
-    return urlunsplit((parts.scheme, f"***:***@{hostinfo}", parts.path, parts.query, parts.fragment))
+    safe_netloc = parts.netloc
+    if "@" in safe_netloc:
+        _, _, hostinfo = safe_netloc.rpartition("@")
+        safe_netloc = f"***:***@{hostinfo}"
+    return urlunsplit((parts.scheme, safe_netloc, parts.path, "", ""))
 
 
-def load_config() -> Config:
-    tg_token = os.environ.get("TG_TOKEN", "").strip()
-    if not tg_token:
-        raise RuntimeError("ENV TG_TOKEN is required")
-
+def _parse_transmission_fallback_endpoint() -> tuple[TransmissionProtocol, str, int, str]:
     tr_protocol_raw = os.environ.get("TR_PROTOCOL", "http").strip().lower()
     if tr_protocol_raw == "http":
         tr_protocol: TransmissionProtocol = "http"
@@ -301,6 +339,39 @@ def load_config() -> Config:
         raise RuntimeError("TR_PROTOCOL must be 'http' or 'https'")
 
     tr_port = _parse_int_env("TR_PORT", "9091", min_value=1, max_value=65535)
+    tr_host = os.environ.get("TR_HOST", "127.0.0.1").strip()
+    if not tr_host or any(character.isspace() for character in tr_host) or "://" in tr_host or "/" in tr_host:
+        raise RuntimeError("TR_HOST must be a hostname or IP address without a URL scheme or path")
+    tr_path = os.environ.get("TR_PATH", "/transmission/rpc").strip()
+    if (
+        not tr_path.startswith("/")
+        or any(character.isspace() for character in tr_path)
+        or "?" in tr_path
+        or "#" in tr_path
+    ):
+        raise RuntimeError("TR_PATH must be an absolute URL path without whitespace, query string, or fragment")
+    return tr_protocol, tr_host, tr_port, tr_path
+
+
+def load_config() -> Config:
+    tg_token = os.environ.get("TG_TOKEN", "").strip()
+    if not tg_token:
+        raise RuntimeError("ENV TG_TOKEN is required")
+
+    tg_proxy = _normalize_proxy_url(os.environ.get("TG_PROXY", "").strip() or None, env_name="TG_PROXY")
+    tg_get_updates_proxy = _normalize_proxy_url(
+        os.environ.get("TG_GET_UPDATES_PROXY", "").strip() or None,
+        env_name="TG_GET_UPDATES_PROXY",
+    )
+    tr_url = _validate_transmission_url(os.environ.get("TR_URL", "").strip() or None)
+
+    if tr_url is None:
+        tr_protocol, tr_host, tr_port, tr_path = _parse_transmission_fallback_endpoint()
+    else:
+        # These fields are unused when TR_URL is configured. Ignore stale
+        # fallback values instead of preventing startup with a valid URL.
+        tr_protocol, tr_host, tr_port, tr_path = "http", "127.0.0.1", 9091, "/transmission/rpc"
+
     tr_timeout = _parse_float_env("TR_TIMEOUT", "10", min_exclusive=0.0)
     list_limit = _parse_int_env("LIST_LIMIT", "25", min_value=1)
     allowed_user_ids = _parse_allowed_ids(os.environ.get("ALLOWED_USER_IDS", ""))
@@ -308,7 +379,6 @@ def load_config() -> Config:
     timezone_name, bot_timezone = _parse_timezone_env()
     state_dir_raw = os.environ.get("STATE_DIR", "").strip()
     state_dir = Path(state_dir_raw).expanduser() if state_dir_raw else Path(__file__).resolve().parent
-
     if allowed_user_ids is None:
         if allow_all_users:
             log.warning(
@@ -321,13 +391,13 @@ def load_config() -> Config:
         tg_token=tg_token,
         allowed_user_ids=allowed_user_ids,
         allow_all_users=allow_all_users,
-        tg_proxy=os.environ.get("TG_PROXY", "").strip() or None,
-        tg_get_updates_proxy=os.environ.get("TG_GET_UPDATES_PROXY", "").strip() or None,
-        tr_url=os.environ.get("TR_URL", "").strip() or None,
+        tg_proxy=tg_proxy,
+        tg_get_updates_proxy=tg_get_updates_proxy,
+        tr_url=tr_url,
         tr_protocol=tr_protocol,
-        tr_host=os.environ.get("TR_HOST", "127.0.0.1").strip(),
+        tr_host=tr_host,
         tr_port=tr_port,
-        tr_path=os.environ.get("TR_PATH", "/transmission/rpc").strip(),
+        tr_path=tr_path,
         tr_user=os.environ.get("TR_USER", "").strip() or None,
         tr_pass=os.environ.get("TR_PASS", "").strip() or None,
         tr_timeout=tr_timeout,
@@ -359,7 +429,8 @@ def bot_now() -> datetime:
 
 
 def initialize_runtime() -> None:
-    global CFG, CONFIRM_DEL_KEEP_FLOW, STATE_STORE, _OUTBOX_DRAIN_LOCK, _TR_CALL_LOCK, _TR_CLIENT, log
+    global CFG, CONFIRM_DEL_KEEP_FLOW, STATE_STORE
+    global TORRENT_HISTORY_LOCK, TRAFFIC_STATE_LOCK, _OUTBOX_DRAIN_LOCK, _TR_CALL_LOCK, _TR_CLIENT, log
 
     load_dotenv_file(Path(__file__).resolve().with_name(".env"))
     log = configure_logging()
@@ -375,6 +446,8 @@ def initialize_runtime() -> None:
     CONFIRM_DEL_KEEP_FLOW = _parse_bool_env("CONFIRM_DEL_KEEP", default=False)
     _TR_CALL_LOCK = None
     _OUTBOX_DRAIN_LOCK = None
+    TRAFFIC_STATE_LOCK = None
+    TORRENT_HISTORY_LOCK = None
     with _TR_CLIENT_LOCK:
         _TR_CLIENT = None
 
@@ -470,8 +543,8 @@ TORRENT_HISTORY_LAST_PAGE_KEY = "torrent_history_last_page"
 NOTIFY_POLL_INTERVAL_SEC = 60
 NOTIFY_START_QUICK_DELAYS_SEC = (0.0, 2.0, 5.0, 15.0, 30.0)
 NOTIFY_NO_PEERS_DELAY_SEC = 10 * 60
-TRAFFIC_STATE_LOCK = asyncio.Lock()
-TORRENT_HISTORY_LOCK = asyncio.Lock()
+TRAFFIC_STATE_LOCK: Optional[asyncio.Lock] = None
+TORRENT_HISTORY_LOCK: Optional[asyncio.Lock] = None
 TORRENT_HISTORY_FIELDS = (
     "id",
     "hashString",
@@ -483,6 +556,7 @@ TORRENT_HISTORY_FIELDS = (
     "uploadedEver",
     "uploadRatio",
     "percentDone",
+    "rateDownload",
     "leftUntilDone",
     "addedDate",
     "doneDate",
@@ -573,7 +647,13 @@ def _sort_torrents(items: Sequence[Any]) -> list[Any]:
 
 def fmt_bytes(n: int | float) -> str:
     units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
-    x = float(max(0, n))
+    try:
+        x = float(n)
+    except (OverflowError, TypeError, ValueError):
+        x = 0.0
+    if not isfinite(x):
+        x = 0.0
+    x = max(0.0, x)
     i = 0
     while x >= 1024 and i < len(units) - 1:
         x /= 1024
@@ -586,15 +666,21 @@ def fmt_rate(bps: int | float) -> str:
 
 
 def _clamp_progress(value: int | float) -> float:
-    return min(100.0, max(0.0, float(value)))
+    normalized = float(value)
+    if not isfinite(normalized):
+        return 0.0
+    return min(100.0, max(0.0, normalized))
 
 
 def torrent_progress_percent(torrent: Any) -> float:
-    progress = getattr(torrent, "progress", None)
+    progress = _get_mapping_or_attr_value(torrent, ("progress",))
     if isinstance(progress, (int, float)):
         return _clamp_progress(progress)
 
-    percent_done = getattr(torrent, "percent_done", None)
+    percent_done = _get_mapping_or_attr_value(
+        torrent,
+        ("percent_done", "percentDone", "percent-done"),
+    )
     if isinstance(percent_done, (int, float)):
         return _clamp_progress(percent_done * 100.0)
 
@@ -622,42 +708,50 @@ def _format_progress_bar(progress: int | float, *, width: int = 9) -> str:
 
 
 def torrent_total_size(torrent: Any) -> int:
-    for attr in ("total_size", "size_when_done"):
-        value = getattr(torrent, attr, None)
-        if isinstance(value, (int, float)) and value > 0:
-            return int(value)
+    for names in (
+        ("total_size", "totalSize", "total-size"),
+        ("size_when_done", "sizeWhenDone", "size-when-done"),
+    ):
+        value = _get_mapping_or_attr_value(torrent, names)
+        normalized = _non_negative_int(value)
+        if normalized is not None and normalized > 0:
+            return normalized
     return 0
 
 
 def _torrent_left_until_done(torrent: Any) -> Optional[int]:
-    for attr in ("left_until_done", "leftUntilDone"):
-        value = getattr(torrent, attr, None)
-        if isinstance(value, (int, float)) and value >= 0:
-            return int(value)
-    return None
+    value = _get_mapping_or_attr_value(
+        torrent,
+        ("left_until_done", "leftUntilDone", "left-until-done"),
+    )
+    return _non_negative_int(value)
 
 
 def _torrent_eta_seconds(torrent: Any) -> Optional[int]:
-    eta = getattr(torrent, "eta", None)
+    eta = _get_mapping_or_attr_value(torrent, ("eta",))
     if isinstance(eta, (int, float)):
-        return int(eta) if eta >= 0 else None
+        return _non_negative_int(eta)
 
     total_seconds = getattr(eta, "total_seconds", None)
     if callable(total_seconds):
         raw_seconds = total_seconds()
-        if isinstance(raw_seconds, (int, float)):
-            seconds = int(raw_seconds)
-            return seconds if seconds >= 0 else None
+        normalized_seconds = _non_negative_int(raw_seconds)
+        if normalized_seconds is not None:
+            return normalized_seconds
 
     left_until_done = _torrent_left_until_done(torrent)
-    rate_download = getattr(torrent, "rate_download", None)
+    rate_download = _get_mapping_or_attr_value(
+        torrent,
+        ("rate_download", "rateDownload", "rate-download"),
+    )
     if (
         left_until_done is not None
         and left_until_done > 0
-        and isinstance(rate_download, (int, float))
-        and rate_download > 0
+        and (normalized_rate := _non_negative_float(rate_download)) is not None
+        and normalized_rate > 0
     ):
-        return int(ceil(left_until_done / rate_download))
+        estimated_seconds = left_until_done / normalized_rate
+        return int(ceil(estimated_seconds)) if isfinite(estimated_seconds) else None
 
     if torrent_progress_percent(torrent) >= 100:
         return 0
@@ -727,6 +821,20 @@ def _get_tr_call_lock() -> asyncio.Lock:
     return _TR_CALL_LOCK
 
 
+def _get_traffic_state_lock() -> asyncio.Lock:
+    global TRAFFIC_STATE_LOCK
+    if TRAFFIC_STATE_LOCK is None:
+        TRAFFIC_STATE_LOCK = asyncio.Lock()
+    return TRAFFIC_STATE_LOCK
+
+
+def _get_torrent_history_lock() -> asyncio.Lock:
+    global TORRENT_HISTORY_LOCK
+    if TORRENT_HISTORY_LOCK is None:
+        TORRENT_HISTORY_LOCK = asyncio.Lock()
+    return TORRENT_HISTORY_LOCK
+
+
 async def tr_call(
     fn: Callable[[Client], Any],
     *,
@@ -785,16 +893,10 @@ def build_telegram_application(
         log.info("Telegram proxy is not configured; using direct connection")
         return builder.build()
 
-    if hasattr(builder, "proxy") and hasattr(builder, "get_updates_proxy"):
-        if tg_proxy:
-            builder = builder.proxy(tg_proxy)
-        if tg_get_updates_proxy:
-            builder = builder.get_updates_proxy(tg_get_updates_proxy)
-    else:
-        if tg_proxy:
-            builder = builder.request(HTTPXRequest(proxy_url=tg_proxy))
-        if tg_get_updates_proxy:
-            builder = builder.get_updates_request(HTTPXRequest(proxy_url=tg_get_updates_proxy))
+    if tg_proxy:
+        builder = builder.proxy(tg_proxy)
+    if tg_get_updates_proxy:
+        builder = builder.get_updates_proxy(tg_get_updates_proxy)
 
     log.info(
         "Telegram proxy enabled (bot=%s, get_updates=%s)",
@@ -1006,6 +1108,7 @@ async def _deliver_outbox_item(ctx: ContextTypes.DEFAULT_TYPE, item: OutboxItem)
         await asyncio.to_thread(
             get_state_store().mark_outbox_failed,
             item.id,
+            cast(str, item.claim_token),
             attempts,
             next_attempt_at,
             error=_redact_log_text(str(exc)),
@@ -1016,7 +1119,11 @@ async def _deliver_outbox_item(ctx: ContextTypes.DEFAULT_TYPE, item: OutboxItem)
             attempts,
         )
     else:
-        await asyncio.to_thread(get_state_store().mark_outbox_delivered, item.id)
+        await asyncio.to_thread(
+            get_state_store().mark_outbox_delivered,
+            item.id,
+            cast(str, item.claim_token),
+        )
 
 
 async def _drain_notification_outbox(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1080,12 +1187,30 @@ async def _register_torrent_start_watch(
 
 
 def _torrent_start_detected(torrent: Any) -> bool:
-    downloaded_ever = float(max(0.0, getattr(torrent, "downloaded_ever", 0.0)))
-    percent_done = float(max(0.0, getattr(torrent, "percent_done", 0.0)))
-    rate_download = float(max(0.0, getattr(torrent, "rate_download", 0.0)))
-    status_raw = str(getattr(torrent, "status", "") or "").strip().lower()
-    started_by_status = status_raw in DOWNLOADING_STATUSES
-    return downloaded_ever > 0.0 or percent_done > 0.0 or rate_download > 0.0 or started_by_status
+    downloaded_ever = _non_negative_float(
+        _get_mapping_or_attr_value(
+            torrent,
+            ("downloaded_ever", "downloadedEver", "downloaded-ever"),
+        )
+    )
+    percent_done = _non_negative_float(
+        _get_mapping_or_attr_value(
+            torrent,
+            ("percent_done", "percentDone", "percent-done"),
+        )
+    )
+    rate_download = _non_negative_float(
+        _get_mapping_or_attr_value(
+            torrent,
+            ("rate_download", "rateDownload", "rate-download"),
+        )
+    )
+    return any(value is not None and value > 0.0 for value in (downloaded_ever, percent_done, rate_download))
+
+
+def _torrent_is_attempting_download(torrent: Any) -> bool:
+    status_raw = _get_mapping_or_attr_value(torrent, ("status",))
+    return str(status_raw or "").strip().lower() == "downloading"
 
 
 def _pop_pending_torrent_start(ctx: ContextTypes.DEFAULT_TYPE, torrent_id: int) -> Optional[dict[Any, Any]]:
@@ -1156,7 +1281,7 @@ async def _notify_torrent_start_soon(
         if torrent is None:
             try:
                 torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
-            except (TransmissionError, TRCallError):
+            except (KeyError, TransmissionError, TRCallError):
                 log.warning("Skipping quick start notification check due to Transmission error", exc_info=True)
                 return
 
@@ -1259,8 +1384,17 @@ def _format_download_duration(seconds: int | float) -> str:
 
 def _torrent_timepoint_to_ts(value: Any) -> Optional[int]:
     if isinstance(value, datetime):
-        return int(value.timestamp())
-    if isinstance(value, (int, float)):
+        try:
+            timestamp = value.timestamp()
+        except (OSError, OverflowError, ValueError):
+            return None
+        return int(timestamp) if isfinite(timestamp) else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        as_int = value
+        return as_int if as_int > 0 else None
+    if isinstance(value, float):
+        if not isfinite(value):
+            return None
         as_int = int(value)
         return as_int if as_int > 0 else None
     return None
@@ -1297,18 +1431,32 @@ def _build_completion_notification_text(torrent_id: int, name: str, torrent: Opt
 def _non_negative_int(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        if not isfinite(value):
+            return None
         return int(max(0, value))
     return None
 
 
 def _get_mapping_or_attr_value(source: Any, names: Sequence[str]) -> Any:
+    try:
+        source_fields = getattr(source, "fields", None)
+    except (AttributeError, KeyError):
+        source_fields = None
+
     for name in names:
         if isinstance(source, dict) and name in source:
             return source[name]
-        value = getattr(source, name, None)
+        try:
+            value = getattr(source, name, None)
+        except (AttributeError, KeyError):
+            value = None
         if value is not None:
             return value
+        if isinstance(source_fields, dict) and name in source_fields:
+            return source_fields[name]
     return None
 
 
@@ -1337,7 +1485,7 @@ def _extract_free_space_value(source: Any) -> Optional[int]:
 async def _get_download_dir_free_space() -> Optional[int]:
     try:
         session = await tr_call(lambda c: c.get_session())
-    except (TransmissionError, TRCallError):
+    except (KeyError, TransmissionError, TRCallError):
         return None
 
     return _extract_free_space_value(session)
@@ -1353,13 +1501,20 @@ def _build_projected_free_space_text(free_space_before: Optional[int], torrent: 
     if free_space_before is None:
         return "💾 После полной скачки: <i>не удалось рассчитать</i>."
 
-    required_space = getattr(torrent, "left_until_done", None)
+    required_space = _get_mapping_or_attr_value(
+        torrent,
+        ("left_until_done", "leftUntilDone", "left-until-done"),
+    )
     if not isinstance(required_space, (int, float)):
-        required_space = getattr(torrent, "total_size", None)
-    if not isinstance(required_space, (int, float)):
+        required_space = _get_mapping_or_attr_value(
+            torrent,
+            ("total_size", "totalSize", "total-size"),
+        )
+    normalized_required_space = _non_negative_int(required_space)
+    if normalized_required_space is None:
         return "💾 После полной скачки: <i>не удалось рассчитать</i>."
 
-    projected_free_space = max(0, int(free_space_before - max(0, int(required_space))))
+    projected_free_space = max(0, free_space_before - normalized_required_space)
     return f"💾 После полной скачки: <b>{fmt_bytes(projected_free_space)}</b>."
 
 
@@ -1571,7 +1726,7 @@ async def update_traffic_state(
     downloaded: int,
     uploaded: int,
 ) -> tuple[dict[str, dict[str, int | str]], list[dict[str, int | str]]]:
-    async with TRAFFIC_STATE_LOCK:
+    async with _get_traffic_state_lock():
         anchors, history = await asyncio.to_thread(_read_traffic_state)
         effective_downloaded, effective_uploaded, counters_changed = _normalize_traffic_counters(
             anchors,
@@ -2124,18 +2279,21 @@ def _history_entry_float(entry: Optional[dict[str, Any]], field: str, default: f
     if not isinstance(entry, dict):
         return default
     value = entry.get(field)
-    if isinstance(value, bool):
-        return default
-    if isinstance(value, (int, float)):
-        return max(0.0, float(value))
-    return default
+    normalized = _non_negative_float(value)
+    return default if normalized is None else normalized
 
 
 def _non_negative_float(value: Any) -> Optional[float]:
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return max(0.0, float(value))
+        try:
+            normalized = float(value)
+        except OverflowError:
+            return None
+        if not isfinite(normalized):
+            return None
+        return max(0.0, normalized)
     return None
 
 
@@ -2311,7 +2469,7 @@ async def sync_torrent_history(
     mark_missing: bool = True,
 ) -> list[dict[str, Any]]:
     now_ts = int(time_module.time())
-    async with TORRENT_HISTORY_LOCK:
+    async with _get_torrent_history_lock():
         items = await asyncio.to_thread(_read_torrent_history_state)
         seen_keys: set[str] = set()
         changed = False
@@ -2356,7 +2514,7 @@ async def mark_torrent_history_removed(torrent: Any, *, with_data: bool) -> None
     if key is None:
         return
 
-    async with TORRENT_HISTORY_LOCK:
+    async with _get_torrent_history_lock():
         items = await asyncio.to_thread(_read_torrent_history_state)
         entry = _torrent_history_entry_from_torrent(torrent, items.get(key), now_ts)
         if entry is None:
@@ -2374,7 +2532,7 @@ async def mark_torrent_history_removed(torrent: Any, *, with_data: bool) -> None
 
 
 async def load_torrent_history_entries() -> list[dict[str, Any]]:
-    async with TORRENT_HISTORY_LOCK:
+    async with _get_torrent_history_lock():
         items = await asyncio.to_thread(_read_torrent_history_state)
         return list(items.values())
 
@@ -2918,6 +3076,59 @@ async def send_torrent_list(  # noqa: C901
         )
 
 
+async def _hydrate_added_torrent(torrent: Any, *, operation: str) -> tuple[Any, bool]:
+    selector: str | int | None = _torrent_history_hash(torrent)
+    if selector is None:
+        torrent_id = _non_negative_int(_get_mapping_or_attr_value(torrent, ("id",)))
+        selector = torrent_id if torrent_id is not None and torrent_id > 0 else None
+
+    if selector is None:
+        log.warning("Torrent was added but its details cannot be refreshed because the response has no id or hash")
+        return torrent, False
+
+    try:
+        hydrated = await tr_call(
+            lambda c: c.get_torrent(selector),
+            operation=operation,
+        )
+    except (KeyError, TransmissionError, TRCallError):
+        log.warning("Torrent %s was added but its details refresh failed during %s", selector, operation, exc_info=True)
+        return torrent, False
+
+    return hydrated, True
+
+
+def _added_torrent_display_values(torrent: Any) -> tuple[str, str]:
+    name = str(_get_mapping_or_attr_value(torrent, ("name",)) or "<без названия>")
+    torrent_id = _non_negative_int(_get_mapping_or_attr_value(torrent, ("id",)))
+    return name, str(torrent_id) if torrent_id is not None and torrent_id > 0 else "неизвестен"
+
+
+async def _register_added_torrent_watch_safe(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int],
+    torrent: Any,
+) -> None:
+    try:
+        await _register_torrent_start_watch(ctx, chat_id, torrent)
+    except Exception:
+        log.exception("Torrent was added, but its start watch could not be persisted")
+
+
+async def _sync_added_torrent_history_safe(torrent: Any) -> None:
+    try:
+        await sync_torrent_history([torrent], mark_missing=False)
+    except Exception:
+        log.exception("Torrent was added, but its history snapshot could not be persisted")
+
+
+def _schedule_added_torrent_watch_safe(ctx: ContextTypes.DEFAULT_TYPE, torrent: Any) -> None:
+    try:
+        _schedule_torrent_start_watch(ctx, torrent)
+    except Exception:
+        log.exception("Torrent was added, but its quick start watch could not be scheduled")
+
+
 async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     link = text.strip()
     if not is_magnet_or_torrent_link(link):
@@ -2927,7 +3138,7 @@ async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
     free_space_before = await _get_download_dir_free_space()
 
     try:
-        torrent = await tr_call(
+        added_torrent = await tr_call(
             lambda c: c.add_torrent(link),
             retry_on_connection=False,
             operation="add_torrent_url",
@@ -2937,25 +3148,53 @@ async def add_magnet_or_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text
         return
 
     chat_id = update.effective_chat.id if update.effective_chat else None
-    await _register_torrent_start_watch(ctx, chat_id, torrent)
-    await sync_torrent_history([torrent], mark_missing=False)
+    await _register_added_torrent_watch_safe(ctx, chat_id, added_torrent)
+    torrent, details_refreshed = await _hydrate_added_torrent(
+        added_torrent,
+        operation="hydrate_added_torrent_url",
+    )
+    if details_refreshed:
+        await _sync_added_torrent_history_safe(torrent)
+
+    torrent_name, torrent_id_text = _added_torrent_display_values(torrent)
+    details_warning = ""
+    if not details_refreshed:
+        details_warning = "⚠️ Торрент добавлен, но свежие детали пока не удалось получить.\n"
 
     await reply_chunks(
         update,
         (
-            f"✅ Торрент добавлен: <b>{html.escape(torrent.name)}</b>\n"
-            f"ID: <b>{torrent.id}</b>\n"
+            f"✅ Торрент добавлен: <b>{html.escape(torrent_name)}</b>\n"
+            f"ID: <b>{torrent_id_text}</b>\n"
+            f"{details_warning}"
             f"{_build_projected_free_space_text(free_space_before, torrent)}"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
     )
-    _schedule_torrent_start_watch(ctx, torrent)
+    _schedule_added_torrent_watch_safe(ctx, torrent)
 
 
 def is_magnet_or_torrent_link(text: str) -> bool:
     normalized = text.strip().lower()
     return normalized.startswith("magnet:") or normalized.startswith("http://") or normalized.startswith("https://")
+
+
+def _validate_downloaded_torrent_file(path: Path) -> None:
+    downloaded_size = path.stat().st_size
+    if downloaded_size <= 0:
+        raise ValueError("получен пустой .torrent файл")
+    if downloaded_size > TORRENT_FILE_MAX_BYTES:
+        raise ValueError("размер .torrent файла превышает лимит 10 MiB")
+
+
+def _delete_temporary_file_safe(path: Optional[Path]) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.warning("Failed to remove temporary torrent file %s", path, exc_info=True)
 
 
 async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2969,15 +3208,25 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await reply_chunks(update, "Это не .torrent файл.", reply_markup=KB_ADD)
         return
 
-    tg_file = await doc.get_file()
+    declared_size = doc.file_size
+    if isinstance(declared_size, int) and declared_size > TORRENT_FILE_MAX_BYTES:
+        await reply_chunks(
+            update,
+            "❌ .torrent файл слишком большой. Максимальный размер: 10 MiB.",
+            reply_markup=KB_ADD,
+        )
+        return
+
     free_space_before = await _get_download_dir_free_space()
     tmp_path: Optional[Path] = None
 
     try:
+        tg_file = await doc.get_file()
         with tempfile.NamedTemporaryFile(prefix="tg_", suffix=".torrent", delete=False) as temp_file:
             tmp_path = Path(temp_file.name)
 
         await tg_file.download_to_drive(custom_path=str(tmp_path))
+        _validate_downloaded_torrent_file(tmp_path)
 
         def _add(client: Client):
             if tmp_path is None:
@@ -2985,33 +3234,99 @@ async def add_torrent_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
             with tmp_path.open("rb") as rf:
                 return client.add_torrent(rf)
 
-        torrent = await tr_call(_add, retry_on_connection=False, operation="add_torrent_file")
+        added_torrent = await tr_call(_add, retry_on_connection=False, operation="add_torrent_file")
 
-    except (TelegramError, OSError, TransmissionError, TRCallError) as exc:
+    except (TelegramError, OSError, ValueError, TransmissionError, TRCallError) as exc:
         await reply_chunks(update, f"❌ Не удалось добавить .torrent: {html.escape(str(exc))}", reply_markup=KB_ADD)
         return
     finally:
-        if tmp_path and tmp_path.exists():
-            tmp_path.unlink(missing_ok=True)
+        _delete_temporary_file_safe(tmp_path)
 
     chat_id = update.effective_chat.id if update.effective_chat else None
-    await _register_torrent_start_watch(ctx, chat_id, torrent)
-    await sync_torrent_history([torrent], mark_missing=False)
+    await _register_added_torrent_watch_safe(ctx, chat_id, added_torrent)
+    torrent, details_refreshed = await _hydrate_added_torrent(
+        added_torrent,
+        operation="hydrate_added_torrent_file",
+    )
+    if details_refreshed:
+        await _sync_added_torrent_history_safe(torrent)
+
+    torrent_name, torrent_id_text = _added_torrent_display_values(torrent)
+    details_warning = ""
+    if not details_refreshed:
+        details_warning = "⚠️ Торрент добавлен, но свежие детали пока не удалось получить.\n"
 
     await reply_chunks(
         update,
         (
-            f"✅ Торрент добавлен из файла: <b>{html.escape(torrent.name)}</b>\n"
-            f"ID: <b>{torrent.id}</b>\n"
+            f"✅ Торрент добавлен из файла: <b>{html.escape(torrent_name)}</b>\n"
+            f"ID: <b>{torrent_id_text}</b>\n"
+            f"{details_warning}"
             f"{_build_projected_free_space_text(free_space_before, torrent)}"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=KB_ADD,
     )
-    _schedule_torrent_start_watch(ctx, torrent)
+    _schedule_added_torrent_watch_safe(ctx, torrent)
 
 
-async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str, torrent_id: int) -> None:
+async def _delete_torrent_action(
+    update: Update,
+    *,
+    action: str,
+    torrent_id: int,
+    expected_torrent_hash: Optional[str],
+    reply_markup: ReplyKeyboardMarkup,
+) -> Optional[str]:
+    torrent = await tr_call(
+        lambda c: c.get_torrent(torrent_id, arguments=TORRENT_HISTORY_FIELDS),
+        operation="get_torrent_for_delete",
+    )
+    torrent_hash = _torrent_history_hash(torrent)
+    expected_hash = expected_torrent_hash.strip().lower() if isinstance(expected_torrent_hash, str) else None
+    if torrent_hash is None:
+        await reply_chunks(
+            update,
+            "❌ Не удалось определить стабильный hash торрента. Удаление отменено.",
+            reply_markup=reply_markup,
+        )
+        return None
+    if expected_hash is not None and torrent_hash != expected_hash:
+        await reply_chunks(
+            update,
+            "⚠️ Запрос подтверждения устарел: под этим ID уже другой торрент. Удаление отменено.",
+            reply_markup=reply_markup,
+        )
+        return None
+
+    with_data = action == "del_data"
+    try:
+        await sync_torrent_history([torrent], mark_missing=False)
+    except Exception:
+        log.exception("Torrent history snapshot failed before deletion")
+    await tr_call(
+        lambda c: c.remove_torrent(torrent_hash, delete_data=with_data),
+        retry_on_connection=False,
+        operation="remove_torrent_with_data" if with_data else "remove_torrent_keep_data",
+    )
+    try:
+        await mark_torrent_history_removed(torrent, with_data=with_data)
+    except Exception:
+        log.exception("Torrent was removed, but its history entry could not be updated")
+
+    if with_data:
+        return f"💥 Удалено вместе с данными: ID {torrent_id} | {torrent.name}"
+    return f"🗑️ Удалено (данные сохранены): ID {torrent_id} | {torrent.name}"
+
+
+async def ctrl_action(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    action: str,
+    torrent_id: int,
+    *,
+    expected_torrent_hash: Optional[str] = None,
+) -> None:
     ctrl_keyboard = _ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None)
 
     try:
@@ -3029,28 +3344,26 @@ async def ctrl_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: st
                 operation="start_torrent",
             )
             msg = f"▶️ Запущено: ID {torrent_id}"
-        elif action == "del_keep":
-            torrent = await tr_call(lambda c: c.get_torrent(torrent_id, arguments=TORRENT_HISTORY_FIELDS))
-            await sync_torrent_history([torrent], mark_missing=False)
-            await tr_call(
-                lambda c: c.remove_torrent(torrent_id, delete_data=False),
-                retry_on_connection=False,
-                operation="remove_torrent_keep_data",
+        elif action in {"del_keep", "del_data"}:
+            delete_message = await _delete_torrent_action(
+                update,
+                action=action,
+                torrent_id=torrent_id,
+                expected_torrent_hash=expected_torrent_hash,
+                reply_markup=ctrl_keyboard,
             )
-            await mark_torrent_history_removed(torrent, with_data=False)
-            msg = f"🗑️ Удалено (данные сохранены): ID {torrent_id} | {torrent.name}"
-        elif action == "del_data":
-            torrent = await tr_call(lambda c: c.get_torrent(torrent_id, arguments=TORRENT_HISTORY_FIELDS))
-            await sync_torrent_history([torrent], mark_missing=False)
-            await tr_call(
-                lambda c: c.remove_torrent(torrent_id, delete_data=True),
-                retry_on_connection=False,
-                operation="remove_torrent_with_data",
-            )
-            await mark_torrent_history_removed(torrent, with_data=True)
-            msg = f"💥 Удалено вместе с данными: ID {torrent_id} | {torrent.name}"
+            if delete_message is None:
+                return
+            msg = delete_message
         else:
             msg = "❌ Неизвестное действие"
+    except KeyError:
+        await reply_chunks(
+            update,
+            f"❌ Торрент с ID {torrent_id} больше не найден.",
+            reply_markup=ctrl_keyboard,
+        )
+        return
     except (TransmissionError, TRCallError) as exc:
         await reply_chunks(
             update,
@@ -3099,9 +3412,17 @@ async def _request_delete_confirmation(
     torrent_id: int,
 ) -> None:
     ctrl_keyboard = _ctrl_keyboard_for_chat(ctx, update.effective_chat.id if update.effective_chat else None)
+    _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
 
     try:
         torrent = await tr_call(lambda c: c.get_torrent(torrent_id))
+    except KeyError:
+        await reply_chunks(
+            update,
+            f"❌ Торрент с ID {torrent_id} больше не найден.",
+            reply_markup=ctrl_keyboard,
+        )
+        return
     except (TransmissionError, TRCallError) as exc:
         await reply_chunks(
             update,
@@ -3110,9 +3431,22 @@ async def _request_delete_confirmation(
         )
         return
 
+    torrent_hash = _torrent_history_hash(torrent)
+    if torrent_hash is None:
+        await reply_chunks(
+            update,
+            "❌ Не удалось определить стабильный hash торрента. Удаление отменено.",
+            reply_markup=ctrl_keyboard,
+        )
+        return
+
     set_wait(ctx, WAIT_NONE)
     set_menu(ctx, MENU_CTRL)
-    _require_user_data(ctx)[PENDING_CTRL_ACTION_KEY] = {"action": action, "torrent_id": torrent_id}
+    _require_user_data(ctx)[PENDING_CTRL_ACTION_KEY] = {
+        "action": action,
+        "torrent_id": torrent_id,
+        "torrent_hash": torrent_hash,
+    }
 
     await reply_chunks(
         update,
@@ -3161,10 +3495,22 @@ async def on_delete_confirmation(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         await query.answer("Запрос подтверждения устарел", show_alert=True)
         return
 
+    pending_hash = pending.get("torrent_hash")
+    if not isinstance(pending_hash, str) or not pending_hash.strip():
+        _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
+        await query.answer("Запрос подтверждения устарел", show_alert=True)
+        return
+
     _require_user_data(ctx).pop(PENDING_CTRL_ACTION_KEY, None)
     await query.answer("Выполняю…")
     await query.edit_message_reply_markup(reply_markup=None)
-    await ctrl_action(update, ctx, action, torrent_id=torrent_id)
+    await ctrl_action(
+        update,
+        ctx,
+        action,
+        torrent_id=torrent_id,
+        expected_torrent_hash=pending_hash,
+    )
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3628,7 +3974,12 @@ async def _process_torrent_notifications(  # noqa: C901
                     text=_build_torrent_start_notification_text(watch.torrent_id, watch.name),
                 )
             start_notified = True
-        elif not started and not no_peers_notified and now_ts - watch.added_at >= NOTIFY_NO_PEERS_DELAY_SEC:
+        elif (
+            not started
+            and _torrent_is_attempting_download(torrent)
+            and not no_peers_notified
+            and now_ts - watch.added_at >= NOTIFY_NO_PEERS_DELAY_SEC
+        ):
             if watch.chat_id in enabled_chats:
                 await _enqueue_notification(
                     event_key=f"no-peers:{watch.torrent_key}:{int(watch.added_at * 1000)}",

@@ -3,6 +3,11 @@
 .venv/
 __pycache__/
 *.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 bot-errors.log*
 traffic_anchors.json
 traffic_anchors.tmp
@@ -11,3 +16,4 @@ torrent_history.tmp
 bot-state.sqlite3
 bot-state.sqlite3-shm
 bot-state.sqlite3-wal
+bot-state.sqlite3-journal

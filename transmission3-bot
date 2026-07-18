@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import getpass
 import grp
 import json
+import math
 import os
+import re
 import shutil
 import socket
 
@@ -26,6 +29,37 @@ DEFAULT_REPO_URL = "https://github.com/AlexeysM14/transmission_telegram-bot.git"
 DEFAULT_CLI_IMPL_PATH = Path(f"/usr/local/libexec/{SERVICE_NAME}")
 TELEGRAM_API_BASE = "https://api.telegram.org"
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
+SOCKS_PROXY_SCHEMES = {"socks5", "socks5h"}
+
+_SOCKS_TELEGRAM_CHECK_CODE = r"""
+import json
+import sys
+
+import httpx
+
+settings = json.load(sys.stdin)
+token = settings["token"]
+try:
+    with httpx.Client(
+        proxy=settings["proxy_url"],
+        timeout=settings["timeout"],
+        trust_env=False,
+        follow_redirects=False,
+    ) as client:
+        response = client.get("https://api.telegram.org/bot" + token + "/getMe")
+        payload = response.json()
+        if response.status_code != 200:
+            result = {"ok": False, "message": "HTTP " + str(response.status_code)}
+        elif not payload.get("ok"):
+            result = {"ok": False, "message": "API error: " + str(payload.get("description", "unknown error"))}
+        else:
+            username = (payload.get("result") or {}).get("username") or "unknown"
+            result = {"ok": True, "message": "ok (@" + str(username) + ")"}
+except Exception as exc:
+    result = {"ok": False, "message": type(exc).__name__ + ": request failed"}
+
+json.dump(result, sys.stdout)
+"""
 
 
 def load_install_settings() -> dict[str, str]:
@@ -61,7 +95,41 @@ SERVICE_GROUP = INSTALL_SETTINGS.get("SERVICE_GROUP", os.environ.get("SERVICE_GR
 def sanitized_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     for key in tuple(env):
-        if key.startswith(("PYTHON", "PIP_", "GIT_", "LD_", "DYLD_", "APT_", "DPKG_")):
+        if key.startswith(
+            (
+                "PYTHON",
+                "PIP_",
+                "GIT_",
+                "LD_",
+                "DYLD_",
+                "APT_",
+                "DPKG_",
+                "CARGO_",
+            )
+        ) or key in {
+            "ALL_PROXY",
+            "BASH_ENV",
+            "BASHOPTS",
+            "CDPATH",
+            "CURL_CA_BUNDLE",
+            "ENV",
+            "GLOBIGNORE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "IFS",
+            "MAKEFLAGS",
+            "NO_PROXY",
+            "REQUESTS_CA_BUNDLE",
+            "RUSTC_WRAPPER",
+            "SHELLOPTS",
+            "SSL_CERT_DIR",
+            "SSL_CERT_FILE",
+            "SSLKEYLOGFILE",
+            "all_proxy",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+        }:
             env.pop(key, None)
     env["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
     env["PYTHONNOUSERSITE"] = "1"
@@ -78,14 +146,15 @@ def run(
     cwd: Optional[Path] = None,
     display_cmd: Optional[list[str]] = None,
 ) -> int:
-    print(f"\n$ {' '.join(display_cmd or cmd)}")
+    safe_cmd = display_cmd or cmd
+    print(f"\n$ {' '.join(safe_cmd)}")
     proc = subprocess.run(  # nosec B603
         cmd,
         cwd=cwd or ROOT,
         env=env or sanitized_subprocess_env(),
     )
     if check and proc.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+        raise RuntimeError(f"Command failed: {' '.join(safe_cmd)}")
     return proc.returncode
 
 
@@ -223,6 +292,7 @@ def run_clean_git_clone(destination: Path) -> None:
             "--depth",
             "1",
             "--no-hardlinks",
+            "--",
             REPO_URL,
             str(destination),
         ],
@@ -230,6 +300,34 @@ def run_clean_git_clone(destination: Path) -> None:
         cwd=destination.parent,
         display_cmd=[git, "clone", "<configured repository>", str(destination)],
     )
+
+
+def resolve_checkout_commit(checkout: Path) -> str:
+    git = trusted_system_executable("git")
+    proc = subprocess.run(  # nosec B603
+        [
+            git,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.ext.allow=never",
+            "-C",
+            str(checkout),
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ],
+        capture_output=True,
+        text=True,
+        env=git_env(),
+        check=False,
+    )
+    commit = proc.stdout.strip().lower()
+    if proc.returncode != 0 or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit) is None:
+        raise RuntimeError("Unable to resolve the clean checkout commit")
+    return commit
 
 
 def assert_secure_tree(root: Path) -> None:
@@ -250,6 +348,7 @@ def do_update_from_github() -> None:
     try:
         run_clean_git_clone(clean_checkout)
         assert_secure_tree(clean_checkout)
+        expected_commit = resolve_checkout_commit(clean_checkout)
         installer = clean_checkout / "install.sh"
         assert_secure_regular_file(installer, label="clean installer")
         bash = trusted_system_executable("bash")
@@ -260,6 +359,7 @@ def do_update_from_github() -> None:
                 "SERVICE_USER": SERVICE_USER,
                 "SERVICE_GROUP": SERVICE_GROUP,
                 "REPO_URL": REPO_URL,
+                "EXPECTED_COMMIT": expected_commit,
                 "START_SERVICE": "1",
             }
         )
@@ -298,9 +398,16 @@ def set_env_key(key: str, prompt: str, *, allow_empty_delete: bool = False) -> N
 
 def normalize_proxy_url_or_raise(raw_url: str, *, env_name: str) -> str:
     value = raw_url.strip()
-    parts = urlsplit(value)
+    if any(character.isspace() for character in value):
+        raise ValueError(f"{env_name}: proxy URL must not contain whitespace")
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        _ = parts.port
+    except ValueError as exc:
+        raise ValueError(f"{env_name}: invalid proxy URL ({exc})") from exc
     scheme = parts.scheme.lower()
-    if not scheme or not parts.netloc:
+    if not scheme or not parts.netloc or not hostname:
         raise ValueError(f"{env_name}: invalid proxy URL")
 
     if scheme == "mtproto":
@@ -350,12 +457,19 @@ def mask_proxy_url(raw_url: Optional[str]) -> str:
     if not raw_url:
         return "direct"
 
-    parts = urlsplit(raw_url)
-    if "@" not in parts.netloc:
-        return raw_url
+    try:
+        parts = urlsplit(raw_url)
+        _ = parts.port
+    except ValueError:
+        return "<invalid URL>"
+    if not parts.scheme or not parts.netloc or not parts.hostname:
+        return "<invalid URL>"
 
-    _, _, hostinfo = parts.netloc.rpartition("@")
-    return urlunsplit((parts.scheme, f"***:***@{hostinfo}", parts.path, parts.query, parts.fragment))
+    safe_netloc = parts.netloc
+    if "@" in safe_netloc:
+        _, _, hostinfo = safe_netloc.rpartition("@")
+        safe_netloc = f"***:***@{hostinfo}"
+    return urlunsplit((parts.scheme, safe_netloc, parts.path, "", ""))
 
 
 def format_bool(value: bool) -> str:
@@ -395,7 +509,24 @@ def parse_timeout(raw: str) -> float:
         timeout = float((raw or "10").strip())
     except ValueError:
         return 10.0
-    return timeout if timeout > 0 else 10.0
+    return timeout if math.isfinite(timeout) and timeout > 0 else 10.0
+
+
+def validate_http_url(raw_url: str, *, label: str) -> str:
+    value = raw_url.strip()
+    if any(character.isspace() for character in value):
+        raise ValueError(f"{label}: URL must not contain whitespace")
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        _ = parts.port
+    except ValueError as exc:
+        raise ValueError(f"{label}: invalid URL ({exc})") from exc
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc or not hostname:
+        raise ValueError(f"{label}: URL must use http:// or https:// and include a host")
+    if parts.query or parts.fragment:
+        raise ValueError(f"{label}: URL must not contain a query string or fragment")
+    return value
 
 
 def build_transmission_url(env: dict[str, str]) -> str:
@@ -420,7 +551,10 @@ def build_basic_auth(user: Optional[str], password: Optional[str]) -> Optional[s
 
 
 def check_transmission_rpc(env: dict[str, str]) -> tuple[bool, str]:  # noqa: C901
-    url = build_transmission_url(env)
+    try:
+        url = validate_http_url(build_transmission_url(env), label="Transmission RPC")
+    except ValueError as exc:
+        return False, f"error: {exc}"
     timeout = parse_timeout(env.get("TR_TIMEOUT", "10"))
     headers = {"Content-Type": "application/json"}
     auth = build_basic_auth(env.get("TR_USER"), env.get("TR_PASS"))
@@ -463,7 +597,53 @@ def check_transmission_rpc(env: dict[str, str]) -> tuple[bool, str]:  # noqa: C9
         return False, f"error: invalid JSON response ({exc})"
 
 
+def check_telegram_api_via_socks(
+    token: str,
+    *,
+    proxy_url: str,
+    timeout: float,
+    label: str,
+) -> tuple[bool, str]:
+    venv_python = ROOT / ".venv" / "bin" / "python"
+    if not venv_python.exists():
+        return False, f"{label}: installed virtualenv is missing"
+
+    try:
+        assert_secure_regular_file(venv_python, label="virtualenv Python")
+        proc = subprocess.run(  # nosec B603
+            [str(venv_python), "-I", "-c", _SOCKS_TELEGRAM_CHECK_CODE],
+            cwd=ROOT,
+            input=json.dumps({"token": token, "proxy_url": proxy_url, "timeout": timeout}),
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5.0,
+            env=sanitized_subprocess_env(),
+            check=False,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return False, f"{label}: {type(exc).__name__}: SOCKS health check failed"
+
+    if proc.returncode != 0:
+        return False, f"{label}: SOCKS health check exited with status {proc.returncode}"
+    try:
+        result = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return False, f"{label}: SOCKS health check returned invalid output"
+    if not isinstance(result, dict):
+        return False, f"{label}: SOCKS health check returned invalid output"
+    message = str(result.get("message", "unknown error"))
+    return bool(result.get("ok")), f"{label}: {message}"
+
+
 def check_telegram_api(token: str, *, proxy_url: Optional[str], timeout: float, label: str) -> tuple[bool, str]:
+    if proxy_url:
+        try:
+            proxy_url = normalize_proxy_url_or_raise(proxy_url, env_name=label)
+        except ValueError as exc:
+            return False, str(exc)
+        if urlsplit(proxy_url).scheme.lower() in SOCKS_PROXY_SCHEMES:
+            return check_telegram_api_via_socks(token, proxy_url=proxy_url, timeout=timeout, label=label)
+
     target = f"{TELEGRAM_API_BASE}/bot{token}/getMe"
     try:
         body = open_url(target, proxy_url=proxy_url, timeout=timeout)
@@ -487,9 +667,12 @@ def check_telegram_api(token: str, *, proxy_url: Optional[str], timeout: float, 
 
 
 def check_tcp_target(raw_url: str, *, timeout: float, label: str) -> tuple[bool, str]:
-    parts = urlsplit(raw_url)
-    host = parts.hostname
-    port = parts.port
+    try:
+        parts = urlsplit(raw_url)
+        host = parts.hostname
+        port = parts.port
+    except ValueError as exc:
+        return False, f"{label}: invalid URL ({exc})"
     if not host or port is None:
         return False, f"{label}: invalid URL"
 
@@ -631,7 +814,13 @@ def menu() -> None:  # noqa: C901
             if choice == "1":
                 do_update_from_github()
             elif choice == "2":
-                set_env_key("TG_TOKEN", "Enter Telegram token: ")
+                data = load_env()
+                value = getpass.getpass("Enter Telegram token: ").strip()
+                if not value:
+                    print("⚠️ Empty value, nothing changed")
+                else:
+                    data["TG_TOKEN"] = value
+                    save_env(data)
             elif choice == "3":
                 set_env_key(
                     "ALLOWED_USER_IDS",
@@ -640,7 +829,7 @@ def menu() -> None:  # noqa: C901
                 )
             elif choice == "4":
                 data = load_env()
-                value = input(
+                value = getpass.getpass(
                     "Enter Telegram proxy URL (leave empty to disable proxy; supported: http(s):// or socks5://): "
                 ).strip()
                 if not value:
@@ -652,7 +841,7 @@ def menu() -> None:  # noqa: C901
                     save_env(data)
             elif choice == "5":
                 data = load_env()
-                value = input(
+                value = getpass.getpass(
                     "Enter Telegram getUpdates proxy URL "
                     "(leave empty to reuse TG_PROXY; supported: http(s):// or socks5://): "
                 ).strip()
@@ -664,11 +853,15 @@ def menu() -> None:  # noqa: C901
                     data["TG_GET_UPDATES_PROXY"] = normalize_proxy_url_or_raise(value, env_name="TG_GET_UPDATES_PROXY")
                     save_env(data)
             elif choice == "6":
-                set_env_key(
-                    "TR_URL",
-                    "Enter Transmission RPC URL (leave empty to use TR_PROTOCOL/TR_HOST/TR_PORT/TR_PATH): ",
-                    allow_empty_delete=True,
-                )
+                data = load_env()
+                value = getpass.getpass(
+                    "Enter Transmission RPC URL (leave empty to use TR_PROTOCOL/TR_HOST/TR_PORT/TR_PATH): "
+                ).strip()
+                if not value:
+                    data.pop("TR_URL", None)
+                else:
+                    data["TR_URL"] = validate_http_url(value, label="TR_URL")
+                save_env(data)
             elif choice == "7":
                 restart_bot_service()
             elif choice == "8":

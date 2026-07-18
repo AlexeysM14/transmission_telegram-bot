@@ -5,6 +5,7 @@ Telegram-бот для управления Transmission 3 через меню-�
 ## Установка в Linux (с systemd)
 
 Команды ниже рассчитаны на запуск от пользователя `root` (например, в Proxmox/LXC-контейнере), поэтому `sudo` не используется.
+Нужен Python 3.10 или новее.
 
 1) Установите Git (если ещё не установлен):
 
@@ -69,11 +70,13 @@ transmission3-bot status
 - `/var/log/transmission3-bot` — ротируемые файловые логи, принадлежит сервисному пользователю;
 - `/usr/local/bin/transmission3-bot` — обычный root-owned launcher, а не ссылка в каталог с кодом.
 
-systemd монтирует корневую файловую систему для процесса только для чтения и разрешает запись лишь в каталоги состояния и логов. При повторном запуске `install.sh` старая конфигурация `.env`, JSON-состояние и файлы логов автоматически переносятся в новые каталоги. В `/opt/transmission3-bot/.env` остаётся только root-owned совместимая ссылка на файл из `/etc`.
+systemd монтирует корневую файловую систему для процесса только для чтения и разрешает запись лишь в каталоги состояния и логов. При повторном запуске `install.sh` доверенная root-owned конфигурация `.env`, JSON-состояние и файлы логов автоматически переносятся в новые каталоги.
+
+Конфигурация из каталога, доступного сервисному пользователю на запись, по умолчанию не импортируется: заново задайте секреты через `transmission3-bot update`. Осознанно разрешить такой одноразовый импорт можно только после проверки файла, запустив установщик с `IMPORT_UNTRUSTED_LEGACY_ENV=1`. В `/opt/transmission3-bot/.env` остаётся только root-owned совместимая ссылка на файл из `/etc`.
 
 Для первой миграции старой установки запускайте новый `install.sh` из отдельного доверенного checkout, а не из прежнего `/opt/transmission3-bot`: в старой схеме этот каталог принадлежал сервисному пользователю.
 
-Обновление кода требует `sudo`. CLI и установщик никогда не выполняют Git-команды, `pip`, Python или requirements из текущего `/opt/transmission3-bot`. Вместо этого создаётся новый root-owned checkout рядом с каталогом установки, Git запускается без system/global/local config и hooks, а зависимости устанавливаются только из бинарных wheels (`--only-binary=:all:`, `--no-input`) в новую `.venv`.
+Обновление кода требует `sudo`. CLI и установщик никогда не выполняют Git-команды, `pip`, Python или requirements из текущего `/opt/transmission3-bot`. Вместо этого создаётся новый root-owned checkout рядом с каталогом установки, Git запускается без system/global/local config и hooks, а зависимости устанавливаются только из бинарных wheels (`--only-binary=:all:`, `--no-input`) в новую `.venv`. Повторный checkout установщика сверяется с конкретным commit первого checkout; параллельные запуски установки блокируются через `flock`.
 
 Готовый release целиком переключается через rename. Предыдущие root-owned release, CLI, unit и конфигурация сохраняются до перезапуска и проверки `systemctl is-active`; при ошибке они восстанавливаются и прежний сервис запускается снова. Если старая установка доступна сервисному пользователю на запись, она считается недоверенной: при неудачной миграции бот остаётся остановленным, а старый код не восстанавливается и не выполняется.
 
@@ -89,13 +92,13 @@ systemctl status transmission3-bot
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 Опционально: для отправки графика трафика установите `matplotlib`:
 
 ```bash
-pip install matplotlib
+python -m pip install matplotlib
 ```
 
 ```bash
@@ -120,7 +123,7 @@ python bot.py
 - `📈 Статистика` — трафик за день, 7 дней и месяц.
 - `📚 История раздач` — список торрентов с отданным/скачанным трафиком и ratio. Записи остаются в истории после удаления торрента из Transmission.
 - `📋 Торренты` — списки, поиск и быстрые действия.
-- `➕ Добавить` — magnet/URL или `.torrent` файл.
+- `➕ Добавить` — magnet/URL или `.torrent` файл размером до 10 MiB.
 - `⚙️ Управление` — пауза, старт, удаление и уведомления.
 
 История раздач и настройки уведомлений хранятся в SQLite в каталоге состояния. При systemd-установке это `/var/lib/transmission3-bot`; старые `traffic_anchors.json` и `torrent_history.json` импортируются автоматически. Снимок истории обновляется при обычных действиях с ботом и фоновым заданием.
@@ -142,8 +145,13 @@ python bot.py
   2. Выполните команду:
 
 ```bash
-curl -s "https://api.telegram.org/bot<TG_TOKEN>/getUpdates"
+read -rsp "Telegram bot token: " TG_TOKEN && echo
+printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "$TG_TOKEN" | curl --silent --show-error --config -
+unset TG_TOKEN
 ```
+
+Так токен не попадает в историю shell и аргументы процесса `curl`. После получения id отзовите токен у `@BotFather`,
+если есть подозрение, что он где-либо раскрылся.
 
   3. В ответе найдите поле `"from":{"id":...}` — это ваш user id.
 
@@ -170,3 +178,27 @@ curl -s "https://api.telegram.org/bot<TG_TOKEN>/getUpdates"
 - `LOG_LEVEL` — уровень логирования в консоль (`INFO`, `DEBUG` и т.п.).
 - `STATE_DIR` — каталог постоянного состояния (при systemd-установке `/var/lib/transmission3-bot`).
 - `LOG_FILE` — путь к файлу логов предупреждений/ошибок (при systemd-установке `/var/log/transmission3-bot/bot-errors.log`, ротация 1 MiB × 3 файла).
+
+## Разработка и проверки
+
+Код поддерживает Python 3.10+. Прямые runtime-зависимости задаются в `requirements.in`, а полностью закреплённый
+`requirements.txt` генерируется с SHA-256-хешами. Версии инструментов разработки находятся в `requirements-dev.txt`.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+
+python -m pytest -q
+ruff check bot.py state_store.py transmission3-bot tests
+ruff format --check bot.py state_store.py transmission3-bot tests
+pyright
+bandit -q -r bot.py state_store.py transmission3-bot
+bash -n install.sh
+
+# после изменения requirements.in
+python -m piptools compile --generate-hashes --strip-extras requirements.in
+```
+
+CI выполняет тот же набор проверок на Python 3.10, 3.12 и 3.14, проверяет актуальность lock-файла и целостность окружения через `pip check`, а также отдельно запускает аудит известных уязвимостей runtime-зависимостей. Тесты не требуют работающего Transmission или доступа к Telegram.

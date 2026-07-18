@@ -1,9 +1,11 @@
 {
     "include": [
         "bot.py",
-        "state_store.py"
+        "state_store.py",
+        "transmission3-bot",
+        "tests"
     ],
-    "pythonVersion": "3.9",
+    "pythonVersion": "3.10",
     "typeCheckingMode": "basic",
     "venv": ".venv",
     "venvPath": "."

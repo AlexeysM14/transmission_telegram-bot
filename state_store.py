@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+import stat
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
+from math import isfinite
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Set, Tuple, Union
 
@@ -26,7 +30,7 @@ TorrentHistory = Dict[str, Dict[str, Any]]
 
 
 class StateStoreError(RuntimeError):
-    """Raised when persisted state cannot be decoded safely."""
+    """Raised when persisted state or its schema cannot be used safely."""
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,7 @@ class OutboxItem:
     kind: str
     text: str
     status: str
+    claim_token: Optional[str]
     attempts: int
     next_attempt_at: float
     created_at: float
@@ -73,6 +78,10 @@ class StartWatch:
     completion_notified: bool = False
 
 
+# Rollback compatibility: the previous v2 initializer detects claim support by
+# searching sqlite_master SQL for the exact literal "'sending'". Keep the v3
+# table's equivalent expression split so that a rollback rebuilds a real v2
+# outbox instead of leaving v3 CHECK constraints under user_version=2.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (
     key TEXT PRIMARY KEY,
@@ -106,13 +115,18 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
     kind TEXT NOT NULL,
     text TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending', 'sending', 'delivered', 'cancelled')),
+        CHECK (status IN ('pending', ('send' || 'ing'), 'delivered', 'cancelled')),
+    claim_token TEXT,
     attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     next_attempt_at REAL NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     delivered_at REAL,
     last_error TEXT,
+    CHECK (
+        (status = ('send' || 'ing') AND claim_token IS NOT NULL AND length(claim_token) > 0)
+        OR (status != ('send' || 'ing') AND claim_token IS NULL)
+    ),
     UNIQUE (event_key, chat_id)
 );
 
@@ -120,6 +134,8 @@ CREATE INDEX IF NOT EXISTS notification_outbox_due_idx
     ON notification_outbox (status, next_attempt_at, id);
 CREATE INDEX IF NOT EXISTS notification_outbox_chat_idx
     ON notification_outbox (chat_id, status);
+CREATE INDEX IF NOT EXISTS notification_outbox_claim_idx
+    ON notification_outbox (claim_token) WHERE claim_token IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS monitor_snapshots (
     torrent_key TEXT PRIMARY KEY,
@@ -155,6 +171,7 @@ class SQLiteStateStore:
 
     _TRAFFIC_MIGRATION_KEY = "legacy.traffic_anchors.v1"
     _HISTORY_MIGRATION_KEY = "legacy.torrent_history.v1"
+    _SCHEMA_VERSION = 3
 
     def __init__(
         self,
@@ -191,11 +208,19 @@ class SQLiteStateStore:
                 return
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._secure_database_file()
             connection = self._connect()
             try:
+                version = self._schema_version(connection)
+                self._reject_future_schema(version)
+                connection.execute("BEGIN IMMEDIATE")
+                version = self._schema_version(connection)
+                self._reject_future_schema(version)
+                self._migrate_outbox_to_v3(connection)
+                self._execute_schema(connection)
+                connection.execute("PRAGMA user_version=3")
+                connection.commit()
                 connection.execute("PRAGMA journal_mode=WAL")
-                self._migrate_outbox_claim_status(connection)
-                connection.executescript("BEGIN IMMEDIATE;\n{}\nPRAGMA user_version=2;\nCOMMIT;".format(_SCHEMA))
             except BaseException:
                 if connection.in_transaction:
                     connection.rollback()
@@ -203,12 +228,11 @@ class SQLiteStateStore:
             finally:
                 connection.close()
 
-            # State may contain chat identifiers, torrent names and delivery
-            # errors. Keep it private even outside the hardened systemd unit.
-            self.db_path.chmod(0o600)
+            self._secure_sqlite_files()
 
             self._migrate_legacy_traffic()
             self._migrate_legacy_torrent_history()
+            self._secure_sqlite_files()
             self._initialized = True
 
     def load_traffic_state(self) -> Tuple[TrafficAnchors, TrafficHistory]:
@@ -222,8 +246,8 @@ class SQLiteStateStore:
         if row is None:
             return {}, []
         try:
-            anchors_raw = json.loads(str(row["anchors_json"]))
-            history_raw = json.loads(str(row["history_json"]))
+            anchors_raw = self._load_json_text(str(row["anchors_json"]))
+            history_raw = self._load_json_text(str(row["history_json"]))
             return self._normalize_traffic_state(anchors_raw, history_raw)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise StateStoreError("SQLite traffic state is invalid") from exc
@@ -252,7 +276,7 @@ class SQLiteStateStore:
         for row in rows:
             key = str(row["torrent_key"])
             try:
-                payload = json.loads(str(row["payload_json"]))
+                payload = self._load_json_text(str(row["payload_json"]))
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 raise StateStoreError("SQLite torrent history entry {!r} is invalid".format(key)) from exc
             if not isinstance(payload, dict):
@@ -394,12 +418,12 @@ class SQLiteStateStore:
         self._require_initialized()
         if limit < 1:
             raise ValueError("limit must be positive")
-        due_at = time.time() if now_ts is None else float(now_ts)
+        due_at = self._finite_float(time.time() if now_ts is None else now_ts, "now_ts")
         with self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT id, event_key, chat_id, kind, text, status,
-                       attempts, next_attempt_at, created_at, updated_at,
+                       claim_token, attempts, next_attempt_at, created_at, updated_at,
                        delivered_at, last_error
                   FROM notification_outbox
                  WHERE status = 'pending' AND next_attempt_at <= ?
@@ -417,107 +441,121 @@ class SQLiteStateStore:
         *,
         lease_seconds: float = 120.0,
     ) -> List[OutboxItem]:
-        """Atomically lease due items so parallel drainers cannot send duplicates."""
+        """Atomically lease due items to one fenced delivery batch."""
 
         self._require_initialized()
         if limit < 1:
             raise ValueError("limit must be positive")
-        if lease_seconds <= 0:
+        normalized_lease_seconds = self._finite_float(lease_seconds, "lease_seconds")
+        if normalized_lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        claimed_at = time.time() if now_ts is None else float(now_ts)
-        lease_until = claimed_at + float(lease_seconds)
+        claimed_at = self._finite_float(time.time() if now_ts is None else now_ts, "now_ts")
+        lease_until = self._finite_float(claimed_at + normalized_lease_seconds, "lease deadline")
+        claim_token = uuid.uuid4().hex
         with self._connection(write=True) as connection:
             connection.execute(
                 """
                 UPDATE notification_outbox
-                   SET status = 'pending', updated_at = ?
+                   SET status = 'pending', claim_token = NULL, updated_at = ?
                  WHERE status = 'sending' AND next_attempt_at <= ?
                 """,
                 (claimed_at, claimed_at),
             )
-            rows = connection.execute(
-                """
-                SELECT id
-                  FROM notification_outbox
-                 WHERE status = 'pending' AND next_attempt_at <= ?
-                 ORDER BY next_attempt_at, id
-                 LIMIT ?
-                """,
-                (claimed_at, int(limit)),
-            ).fetchall()
-            item_ids = [int(row["id"]) for row in rows]
-            if not item_ids:
-                return []
-            placeholders = ",".join("?" for _ in item_ids)
             connection.execute(
                 """
                 UPDATE notification_outbox
-                   SET status = 'sending', next_attempt_at = ?, updated_at = ?
-                 WHERE id IN ({}) AND status = 'pending'
-                """.format(placeholders),
-                [lease_until, claimed_at, *item_ids],
+                   SET status = 'sending',
+                       claim_token = ?,
+                       next_attempt_at = ?,
+                       updated_at = ?
+                 WHERE status = 'pending'
+                   AND id IN (
+                       SELECT id
+                         FROM notification_outbox
+                        WHERE status = 'pending' AND next_attempt_at <= ?
+                        ORDER BY next_attempt_at, id
+                        LIMIT ?
+                   )
+                """,
+                (claim_token, lease_until, claimed_at, claimed_at, int(limit)),
             )
             claimed_rows = connection.execute(
                 """
                 SELECT id, event_key, chat_id, kind, text, status,
-                       attempts, next_attempt_at, created_at, updated_at,
+                       claim_token, attempts, next_attempt_at, created_at, updated_at,
                        delivered_at, last_error
                   FROM notification_outbox
-                 WHERE id IN ({}) AND status = 'sending'
+                 WHERE status = 'sending' AND claim_token = ?
                  ORDER BY id
-                """.format(placeholders),
-                item_ids,
+                """,
+                (claim_token,),
             ).fetchall()
         return [self._outbox_item_from_row(row) for row in claimed_rows]
 
-    def mark_outbox_delivered(self, item_id: int, *, delivered_at: Optional[float] = None) -> bool:
-        """Mark a pending item delivered; return whether it changed state."""
+    def mark_outbox_delivered(
+        self,
+        item_id: int,
+        claim_token: str,
+        *,
+        delivered_at: Optional[float] = None,
+    ) -> bool:
+        """Complete the current fenced lease; return whether it still owned the item."""
 
         self._require_initialized()
-        delivered = time.time() if delivered_at is None else float(delivered_at)
+        claim_token = self._claim_token(claim_token)
+        delivered = self._finite_float(time.time() if delivered_at is None else delivered_at, "delivered_at")
         with self._connection(write=True) as connection:
             cursor = connection.execute(
                 """
                 UPDATE notification_outbox
-                   SET status = 'delivered', delivered_at = ?, updated_at = ?, last_error = NULL
-                 WHERE id = ? AND status IN ('pending', 'sending')
+                   SET status = 'delivered',
+                       claim_token = NULL,
+                       delivered_at = ?,
+                       updated_at = ?,
+                       last_error = NULL
+                 WHERE id = ? AND status = 'sending' AND claim_token = ?
                 """,
-                (delivered, delivered, int(item_id)),
+                (delivered, delivered, int(item_id), claim_token),
             )
             return cursor.rowcount == 1
 
     def mark_outbox_failed(
         self,
         item_id: int,
+        claim_token: str,
         attempts: int,
         next_attempt_at: float,
         *,
         error: Optional[str] = None,
     ) -> bool:
-        """Record a failed attempt and schedule the next delivery attempt."""
+        """Fail the current fenced lease and schedule its next delivery attempt."""
 
         self._require_initialized()
+        claim_token = self._claim_token(claim_token)
         attempts = int(attempts)
         if attempts < 1:
             raise ValueError("attempts must be positive")
+        normalized_next_attempt_at = self._finite_float(next_attempt_at, "next_attempt_at")
         now = time.time()
         with self._connection(write=True) as connection:
             cursor = connection.execute(
                 """
                 UPDATE notification_outbox
                    SET status = 'pending',
+                       claim_token = NULL,
                        attempts = MAX(attempts, ?),
                        next_attempt_at = ?,
                        updated_at = ?,
                        last_error = ?
-                 WHERE id = ? AND status IN ('pending', 'sending')
+                 WHERE id = ? AND status = 'sending' AND claim_token = ?
                 """,
                 (
                     attempts,
-                    float(next_attempt_at),
+                    normalized_next_attempt_at,
                     now,
                     None if error is None else str(error)[:4096],
                     int(item_id),
+                    claim_token,
                 ),
             )
             return cursor.rowcount == 1
@@ -579,7 +617,7 @@ class SQLiteStateStore:
             started=bool(started),
             present=bool(present),
             generation=self._generation(generation),
-            updated_at=time.time() if updated_at is None else float(updated_at),
+            updated_at=self._finite_float(time.time() if updated_at is None else updated_at, "updated_at"),
         )
         with self._connection(write=True) as connection:
             self._upsert_snapshot(connection, snapshot)
@@ -641,7 +679,7 @@ class SQLiteStateStore:
             chat_id=int(chat_id),
             torrent_id=torrent_id,
             name=str(name) or "<без названия>",
-            added_at=time.time() if added_at is None else float(added_at),
+            added_at=self._finite_float(time.time() if added_at is None else added_at, "added_at"),
             start_notified=False,
             no_peers_notified=False,
             completion_notified=False,
@@ -779,6 +817,61 @@ class SQLiteStateStore:
     list_enabled_chat_ids = list_enabled_chats
     cancel_pending_for_chat = cancel_pending_outbox
 
+    def _secure_database_file(self) -> None:
+        """Create the main database privately before SQLite can create sidecars."""
+
+        flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(str(self.db_path), flags, 0o600)
+        except FileExistsError:
+            existing_flags = os.O_RDWR
+            if hasattr(os, "O_CLOEXEC"):
+                existing_flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                existing_flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(str(self.db_path), existing_flags)
+            except OSError as exc:
+                raise StateStoreError("SQLite database path must be a writable regular file") from exc
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise StateStoreError("SQLite database path must be a regular file")
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
+    def _secure_sqlite_files(self) -> None:
+        """Keep the database and any persistent WAL sidecars owner-only."""
+
+        paths = (
+            self.db_path,
+            Path("{}-wal".format(self.db_path)),
+            Path("{}-shm".format(self.db_path)),
+            Path("{}-journal".format(self.db_path)),
+        )
+        for path in paths:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(str(path), flags)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise StateStoreError("SQLite state path must be a regular file: {}".format(path)) from exc
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise StateStoreError("SQLite state path must be a regular file: {}".format(path))
+                os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             str(self.db_path),
@@ -788,53 +881,72 @@ class SQLiteStateStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout={}".format(self.busy_timeout_ms))
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA synchronous=FULL")
         return connection
 
     @staticmethod
-    def _migrate_outbox_claim_status(connection: sqlite3.Connection) -> None:
+    def _schema_version(connection: sqlite3.Connection) -> int:
+        row = connection.execute("PRAGMA user_version").fetchone()
+        return 0 if row is None else int(row[0])
+
+    def _reject_future_schema(self, version: int) -> None:
+        if version > self._SCHEMA_VERSION:
+            raise StateStoreError(
+                "SQLite schema version {} is newer than supported version {}".format(version, self._SCHEMA_VERSION)
+            )
+
+    @staticmethod
+    def _execute_schema(connection: sqlite3.Connection) -> None:
+        """Execute the schema statement-by-statement inside the caller's transaction."""
+
+        pending_lines: List[str] = []
+        for line in _SCHEMA.splitlines():
+            pending_lines.append(line)
+            statement = "\n".join(pending_lines).strip()
+            if not statement or not sqlite3.complete_statement(statement):
+                continue
+            connection.execute(statement)
+            pending_lines.clear()
+        if any(line.strip() for line in pending_lines):
+            raise StateStoreError("Internal SQLite schema script is incomplete")
+
+    def _migrate_outbox_to_v3(self, connection: sqlite3.Connection) -> None:
         row = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'notification_outbox'"
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notification_outbox'"
         ).fetchone()
-        if row is None or "'sending'" in str(row["sql"]):
+        unfinished = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'notification_outbox_pre_v3'"
+        ).fetchone()
+        if unfinished is not None:
+            raise StateStoreError("Cannot migrate SQLite outbox: notification_outbox_pre_v3 already exists")
+        if row is None:
             return
 
-        connection.executescript(
+        columns = {
+            str(column["name"]) for column in connection.execute("PRAGMA table_info(notification_outbox)").fetchall()
+        }
+        if "claim_token" in columns:
+            return
+
+        connection.execute("DROP INDEX IF EXISTS notification_outbox_due_idx")
+        connection.execute("DROP INDEX IF EXISTS notification_outbox_chat_idx")
+        connection.execute("DROP INDEX IF EXISTS notification_outbox_claim_idx")
+        connection.execute("ALTER TABLE notification_outbox RENAME TO notification_outbox_pre_v3")
+        self._execute_schema(connection)
+        connection.execute(
             """
-            BEGIN IMMEDIATE;
-            DROP INDEX IF EXISTS notification_outbox_due_idx;
-            DROP INDEX IF EXISTS notification_outbox_chat_idx;
-            ALTER TABLE notification_outbox RENAME TO notification_outbox_v1;
-            CREATE TABLE notification_outbox (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_key TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                text TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'sending', 'delivered', 'cancelled')),
-                attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-                next_attempt_at REAL NOT NULL,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                delivered_at REAL,
-                last_error TEXT,
-                UNIQUE (event_key, chat_id)
-            );
             INSERT INTO notification_outbox
-                (id, event_key, chat_id, kind, text, status, attempts,
+                (id, event_key, chat_id, kind, text, status, claim_token, attempts,
                  next_attempt_at, created_at, updated_at, delivered_at, last_error)
-            SELECT id, event_key, chat_id, kind, text, status, attempts,
+            SELECT id, event_key, chat_id, kind, text,
+                   CASE WHEN status = 'sending' THEN 'pending' ELSE status END,
+                   NULL,
+                   attempts,
                    next_attempt_at, created_at, updated_at, delivered_at, last_error
-              FROM notification_outbox_v1;
-            DROP TABLE notification_outbox_v1;
-            CREATE INDEX notification_outbox_due_idx
-                ON notification_outbox (status, next_attempt_at, id);
-            CREATE INDEX notification_outbox_chat_idx
-                ON notification_outbox (chat_id, status);
-            COMMIT;
-            """
+              FROM notification_outbox_pre_v3
+            """,
         )
+        connection.execute("DROP TABLE notification_outbox_pre_v3")
 
     @contextmanager
     def _connection(self, *, write: bool = False) -> Iterator[sqlite3.Connection]:
@@ -965,6 +1077,9 @@ class SQLiteStateStore:
         self._set_metadata(key, "corrupt:{}".format(corrupt_path.name))
 
     def _move_legacy_file(self, path: Path, suffix: str) -> Path:
+        # Renaming preserves the mode, so tighten it before the source path can
+        # disappear during a crash between the filesystem and metadata steps.
+        path.chmod(0o600)
         target = path.with_name("{}.{}".format(path.name, suffix))
         counter = 1
         while target.exists():
@@ -973,9 +1088,9 @@ class SQLiteStateStore:
         path.rename(target)
         return target
 
-    @staticmethod
-    def _load_json_file(path: Path) -> Any:
-        return json.loads(path.read_text(encoding="utf-8"))
+    @classmethod
+    def _load_json_file(cls, path: Path) -> Any:
+        return cls._load_json_text(path.read_text(encoding="utf-8"))
 
     def _metadata_value(self, key: str) -> Optional[str]:
         with self._connection() as connection:
@@ -1109,6 +1224,22 @@ class SQLiteStateStore:
         return normalized
 
     @staticmethod
+    def _claim_token(value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("claim_token must be a non-empty string")
+        return value.strip()
+
+    @staticmethod
+    def _finite_float(value: Any, field: str) -> float:
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("{} must be a finite number".format(field)) from exc
+        if not isfinite(normalized):
+            raise ValueError("{} must be a finite number".format(field))
+        return normalized
+
+    @staticmethod
     def _generation(value: int) -> int:
         generation = int(value)
         if generation < 0:
@@ -1117,7 +1248,14 @@ class SQLiteStateStore:
 
     @staticmethod
     def _dump_json(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False)
+
+    @staticmethod
+    def _load_json_text(value: str) -> Any:
+        def reject_non_finite(constant: str) -> None:
+            raise ValueError("non-finite JSON number is not allowed: {}".format(constant))
+
+        return json.loads(value, parse_constant=reject_non_finite)
 
     @staticmethod
     def _utc_timestamp() -> str:
@@ -1132,23 +1270,26 @@ class SQLiteStateStore:
             kind=str(row["kind"]),
             text=str(row["text"]),
             status=str(row["status"]),
+            claim_token=None if row["claim_token"] is None else str(row["claim_token"]),
             attempts=int(row["attempts"]),
-            next_attempt_at=float(row["next_attempt_at"]),
-            created_at=float(row["created_at"]),
-            updated_at=float(row["updated_at"]),
-            delivered_at=None if row["delivered_at"] is None else float(row["delivered_at"]),
+            next_attempt_at=cls._finite_float(row["next_attempt_at"], "next_attempt_at"),
+            created_at=cls._finite_float(row["created_at"], "created_at"),
+            updated_at=cls._finite_float(row["updated_at"], "updated_at"),
+            delivered_at=(
+                None if row["delivered_at"] is None else cls._finite_float(row["delivered_at"], "delivered_at")
+            ),
             last_error=None if row["last_error"] is None else str(row["last_error"]),
         )
 
-    @staticmethod
-    def _snapshot_from_row(row: sqlite3.Row) -> Snapshot:
+    @classmethod
+    def _snapshot_from_row(cls, row: sqlite3.Row) -> Snapshot:
         return Snapshot(
             torrent_key=str(row["torrent_key"]),
             completed=bool(row["completed"]),
             started=bool(row["started"]),
             present=bool(row["present"]),
             generation=int(row["generation"]),
-            updated_at=float(row["updated_at"]),
+            updated_at=cls._finite_float(row["updated_at"], "updated_at"),
         )
 
     @classmethod
@@ -1161,7 +1302,7 @@ class SQLiteStateStore:
             started=bool(snapshot.started),
             present=bool(snapshot.present),
             generation=cls._generation(snapshot.generation),
-            updated_at=float(snapshot.updated_at),
+            updated_at=cls._finite_float(snapshot.updated_at, "updated_at"),
         )
 
     @staticmethod
@@ -1188,14 +1329,14 @@ class SQLiteStateStore:
             ),
         )
 
-    @staticmethod
-    def _start_watch_from_row(row: sqlite3.Row) -> StartWatch:
+    @classmethod
+    def _start_watch_from_row(cls, row: sqlite3.Row) -> StartWatch:
         return StartWatch(
             torrent_key=str(row["torrent_key"]),
             chat_id=int(row["chat_id"]),
             torrent_id=int(row["torrent_id"]),
             name=str(row["name"]),
-            added_at=float(row["added_at"]),
+            added_at=cls._finite_float(row["added_at"], "added_at"),
             start_notified=bool(row["start_notified"]),
             no_peers_notified=bool(row["no_peers_notified"]),
             completion_notified=bool(row["completion_notified"]),
@@ -1206,7 +1347,7 @@ class SQLiteStateStore:
         cursor = connection.execute(
             """
             UPDATE notification_outbox
-               SET status = 'cancelled', updated_at = ?
+               SET status = 'cancelled', claim_token = NULL, updated_at = ?
              WHERE chat_id = ? AND status IN ('pending', 'sending')
             """,
             (now, chat_id),

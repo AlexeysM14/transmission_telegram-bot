@@ -9,7 +9,9 @@ on:
       - 'state_store.py'
       - 'transmission3-bot'
       - 'install.sh'
+      - 'requirements.in'
       - 'requirements.txt'
+      - 'requirements-dev.txt'
       - 'pyproject.toml'
       - 'pyrightconfig.json'
       - 'tests/**'
@@ -20,7 +22,9 @@ on:
       - 'state_store.py'
       - 'transmission3-bot'
       - 'install.sh'
+      - 'requirements.in'
       - 'requirements.txt'
+      - 'requirements-dev.txt'
       - 'pyproject.toml'
       - 'pyrightconfig.json'
       - 'tests/**'
@@ -37,27 +41,40 @@ permissions:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.9', '3.11']
+        python-version: ['3.10', '3.12', '3.14']
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.in
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies (smoke)
         run: |
           python -m pip install --upgrade pip
-          pip install --disable-pip-version-check -r requirements.txt
-          pip install --disable-pip-version-check ruff bandit pyright pytest pytest-asyncio
+          python -m pip install --disable-pip-version-check --require-hashes -r requirements.txt
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Verify dependencies
+        run: python -m pip check
+
+      - name: Verify runtime lock file
+        if: matrix.python-version == '3.10'
+        run: |
+          python -m piptools compile --generate-hashes --strip-extras requirements.in
+          git diff --exit-code -- requirements.txt
 
       - name: Syntax check
         run: python -m compileall -q bot.py state_store.py transmission3-bot tests
@@ -68,11 +85,36 @@ jobs:
       - name: Lint
         run: ruff check bot.py state_store.py transmission3-bot tests
 
+      - name: Format
+        run: ruff format --check bot.py state_store.py transmission3-bot tests
+
       - name: Type check
         run: pyright
 
       - name: Unit tests
-        run: pytest -q
+        run: python -m pytest -q
 
       - name: Security scan
         run: bandit -q -r bot.py state_store.py transmission3-bot
+
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: |
+            requirements.in
+            requirements.txt
+
+      - name: Audit runtime dependencies
+        run: |
+          python -m pip install --disable-pip-version-check pip-audit==2.10.1
+          python -m pip_audit --requirement requirements.txt --no-deps --disable-pip

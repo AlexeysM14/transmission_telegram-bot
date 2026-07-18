@@ -1,0 +1,5 @@
+bandit==1.9.4
+pip-tools==7.5.3
+pyright==1.1.410
+pytest==9.1.1
+ruff==0.15.16
