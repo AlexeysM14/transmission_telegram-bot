@@ -360,6 +360,7 @@ mkdir -p "$CONFIG_DIR" "$INSTALL_DIR"
     'TG_TOKEN=trusted-token' \
     'ALLOWED_USER_IDS=12345' \
     'TR_PASS=transmission-secret' \
+    'HYSTERIA2_SOCKS5_PROXY=socks5://127.0.0.1:1080' \
     'HTTP_PROXY=http://attacker.invalid:8080' \
     'SSL_CERT_FILE=/tmp/attacker-ca.pem' \
     'BASH_ENV=/tmp/attacker-script' \
@@ -383,6 +384,7 @@ migrate_configuration_by_copy
 /usr/bin/grep -q '^TG_TOKEN=trusted-token$' "$ENV_FILE"
 /usr/bin/grep -q '^ALLOWED_USER_IDS=12345$' "$ENV_FILE"
 /usr/bin/grep -q '^TR_PASS=transmission-secret$' "$ENV_FILE"
+/usr/bin/grep -q '^HYSTERIA2_SOCKS5_PROXY=socks5://127.0.0.1:1080$' "$ENV_FILE"
 for variable in HTTP_PROXY SSL_CERT_FILE BASH_ENV PATH UNKNOWN_SETTING; do
   ! /usr/bin/grep -q "^${variable}=" "$ENV_FILE"
 done
@@ -452,3 +454,9 @@ def test_release_build_requires_hashes_checks_dependencies_and_removes_packaging
         < remove_pip
         < harden_release
     )
+
+
+def test_bot_service_starts_after_managed_hysteria2_client() -> None:
+    installer = INSTALLER.read_text(encoding="utf-8")
+
+    assert "After=network-online.target ${SERVICE_NAME}-hysteria2.service" in installer

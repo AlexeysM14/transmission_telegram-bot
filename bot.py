@@ -172,6 +172,7 @@ class Config:
     allow_all_users: bool
     tg_proxy: Optional[str] = dataclass_field(repr=False)
     tg_get_updates_proxy: Optional[str] = dataclass_field(repr=False)
+    hysteria2_socks5_proxy: Optional[str] = dataclass_field(repr=False)
 
     tr_url: Optional[str] = dataclass_field(repr=False)
     tr_protocol: TransmissionProtocol
@@ -289,6 +290,24 @@ def _normalize_proxy_url(raw_url: Optional[str], *, env_name: str) -> Optional[s
     return raw_url
 
 
+def _normalize_hysteria2_proxy_url(raw_url: Optional[str]) -> Optional[str]:
+    proxy_url = _normalize_proxy_url(raw_url, env_name="HYSTERIA2_SOCKS5_PROXY")
+    if proxy_url and urlsplit(proxy_url).scheme.lower() not in {"socks5", "socks5h"}:
+        raise RuntimeError("HYSTERIA2_SOCKS5_PROXY must use socks5:// or socks5h://")
+    return proxy_url
+
+
+def _resolve_telegram_proxy_urls(
+    tg_proxy: Optional[str],
+    tg_get_updates_proxy: Optional[str],
+    hysteria2_socks5_proxy: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve explicit Telegram proxies before the Hysteria 2 fallback."""
+    bot_proxy = tg_proxy or hysteria2_socks5_proxy
+    get_updates_proxy = tg_get_updates_proxy or tg_proxy or hysteria2_socks5_proxy
+    return bot_proxy, get_updates_proxy
+
+
 def _validate_transmission_url(raw_url: Optional[str]) -> Optional[str]:
     if not raw_url:
         return None
@@ -363,6 +382,9 @@ def load_config() -> Config:
         os.environ.get("TG_GET_UPDATES_PROXY", "").strip() or None,
         env_name="TG_GET_UPDATES_PROXY",
     )
+    hysteria2_socks5_proxy = _normalize_hysteria2_proxy_url(
+        os.environ.get("HYSTERIA2_SOCKS5_PROXY", "").strip() or None
+    )
     tr_url = _validate_transmission_url(os.environ.get("TR_URL", "").strip() or None)
 
     if tr_url is None:
@@ -393,6 +415,7 @@ def load_config() -> Config:
         allow_all_users=allow_all_users,
         tg_proxy=tg_proxy,
         tg_get_updates_proxy=tg_get_updates_proxy,
+        hysteria2_socks5_proxy=hysteria2_socks5_proxy,
         tr_url=tr_url,
         tr_protocol=tr_protocol,
         tr_host=tr_host,
@@ -880,13 +903,16 @@ def build_telegram_application(
     cfg = get_config()
     builder = ApplicationBuilder().token(cfg.tg_token).post_init(post_init).post_shutdown(post_shutdown)
 
-    tg_proxy = _normalize_proxy_url(cfg.tg_proxy, env_name="TG_PROXY")
-    tg_get_updates_proxy = (
-        _normalize_proxy_url(
-            cfg.tg_get_updates_proxy,
-            env_name="TG_GET_UPDATES_PROXY",
-        )
-        or tg_proxy
+    configured_tg_proxy = _normalize_proxy_url(cfg.tg_proxy, env_name="TG_PROXY")
+    configured_updates_proxy = _normalize_proxy_url(
+        cfg.tg_get_updates_proxy,
+        env_name="TG_GET_UPDATES_PROXY",
+    )
+    hysteria2_proxy = _normalize_hysteria2_proxy_url(cfg.hysteria2_socks5_proxy)
+    tg_proxy, tg_get_updates_proxy = _resolve_telegram_proxy_urls(
+        configured_tg_proxy,
+        configured_updates_proxy,
+        hysteria2_proxy,
     )
 
     if not tg_proxy and not tg_get_updates_proxy:
@@ -898,8 +924,10 @@ def build_telegram_application(
     if tg_get_updates_proxy:
         builder = builder.get_updates_proxy(tg_get_updates_proxy)
 
+    source = "Hysteria 2 SOCKS5 fallback" if hysteria2_proxy and not configured_tg_proxy else "configured proxy"
     log.info(
-        "Telegram proxy enabled (bot=%s, get_updates=%s)",
+        "Telegram proxy enabled via %s (bot=%s, get_updates=%s)",
+        source,
         _mask_proxy_url(tg_proxy),
         _mask_proxy_url(tg_get_updates_proxy),
     )

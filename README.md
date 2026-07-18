@@ -52,10 +52,12 @@ transmission3-bot status
 - `10` — отключить отдельный прокси для `getUpdates` (удалить `TG_GET_UPDATES_PROXY`);
 - `11` — разрешить доступ всем приватным чатам (`ALLOW_ALL_USERS=1`);
 - `12` — снова отключить доступ всем приватным чатам (удалить `ALLOW_ALL_USERS`).
+- `13` — вставить профиль `hysteria2://`, `hy2://` или `hysteria2+realm://` и настроить локальный клиент;
+- `14` — остановить Hysteria 2 и удалить сохранённый профиль.
 
 Команда `transmission3-bot status` дополнительно показывает:
 - активен ли systemd-сервис `transmission3-bot`;
-- настроены ли `ALLOWED_USER_IDS`, `ALLOW_ALL_USERS`, `TG_PROXY` и `TG_GET_UPDATES_PROXY`;
+- настроены ли `ALLOWED_USER_IDS`, `ALLOW_ALL_USERS`, `TG_PROXY`, `TG_GET_UPDATES_PROXY` и `HYSTERIA2_SOCKS5_PROXY`;
 - доступен ли Telegram Bot API через указанный прокси;
 - доступен ли Transmission RPC и сколько сейчас активных/остановленных торрентов;
 - где находится файл логов и когда он обновлялся в последний раз.
@@ -107,15 +109,51 @@ export ALLOWED_USER_IDS="<your-telegram-user-id>"
 export TG_PROXY="http://proxy-login:proxy-password@127.0.0.1:8080"
 # optional: separate proxy only for getUpdates long polling
 # export TG_GET_UPDATES_PROXY="socks5://proxy-login:proxy-password@127.0.0.1:1080"
+# optional: Hysteria 2 SOCKS5 fallback, used when the proxies above are absent
+# export HYSTERIA2_SOCKS5_PROXY="socks5://127.0.0.1:1080"
 export BOT_TIMEZONE="Europe/Moscow"
 python bot.py
 ```
 
-Если `TG_PROXY` и `TG_GET_UPDATES_PROXY` не заданы, бот работает как раньше — напрямую, без прокси.
+Если настройки Telegram-прокси и Hysteria 2 не заданы, бот работает как раньше — напрямую.
 
 Для SOCKS-прокси зависимость уже включена в `requirements.txt`, поэтому достаточно указать URL вида `socks5://host:port`.
 Если у прокси требуется авторизация, добавьте логин и пароль прямо в URL, например: `http://login:password@host:port` или `socks5://login:password@host:port`.
 `mtproto://` не поддерживается: MTProto-прокси работают в Telegram-клиентах, а бот использует Telegram Bot API (HTTP/SOCKS-прокси).
+
+### Добавление профиля Hysteria 2
+
+Дополнительные Python-пакеты не нужны: поддержка SOCKS5 уже включена в зависимости бота. Нужен отдельный
+официальный исполняемый файл `hysteria`, содержащий клиент Hysteria 2. Установите его по
+[официальной инструкции](https://v2.hysteria.network/docs/getting-started/Installation/) так, чтобы он находился
+в `/usr/local/bin/hysteria` или `/usr/bin/hysteria`.
+
+После установки бинарника откройте меню:
+
+```bash
+transmission3-bot update
+```
+
+Выберите пункт `13` и вставьте полученный профиль целиком, например:
+
+```text
+hysteria2://password@example.com:443/?sni=example.com
+```
+
+CLI проверит формат ссылки, сохранит её в `/etc/transmission3-bot/hysteria2-client.json` с ограниченными
+правами, создаст и включит `transmission3-bot-hysteria2.service`. Клиент поднимет SOCKS5 на
+`127.0.0.1:1080`, а в окружение бота автоматически будет добавлено
+`HYSTERIA2_SOCKS5_PROXY=socks5://127.0.0.1:1080`. Сам профиль в `.env` не записывается и в выводе CLI
+не показывается. Если бот уже запущен, CLI перезапустит его для немедленного применения нового транспорта.
+
+Приоритет подключения для обычных запросов: `TG_PROXY` → `HYSTERIA2_SOCKS5_PROXY` → прямое соединение.
+Для long polling: `TG_GET_UPDATES_PROXY` → `TG_PROXY` → `HYSTERIA2_SOCKS5_PROXY` → прямое соединение.
+Таким образом, настроенный обычный прокси всегда имеет приоритет, а Hysteria 2 используется только как fallback.
+Проверить локальный порт и доступ к Telegram через него можно командой `transmission3-bot status`.
+
+Пункт `14` останавливает и отключает созданный клиентский сервис, удаляет конфиг с профилем и убирает
+fallback из окружения. Ручной режим через `HYSTERIA2_SOCKS5_PROXY` по-прежнему поддерживается, если клиент
+Hysteria или Xray управляется отдельно.
 
 ## Возможности Telegram-бота
 
@@ -165,7 +203,8 @@ unset TG_TOKEN
 - `ALLOWED_USER_IDS` — список Telegram user id через запятую. По умолчанию доступ закрыт, пока не указан хотя бы один id.
 - `ALLOW_ALL_USERS` — **небезопасный режим** для личных/тестовых установок: `1`, `true`, `yes` или `on` разрешает доступ любому приватному чату, если `ALLOWED_USER_IDS` пустой.
 - `TG_PROXY` — **опционально**: прокси для всех запросов Telegram Bot API, например `http://127.0.0.1:8080`, `socks5://127.0.0.1:1080` или `http://login:password@127.0.0.1:8080`.
-- `TG_GET_UPDATES_PROXY` — **опционально**: отдельный прокси только для long polling (`getUpdates`); если не указан, используется `TG_PROXY`, а если и он не задан — бот работает без прокси. Формат тот же, включая вариант с `login:password@`.
+- `TG_GET_UPDATES_PROXY` — **опционально**: отдельный прокси только для long polling (`getUpdates`); если не указан, используется `TG_PROXY`, затем fallback Hysteria 2, а без них — прямое подключение. Формат тот же, включая вариант с `login:password@`.
+- `HYSTERIA2_SOCKS5_PROXY` — **опционально**: URL локального SOCKS5-порта клиента Hysteria 2, например `socks5://127.0.0.1:1080`. Пункт меню `13` задаёт переменную автоматически; вручную она нужна только при внешнем управлении клиентом. Используется как fallback, когда соответствующий `TG_PROXY` не задан; поддерживаются только `socks5://` и `socks5h://`.
 - `TR_URL` — полный URL подключения к Transmission RPC в явном виде, например: `http://127.0.0.1:9091/transmission/rpc` (если указан, перекрывает host/port/path).
 - `TR_PROTOCOL` — `http` или `https` (по умолчанию `http`).
 - `TR_HOST` — хост Transmission (по умолчанию `127.0.0.1`).

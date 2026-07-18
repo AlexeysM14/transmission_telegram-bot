@@ -24,6 +24,7 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 SERVICE_NAME = "transmission3-bot"
+HYSTERIA2_SERVICE_NAME = f"{SERVICE_NAME}-hysteria2"
 INSTALL_CONFIG_FILE = Path(f"/etc/{SERVICE_NAME}/install.conf")
 DEFAULT_REPO_URL = "https://github.com/AlexeysM14/transmission_telegram-bot.git"
 DEFAULT_CLI_IMPL_PATH = Path(f"/usr/local/libexec/{SERVICE_NAME}")
@@ -90,6 +91,10 @@ REPO_URL = INSTALL_SETTINGS.get("REPO_URL", DEFAULT_REPO_URL)
 CLI_IMPL_PATH = Path(INSTALL_SETTINGS.get("CLI_IMPL_PATH", DEFAULT_CLI_IMPL_PATH))
 SERVICE_USER = INSTALL_SETTINGS.get("SERVICE_USER", os.environ.get("SERVICE_USER", SERVICE_NAME))
 SERVICE_GROUP = INSTALL_SETTINGS.get("SERVICE_GROUP", os.environ.get("SERVICE_GROUP", SERVICE_USER))
+HYSTERIA2_CONFIG_FILE = Path(f"/etc/{SERVICE_NAME}/hysteria2-client.json")
+HYSTERIA2_UNIT_FILE = Path(f"/etc/systemd/system/{HYSTERIA2_SERVICE_NAME}.service")
+HYSTERIA2_SOCKS5_LISTEN = "127.0.0.1:1080"
+HYSTERIA2_SOCKS5_PROXY = f"socks5://{HYSTERIA2_SOCKS5_LISTEN}"
 
 
 def sanitized_subprocess_env() -> dict[str, str]:
@@ -421,6 +426,163 @@ def normalize_proxy_url_or_raise(raw_url: str, *, env_name: str) -> str:
     return value
 
 
+def normalize_hysteria2_proxy_url_or_raise(raw_url: str) -> str:
+    value = normalize_proxy_url_or_raise(raw_url, env_name="HYSTERIA2_SOCKS5_PROXY")
+    if urlsplit(value).scheme.lower() not in SOCKS_PROXY_SCHEMES:
+        raise ValueError("HYSTERIA2_SOCKS5_PROXY must use socks5:// or socks5h://")
+    return value
+
+
+def normalize_hysteria2_profile_uri_or_raise(raw_uri: str) -> str:
+    value = raw_uri.strip()
+    if not value or len(value) > 8192 or any(character.isspace() for character in value):
+        raise ValueError("Invalid Hysteria 2 profile URI")
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("Invalid Hysteria 2 profile URI") from exc
+    if parts.scheme.lower() not in {"hy2", "hysteria2", "hysteria2+realm"} or not parts.netloc or not hostname:
+        raise ValueError("Profile must use hysteria2://, hy2:// or hysteria2+realm://")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid Hysteria 2 profile URI")
+    return value
+
+
+def find_hysteria2_executable() -> Path:
+    for candidate in (Path("/usr/local/bin/hysteria"), Path("/usr/bin/hysteria")):
+        if not candidate.exists():
+            continue
+        assert_secure_regular_file(candidate, label="Hysteria 2 executable")
+        if not os.access(candidate, os.X_OK):
+            raise RuntimeError(f"Hysteria 2 executable is not executable: {candidate}")
+        return candidate.resolve(strict=True)
+    raise RuntimeError(
+        "Hysteria 2 executable is not installed. Install the official 'hysteria' binary first, then retry."
+    )
+
+
+def atomic_write_service_file(path: Path, payload: str, *, mode: int, gid: int) -> None:
+    assert_secure_directory(path.parent, label=f"parent directory for {path.name}")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as temp_file:
+            temp_file.write(payload)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.chown(temp_path, 0, gid)
+        os.chmod(temp_path, mode)
+        os.replace(temp_path, path)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            temp_path.unlink()
+        raise
+
+
+def write_hysteria2_client_config(profile_uri: str) -> None:
+    try:
+        gid = grp.getgrnam(SERVICE_GROUP).gr_gid
+    except KeyError as exc:
+        raise RuntimeError(f"Service group does not exist: {SERVICE_GROUP}") from exc
+    config = {
+        "server": normalize_hysteria2_profile_uri_or_raise(profile_uri),
+        "lazy": True,
+        "socks5": {"listen": HYSTERIA2_SOCKS5_LISTEN},
+    }
+    atomic_write_service_file(
+        HYSTERIA2_CONFIG_FILE,
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        mode=0o640,
+        gid=gid,
+    )
+
+
+def write_hysteria2_unit(executable: Path) -> None:
+    for identity_name, identity in (("SERVICE_USER", SERVICE_USER), ("SERVICE_GROUP", SERVICE_GROUP)):
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*\$?", identity) is None:
+            raise RuntimeError(f"{identity_name} is not valid for a systemd unit")
+    unit = f"""[Unit]
+Description=Hysteria 2 client for Transmission Telegram Bot
+Wants=network-online.target
+After=network-online.target
+Before={SERVICE_NAME}.service
+
+[Service]
+Type=simple
+User={SERVICE_USER}
+Group={SERVICE_GROUP}
+Environment=HYSTERIA_LOG_LEVEL=warn
+Environment=HYSTERIA_DISABLE_UPDATE_CHECK=1
+ExecStart={executable} client -c {HYSTERIA2_CONFIG_FILE}
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+"""
+    atomic_write_service_file(HYSTERIA2_UNIT_FILE, unit, mode=0o644, gid=0)
+
+
+def configure_hysteria2_profile(profile_uri: str) -> None:
+    require_root_for_update()
+    executable = find_hysteria2_executable()
+    normalized_profile = normalize_hysteria2_profile_uri_or_raise(profile_uri)
+    write_hysteria2_client_config(normalized_profile)
+    write_hysteria2_unit(executable)
+
+    data = load_env()
+    data["HYSTERIA2_SOCKS5_PROXY"] = HYSTERIA2_SOCKS5_PROXY
+    save_env(data)
+
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", HYSTERIA2_SERVICE_NAME])
+    run(["systemctl", "restart", HYSTERIA2_SERVICE_NAME])
+    run(["systemctl", "try-restart", SERVICE_NAME])
+    print(f"✅ Hysteria 2 profile configured; local SOCKS5: {HYSTERIA2_SOCKS5_PROXY}")
+
+
+def disable_hysteria2_profile() -> None:
+    require_root_for_update()
+    if HYSTERIA2_UNIT_FILE.exists():
+        run(["systemctl", "disable", "--now", HYSTERIA2_SERVICE_NAME], check=False)
+
+    data = load_env()
+    data.pop("HYSTERIA2_SOCKS5_PROXY", None)
+    save_env(data)
+
+    for path in (HYSTERIA2_CONFIG_FILE, HYSTERIA2_UNIT_FILE):
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "try-restart", SERVICE_NAME])
+    print("✅ Hysteria 2 client disabled and its saved profile removed.")
+
+
+def resolve_telegram_proxy_urls(
+    tg_proxy: Optional[str],
+    tg_get_updates_proxy: Optional[str],
+    hysteria2_socks5_proxy: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    return (
+        tg_proxy or hysteria2_socks5_proxy,
+        tg_get_updates_proxy or tg_proxy or hysteria2_socks5_proxy,
+    )
+
+
 def unset_env_key(key: str) -> None:
     data = load_env()
     if key in data:
@@ -691,7 +853,18 @@ def print_status() -> int:  # noqa: C901
     allow_all_users = parse_bool_value(env.get("ALLOW_ALL_USERS"))
     tg_proxy = env.get("TG_PROXY", "").strip() or None
     tg_updates_proxy = env.get("TG_GET_UPDATES_PROXY", "").strip() or None
-    effective_updates_proxy = tg_updates_proxy or tg_proxy
+    hysteria2_proxy_raw = env.get("HYSTERIA2_SOCKS5_PROXY", "").strip() or None
+    hysteria2_error: Optional[str] = None
+    try:
+        hysteria2_proxy = normalize_hysteria2_proxy_url_or_raise(hysteria2_proxy_raw) if hysteria2_proxy_raw else None
+    except ValueError as exc:
+        hysteria2_proxy = None
+        hysteria2_error = str(exc)
+    effective_bot_proxy, effective_updates_proxy = resolve_telegram_proxy_urls(
+        tg_proxy,
+        tg_updates_proxy,
+        hysteria2_proxy,
+    )
     log_file = get_log_file_path()
     venv_python = ROOT / ".venv" / "bin" / "python"
 
@@ -711,6 +884,9 @@ def print_status() -> int:  # noqa: C901
     print(f"ALLOW_ALL_USERS: {format_bool(allow_all_users)}")
     print(f"TG_PROXY: {mask_proxy_url(tg_proxy)}")
     print(f"TG_GET_UPDATES_PROXY: {mask_proxy_url(tg_updates_proxy)}")
+    print(f"HYSTERIA2_SOCKS5_PROXY: {mask_proxy_url(hysteria2_proxy_raw)}")
+    print(f"Hysteria 2 profile configured: {format_bool(HYSTERIA2_CONFIG_FILE.exists())}")
+    print(f"effective bot proxy: {mask_proxy_url(effective_bot_proxy)}")
     print(f"effective getUpdates proxy: {mask_proxy_url(effective_updates_proxy)}")
     print(f"Transmission RPC URL: {mask_proxy_url(build_transmission_url(env))}")
     print(f"TR_TIMEOUT: {timeout:g}s")
@@ -726,6 +902,17 @@ def print_status() -> int:  # noqa: C901
         print(f"{field}: {value}")
         if code != 0 and field == "active":
             service_ok = False
+
+    if HYSTERIA2_CONFIG_FILE.exists():
+        for field, command in (
+            ("Hysteria 2 active", ["systemctl", "is-active", HYSTERIA2_SERVICE_NAME]),
+            ("Hysteria 2 enabled", ["systemctl", "is-enabled", HYSTERIA2_SERVICE_NAME]),
+        ):
+            code, out, err = run_capture(command)
+            value = out or err or f"exit {code}"
+            print(f"{field}: {value}")
+            if code != 0 and field == "Hysteria 2 active":
+                service_ok = False
 
     code, out, err = run_capture(
         [
@@ -746,6 +933,10 @@ def print_status() -> int:  # noqa: C901
     print("\n[checks]")
     overall_ok = service_ok
 
+    if hysteria2_error:
+        print(f"Hysteria 2 configuration: error: {hysteria2_error}")
+        overall_ok = False
+
     tr_ok, tr_message = check_transmission_rpc(env)
     print(f"Transmission RPC: {tr_message}")
     overall_ok = overall_ok and tr_ok
@@ -755,24 +946,36 @@ def print_status() -> int:  # noqa: C901
         print(f"Proxy socket: {tcp_message}")
         overall_ok = overall_ok and tcp_ok
     else:
-        print("Proxy socket: TG_PROXY not configured (direct connection)")
+        print("Proxy socket: TG_PROXY not configured")
 
     if tg_updates_proxy and tg_updates_proxy != tg_proxy:
         upd_tcp_ok, upd_tcp_message = check_tcp_target(tg_updates_proxy, timeout=timeout, label="TG_GET_UPDATES_PROXY")
         print(f"Updates proxy socket: {upd_tcp_message}")
         overall_ok = overall_ok and upd_tcp_ok
 
+    if hysteria2_proxy and hysteria2_proxy not in {tg_proxy, tg_updates_proxy}:
+        hy2_tcp_ok, hy2_tcp_message = check_tcp_target(
+            hysteria2_proxy,
+            timeout=timeout,
+            label="Hysteria 2 SOCKS5",
+        )
+        print(f"Hysteria 2 socket: {hy2_tcp_message}")
+        overall_ok = overall_ok and hy2_tcp_ok
+
+    if not effective_bot_proxy and not effective_updates_proxy:
+        print("Telegram transport: direct connection")
+
     if tg_token:
         bot_ok, bot_message = check_telegram_api(
             tg_token,
-            proxy_url=tg_proxy,
+            proxy_url=effective_bot_proxy,
             timeout=timeout,
             label="Telegram Bot API",
         )
         print(bot_message)
         overall_ok = overall_ok and bot_ok
 
-        if effective_updates_proxy != tg_proxy:
+        if effective_updates_proxy != effective_bot_proxy:
             upd_ok, upd_message = check_telegram_api(
                 tg_token,
                 proxy_url=effective_updates_proxy,
@@ -805,6 +1008,8 @@ def menu() -> None:  # noqa: C901
             "10) Disable Telegram getUpdates proxy override (remove TG_GET_UPDATES_PROXY)\n"
             "11) Allow every private Telegram user (set ALLOW_ALL_USERS=1)\n"
             "12) Disable allow-all access (remove ALLOW_ALL_USERS)\n"
+            "13) Add Hysteria 2 profile URI and configure the local client\n"
+            "14) Disable Hysteria 2 and remove its saved profile\n"
             "0) Exit\n"
         )
 
@@ -876,6 +1081,16 @@ def menu() -> None:  # noqa: C901
                 save_env(data)
             elif choice == "12":
                 unset_env_key("ALLOW_ALL_USERS")
+            elif choice == "13":
+                value = getpass.getpass(
+                    "Paste Hysteria 2 profile (hysteria2://, hy2:// or hysteria2+realm://): "
+                ).strip()
+                if not value:
+                    print("⚠️ Empty profile, nothing changed")
+                else:
+                    configure_hysteria2_profile(value)
+            elif choice == "14":
+                disable_hysteria2_profile()
             elif choice == "0":
                 print("Bye")
                 return

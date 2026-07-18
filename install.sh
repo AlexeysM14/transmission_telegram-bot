@@ -485,7 +485,7 @@ backup_transaction_files() {
 
 is_allowed_app_environment_key() {
   case "$1" in
-    TG_TOKEN|ALLOWED_USER_IDS|ALLOW_ALL_USERS|TG_PROXY|TG_GET_UPDATES_PROXY)
+    TG_TOKEN|ALLOWED_USER_IDS|ALLOW_ALL_USERS|TG_PROXY|TG_GET_UPDATES_PROXY|HYSTERIA2_SOCKS5_PROXY)
       return 0
       ;;
     TR_URL|TR_PROTOCOL|TR_HOST|TR_PORT|TR_PATH|TR_USER|TR_PASS|TR_TIMEOUT)
@@ -618,7 +618,7 @@ prepare_unit_file() {
 [Unit]
 Description=Transmission Telegram Bot
 Wants=network-online.target
-After=network-online.target
+After=network-online.target ${SERVICE_NAME}-hysteria2.service
 
 [Service]
 Type=simple

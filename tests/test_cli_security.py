@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import math
+import os
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -175,3 +177,103 @@ def test_socks_proxy_uses_venv_health_check(
 
     assert result == (True, "Telegram: ok")
     assert calls == [("socks5://127.0.0.1:1080", 3.0, "Telegram")]
+
+
+def test_hysteria2_proxy_validation_and_fallback_precedence(cli: ModuleType) -> None:
+    hysteria2 = "socks5://127.0.0.1:1080"
+
+    assert cli.normalize_hysteria2_proxy_url_or_raise(hysteria2) == hysteria2  # type: ignore[attr-defined]
+    with pytest.raises(ValueError, match="must use socks5"):
+        cli.normalize_hysteria2_proxy_url_or_raise("http://127.0.0.1:8080")  # type: ignore[attr-defined]
+
+    assert cli.resolve_telegram_proxy_urls(None, None, hysteria2) == (hysteria2, hysteria2)  # type: ignore[attr-defined]
+    assert cli.resolve_telegram_proxy_urls("http://proxy:8080", None, hysteria2) == (  # type: ignore[attr-defined]
+        "http://proxy:8080",
+        "http://proxy:8080",
+    )
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "hysteria2://password@example.com:443/?sni=example.com",
+        "hy2://password@example.com/",
+        "hysteria2+realm://token@realm.example/cabin?auth=password",
+    ],
+)
+def test_hysteria2_profile_validation_accepts_official_uri_schemes(cli: ModuleType, profile: str) -> None:
+    assert cli.normalize_hysteria2_profile_uri_or_raise(profile) == profile  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "https://example.com/profile",
+        "hysteria2://",
+        "hysteria2://password@host name:443/",
+        "hysteria2://password@example.com:99999/",
+    ],
+)
+def test_hysteria2_profile_validation_rejects_invalid_uris(cli: ModuleType, profile: str) -> None:
+    with pytest.raises(ValueError, match="profile|Profile"):
+        cli.normalize_hysteria2_profile_uri_or_raise(profile)  # type: ignore[attr-defined]
+
+
+def test_invalid_hysteria2_profile_error_does_not_disclose_secret(cli: ModuleType) -> None:
+    secret = "unique-profile-password"
+
+    with pytest.raises(ValueError) as exc_info:
+        cli.normalize_hysteria2_profile_uri_or_raise(  # type: ignore[attr-defined]
+            f"hysteria2://{secret}@host name:443/"
+        )
+
+    assert secret not in str(exc_info.value)
+
+
+def test_hysteria2_profile_is_written_to_private_json_config(
+    cli: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    profile = "hysteria2://secret@example.com:443/?sni=example.com"
+    config_path = tmp_path / "hysteria2-client.json"
+    monkeypatch.setattr(cli, "HYSTERIA2_CONFIG_FILE", config_path)
+    monkeypatch.setattr(cli, "assert_secure_directory", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli.os, "chown", lambda *args, **kwargs: None)  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli.grp, "getgrnam", lambda _: SimpleNamespace(gr_gid=os.getgid()))  # type: ignore[attr-defined]
+
+    cli.write_hysteria2_client_config(profile)  # type: ignore[attr-defined]
+
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload == {
+        "server": profile,
+        "lazy": True,
+        "socks5": {"listen": "127.0.0.1:1080"},
+    }
+    assert config_path.stat().st_mode & 0o777 == 0o640
+
+
+def test_configure_hysteria2_keeps_profile_out_of_environment_and_restarts_services(
+    cli: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = "hysteria2://secret@example.com:443/"
+    saved_env: dict[str, str] = {}
+    written_profiles: list[str] = []
+    commands: list[list[str]] = []
+    monkeypatch.setattr(cli, "require_root_for_update", lambda: None)
+    monkeypatch.setattr(cli, "find_hysteria2_executable", lambda: Path("/usr/local/bin/hysteria"))
+    monkeypatch.setattr(cli, "write_hysteria2_client_config", written_profiles.append)
+    monkeypatch.setattr(cli, "write_hysteria2_unit", lambda _: None)
+    monkeypatch.setattr(cli, "load_env", lambda: {"TG_TOKEN": "telegram-token"})
+    monkeypatch.setattr(cli, "save_env", lambda values: saved_env.update(values))
+    monkeypatch.setattr(cli, "run", lambda command, **kwargs: commands.append(command) or 0)
+
+    cli.configure_hysteria2_profile(profile)  # type: ignore[attr-defined]
+
+    assert written_profiles == [profile]
+    assert profile not in saved_env.values()
+    assert saved_env["HYSTERIA2_SOCKS5_PROXY"] == "socks5://127.0.0.1:1080"
+    assert ["systemctl", "enable", "transmission3-bot-hysteria2"] in commands
+    assert ["systemctl", "restart", "transmission3-bot-hysteria2"] in commands
+    assert ["systemctl", "try-restart", "transmission3-bot"] in commands

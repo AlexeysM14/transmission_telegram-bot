@@ -63,6 +63,26 @@ def test_proxy_url_masking_is_fail_safe_and_removes_secrets() -> None:
     assert "hidden" not in masked
 
 
+def test_hysteria2_fallback_accepts_only_socks5() -> None:
+    assert bot._normalize_hysteria2_proxy_url("socks5://127.0.0.1:1080") == "socks5://127.0.0.1:1080"
+    with pytest.raises(RuntimeError, match="must use socks5"):
+        bot._normalize_hysteria2_proxy_url("http://127.0.0.1:8080")
+
+
+def test_hysteria2_is_used_only_when_explicit_telegram_proxy_is_missing() -> None:
+    hysteria2 = "socks5://127.0.0.1:1080"
+
+    assert bot._resolve_telegram_proxy_urls(None, None, hysteria2) == (hysteria2, hysteria2)
+    assert bot._resolve_telegram_proxy_urls("http://proxy:8080", None, hysteria2) == (
+        "http://proxy:8080",
+        "http://proxy:8080",
+    )
+    assert bot._resolve_telegram_proxy_urls(None, "socks5://updates:1081", hysteria2) == (
+        hysteria2,
+        "socks5://updates:1081",
+    )
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -83,6 +103,7 @@ def test_load_config_validates_transmission_host_path_and_timeout(monkeypatch: p
     for name in (
         "TG_PROXY",
         "TG_GET_UPDATES_PROXY",
+        "HYSTERIA2_SOCKS5_PROXY",
         "TR_URL",
         "TR_PROTOCOL",
         "TR_PORT",
@@ -110,14 +131,17 @@ def test_load_config_validates_transmission_host_path_and_timeout(monkeypatch: p
         bot.load_config()
 
     monkeypatch.setenv("TR_TIMEOUT", "5.5")
+    monkeypatch.setenv("HYSTERIA2_SOCKS5_PROXY", "socks5://127.0.0.1:1080")
     config = bot.load_config()
     assert math.isclose(config.tr_timeout, 5.5)
+    assert config.hysteria2_socks5_proxy == "socks5://127.0.0.1:1080"
 
 
 def test_transmission_url_ignores_stale_fallback_endpoint_values(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "TG_PROXY",
         "TG_GET_UPDATES_PROXY",
+        "HYSTERIA2_SOCKS5_PROXY",
         "TR_TIMEOUT",
         "LIST_LIMIT",
         "ALLOWED_USER_IDS",
