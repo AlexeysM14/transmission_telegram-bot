@@ -1978,7 +1978,7 @@ def _build_traffic_chart_last_7_days(
     down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
     up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
 
-    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
+    fig, ax = plt.subplots(figsize=(9.4, 5.2), dpi=130)
     try:
         _draw_traffic_chart(
             ax=ax,
@@ -2069,7 +2069,7 @@ def _build_traffic_chart_current_month(
 
     month_title = f"{_month_name_ru(now.month)} {now.year}"
 
-    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=120)
+    fig, ax = plt.subplots(figsize=(9.4, 5.2), dpi=130)
     try:
         _draw_traffic_chart(
             ax=ax,
@@ -2148,6 +2148,53 @@ def _format_chart_value(value: float) -> str:
     return f"{value:.2f}"
 
 
+def _format_chart_total(value: float) -> str:
+    if value >= 1024:
+        return f"{value / 1024:.1f} TiB"
+    return f"{_format_chart_value(value)} GiB"
+
+
+def _add_chart_summary_cards(
+    ax: Any,
+    *,
+    down_total: float,
+    up_total: float,
+    down_color: str,
+    up_color: str,
+) -> None:
+    card_style = {
+        "boxstyle": "round,pad=0.42,rounding_size=0.12",
+        "facecolor": "#FFFFFF",
+        "edgecolor": "#E2E8F0",
+        "linewidth": 1.0,
+        "alpha": 0.96,
+    }
+    ax.text(
+        0.02,
+        0.96,
+        f"⇣ {_format_chart_total(down_total)}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        color=down_color,
+        fontsize=10,
+        weight="bold",
+        bbox=card_style,
+    )
+    ax.text(
+        0.25,
+        0.96,
+        f"⇡ {_format_chart_total(up_total)}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        color=up_color,
+        fontsize=10,
+        weight="bold",
+        bbox=card_style,
+    )
+
+
 def _annotate_latest_chart_value(
     ax: Any,
     *,
@@ -2187,9 +2234,9 @@ def _draw_traffic_chart(
     annotate_last_points: int = 1,
 ) -> None:
     down_color = "#2563EB"
-    up_color = "#F97316"
-    grid_color = "#CBD5E1"
-    text_color = "#111827"
+    up_color = "#EA580C"
+    grid_color = "#D8E0EA"
+    text_color = "#0F172A"
     muted_text_color = "#64748B"
     y_max = max([*down_values, *up_values, 0.0])
     minor_threshold = max(0.05, y_max * 0.025)
@@ -2197,16 +2244,23 @@ def _draw_traffic_chart(
     up_is_minor = max(up_values or [0.0]) <= minor_threshold
 
     ax.set_facecolor("#F8FAFC")
-    ax.figure.set_facecolor("#FFFFFF")
+    ax.figure.set_facecolor("#F1F5F9")
     ax.set_axisbelow(True)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
-    ax.spines["left"].set_color("#D1D5DB")
-    ax.spines["bottom"].set_color("#D1D5DB")
+    ax.spines["left"].set_color("#CBD5E1")
+    ax.spines["bottom"].set_color("#CBD5E1")
 
     x_values = [float(idx) for idx in range(len(labels))]
     smooth_down_x, smooth_down_y = _smooth_chart_points(x_values, down_values)
     smooth_up_x, smooth_up_y = _smooth_chart_points(x_values, up_values)
+    _add_chart_summary_cards(
+        ax,
+        down_total=sum(down_values),
+        up_total=sum(up_values),
+        down_color=down_color,
+        up_color=up_color,
+    )
 
     ax.fill_between(
         smooth_down_x,
@@ -2229,6 +2283,7 @@ def _draw_traffic_chart(
         alpha=0.42 if down_is_minor else 1.0,
         solid_capstyle="round",
         label="Скачано",
+        zorder=4,
     )
     ax.plot(
         smooth_up_x,
@@ -2238,27 +2293,28 @@ def _draw_traffic_chart(
         alpha=0.42 if up_is_minor else 1.0,
         solid_capstyle="round",
         label="Отдано",
+        zorder=4,
     )
 
     ax.scatter(
         x_values,
         down_values,
-        s=26 if down_is_minor else 38,
+        s=34 if down_is_minor else 52,
         color=down_color,
         alpha=0.46 if down_is_minor else 1.0,
         edgecolor="white",
-        linewidth=1.0,
-        zorder=3,
+        linewidth=1.4,
+        zorder=5,
     )
     ax.scatter(
         x_values,
         up_values,
-        s=26 if up_is_minor else 38,
+        s=34 if up_is_minor else 52,
         color=up_color,
         alpha=0.46 if up_is_minor else 1.0,
         edgecolor="white",
-        linewidth=1.0,
-        zorder=3,
+        linewidth=1.4,
+        zorder=5,
     )
 
     if labels and annotate_last_points > 0:
@@ -2280,7 +2336,7 @@ def _draw_traffic_chart(
                 y_max=max(1.0, y_max),
             )
 
-    ax.set_title(title, fontsize=14, weight="bold", color=text_color, pad=14, loc="left")
+    ax.set_title(title, fontsize=15, weight="bold", color=text_color, pad=18, loc="left")
     ax.set_ylabel(y_label, color=muted_text_color)
 
     tick_step = max(1, (len(labels) + 15) // 16)
@@ -2292,12 +2348,14 @@ def _draw_traffic_chart(
 
     ax.set_ylim(bottom=0, top=max(1.0, y_max * 1.12))
     ax.margins(x=0.035)
-    ax.tick_params(axis="x", rotation=0, labelsize=9, colors=muted_text_color)
+    ax.tick_params(axis="x", rotation=0, labelsize=9, colors=muted_text_color, pad=6)
     ax.tick_params(axis="y", labelsize=9, colors=muted_text_color)
-    ax.grid(True, axis="y", linestyle="-", linewidth=0.8, alpha=0.55, color=grid_color)
+    ax.grid(True, axis="y", linestyle="-", linewidth=0.9, alpha=0.72, color=grid_color)
     ax.grid(False, axis="x")
     ax.legend(
-        loc="upper right",
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=2,
         frameon=True,
         facecolor="white",
         edgecolor="#E5E7EB",
