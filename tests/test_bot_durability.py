@@ -80,6 +80,12 @@ def test_tr_call_serializes_concurrent_rpc_calls(monkeypatch) -> None:
     assert peak_active == 1
 
 
+def test_chart_total_formatter_uses_readable_units() -> None:
+    assert bot._format_chart_total(0) == "0.00 GiB"
+    assert bot._format_chart_total(12.345) == "12.3 GiB"
+    assert bot._format_chart_total(1536) == "1.5 TiB"
+
+
 def test_async_state_locks_are_created_lazily_inside_the_running_loop(monkeypatch) -> None:
     monkeypatch.setattr(bot, "TRAFFIC_STATE_LOCK", None)
     monkeypatch.setattr(bot, "TORRENT_HISTORY_LOCK", None)
