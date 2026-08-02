@@ -230,6 +230,80 @@ def test_invalid_hysteria2_profile_error_does_not_disclose_secret(cli: ModuleTyp
     assert secret not in str(exc_info.value)
 
 
+def test_hysteria2_subscription_accepts_plain_and_base64_profiles(cli: ModuleType) -> None:
+    profile = "hysteria2://secret@example.com:443/?sni=example.com"
+
+    assert cli.extract_hysteria2_profile_from_subscription((profile + "\n").encode()) == profile  # type: ignore[attr-defined]
+    encoded = cli.base64.urlsafe_b64encode(("# ignored\n" + profile + "\n").encode()).rstrip(b"=")  # type: ignore[attr-defined]
+    assert cli.extract_hysteria2_profile_from_subscription(encoded) == profile  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["file:///etc/passwd", "ftp://example.com/list", "https://example.com/list#secret", "https://host name/list"],
+)
+def test_hysteria2_subscription_rejects_unsafe_urls(cli: ModuleType, url: str) -> None:
+    with pytest.raises(ValueError, match="Subscription|subscription"):
+        cli.normalize_hysteria2_subscription_url_or_raise(url)  # type: ignore[attr-defined]
+
+
+def test_configure_hysteria2_subscription_installs_automatic_update_timer(
+    cli: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    subscription_url = "https://subscriptions.example/path?token=secret"
+    profile = "hy2://password@example.com:443/"
+    commands: list[list[str]] = []
+    saved_files: dict[Path, tuple[str, int]] = {}
+    monkeypatch.setattr(cli, "HYSTERIA2_SUBSCRIPTION_FILE", tmp_path / "subscription.url")
+    monkeypatch.setattr(cli, "require_root_for_update", lambda: None)
+    monkeypatch.setattr(cli, "find_hysteria2_executable", lambda: Path("/usr/bin/hysteria"))
+    monkeypatch.setattr(cli, "fetch_hysteria2_subscription", lambda _: profile)
+    monkeypatch.setattr(cli, "write_hysteria2_client_config", lambda _: None)
+    monkeypatch.setattr(cli, "write_hysteria2_unit", lambda _: None)
+    monkeypatch.setattr(cli, "write_hysteria2_subscription_units", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "atomic_write_service_file",
+        lambda path, payload, *, mode, gid: saved_files.update({path: (payload, mode)}),
+    )
+    monkeypatch.setattr(cli, "load_env", lambda: {})
+    monkeypatch.setattr(cli, "save_env", lambda _: None)
+    monkeypatch.setattr(cli, "run", lambda command, **kwargs: commands.append(command) or 0)
+
+    cli.configure_hysteria2_subscription(subscription_url)  # type: ignore[attr-defined]
+
+    assert saved_files[tmp_path / "subscription.url"] == (subscription_url + "\n", 0o600)
+    assert ["systemctl", "enable", "--now", "transmission3-bot-hysteria2-update.timer"] in commands
+    assert ["systemctl", "restart", "transmission3-bot-hysteria2"] in commands
+
+
+def test_hysteria2_subscription_updater_can_only_write_client_config(
+    cli: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service_path = tmp_path / "update.service"
+    timer_path = tmp_path / "update.timer"
+    config_path = tmp_path / "hysteria2-client.json"
+    written: dict[Path, str] = {}
+    monkeypatch.setattr(cli, "HYSTERIA2_UPDATE_UNIT_FILE", service_path)
+    monkeypatch.setattr(cli, "HYSTERIA2_UPDATE_TIMER_FILE", timer_path)
+    monkeypatch.setattr(cli, "HYSTERIA2_CONFIG_FILE", config_path)
+    monkeypatch.setattr(
+        cli,
+        "atomic_write_service_file",
+        lambda path, payload, *, mode, gid: written.update({path: payload}),
+    )
+
+    cli.write_hysteria2_subscription_units()  # type: ignore[attr-defined]
+
+    service = written[service_path]
+    assert "ProtectSystem=strict" in service
+    assert f"ReadWritePaths={config_path}" in service
+
+
 def test_hysteria2_profile_is_written_to_private_json_config(
     cli: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
