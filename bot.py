@@ -12,9 +12,11 @@ import os
 import re
 import secrets
 import sqlite3
+import struct
 import tempfile
 import threading
 import time as time_module
+import zlib
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
@@ -1960,11 +1962,69 @@ def _traffic_points_last_7_days(
     return result[-7:]
 
 
+def _build_basic_traffic_chart_png(down_values: list[float], up_values: list[float]) -> bytes:
+    """Строит резервный график без зависимостей для установок без matplotlib."""
+    width, height = 940, 520
+    left, top, right, bottom = 72, 38, 28, 62
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    pixels = bytearray(b"\xff\xff\xff" * width * height)
+
+    def fill_rect(x1: int, y1: int, x2: int, y2: int, color: tuple[int, int, int]) -> None:
+        x1, x2 = max(0, x1), min(width, x2)
+        y1, y2 = max(0, y1), min(height, y2)
+        row = bytes(color) * max(0, x2 - x1)
+        for y in range(y1, y2):
+            offset = (y * width + x1) * 3
+            pixels[offset : offset + len(row)] = row
+
+    # Сетка и цветные столбцы оставляют график читаемым даже без шрифтов matplotlib.
+    for step in range(6):
+        y = top + round(plot_height * step / 5)
+        fill_rect(left, y, width - right, y + 1, (218, 226, 236))
+    fill_rect(left - 1, top, left + 1, height - bottom + 1, (93, 109, 126))
+    fill_rect(left, height - bottom, width - right, height - bottom + 2, (93, 109, 126))
+
+    values_count = max(len(down_values), len(up_values), 1)
+    maximum = max([*down_values, *up_values, 1.0])
+    group_width = plot_width / values_count
+    bar_width = max(3, min(34, int(group_width * 0.32)))
+    for index in range(values_count):
+        center = left + round(group_width * (index + 0.5))
+        for value, x, color in (
+            (down_values[index] if index < len(down_values) else 0.0, center - bar_width, (36, 123, 220)),
+            (up_values[index] if index < len(up_values) else 0.0, center, (241, 139, 45)),
+        ):
+            bar_height = round(plot_height * max(0.0, value) / maximum)
+            fill_rect(x, height - bottom - bar_height, x + bar_width, height - bottom, color)
+
+    # Легенда: синий — загрузка, оранжевый — отдача; подписи остаются в caption сообщения.
+    fill_rect(left, 12, left + 28, 26, (36, 123, 220))
+    fill_rect(left + 46, 12, left + 74, 26, (241, 139, 45))
+
+    raw = b"".join(b"\x00" + pixels[y * width * 3 : (y + 1) * width * 3] for y in range(height))
+
+    def png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+        checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + chunk_type + payload + struct.pack(">I", checksum)
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + png_chunk(b"IDAT", zlib.compress(raw, level=7))
+        + png_chunk(b"IEND", b"")
+    )
+
+
 def _build_traffic_chart_last_7_days(
     points: list[dict[str, int | str]],
 ) -> tuple[Optional[bytes], Optional[str]]:
     if len(points) < 2:
         return None, "Недостаточно данных для графика. История заполняется раз в день."
+
+    labels = [str(item["date"]) for item in points]
+    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
+    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
 
     try:
         import matplotlib
@@ -1972,11 +2032,7 @@ def _build_traffic_chart_last_7_days(
         matplotlib.use("Agg")
         from matplotlib import pyplot as plt
     except ImportError:
-        return None, "Графики недоступны: установите optional-зависимость matplotlib."
-
-    labels = [str(item["date"]) for item in points]
-    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
-    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+        return _build_basic_traffic_chart_png(down_values, up_values), None
 
     fig, ax = plt.subplots(figsize=(9.4, 5.2), dpi=130)
     try:
@@ -2055,17 +2111,17 @@ def _build_traffic_chart_current_month(
 ) -> tuple[Optional[list[dict[str, int | str]]], Optional[bytes], Optional[str]]:
     points = _daily_totals_current_month(now, downloaded, uploaded, history)
 
+    labels = [str(item["day"]) for item in points]
+    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
+    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+
     try:
         import matplotlib
 
         matplotlib.use("Agg")
         from matplotlib import pyplot as plt
     except ImportError:
-        return None, None, "Графики недоступны: установите optional-зависимость matplotlib."
-
-    labels = [str(item["day"]) for item in points]
-    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
-    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+        return points, _build_basic_traffic_chart_png(down_values, up_values), None
 
     month_title = f"{_month_name_ru(now.month)} {now.year}"
 
