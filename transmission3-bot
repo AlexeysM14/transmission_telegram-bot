@@ -93,8 +93,13 @@ SERVICE_USER = INSTALL_SETTINGS.get("SERVICE_USER", os.environ.get("SERVICE_USER
 SERVICE_GROUP = INSTALL_SETTINGS.get("SERVICE_GROUP", os.environ.get("SERVICE_GROUP", SERVICE_USER))
 HYSTERIA2_CONFIG_FILE = Path(f"/etc/{SERVICE_NAME}/hysteria2-client.json")
 HYSTERIA2_UNIT_FILE = Path(f"/etc/systemd/system/{HYSTERIA2_SERVICE_NAME}.service")
+HYSTERIA2_SUBSCRIPTION_FILE = Path(f"/etc/{SERVICE_NAME}/hysteria2-subscription.url")
+HYSTERIA2_UPDATE_SERVICE_NAME = f"{HYSTERIA2_SERVICE_NAME}-update"
+HYSTERIA2_UPDATE_UNIT_FILE = Path(f"/etc/systemd/system/{HYSTERIA2_UPDATE_SERVICE_NAME}.service")
+HYSTERIA2_UPDATE_TIMER_FILE = Path(f"/etc/systemd/system/{HYSTERIA2_UPDATE_SERVICE_NAME}.timer")
 HYSTERIA2_SOCKS5_LISTEN = "127.0.0.1:1080"
 HYSTERIA2_SOCKS5_PROXY = f"socks5://{HYSTERIA2_SOCKS5_LISTEN}"
+HYSTERIA2_SUBSCRIPTION_MAX_BYTES = 1024 * 1024
 
 
 def sanitized_subprocess_env() -> dict[str, str]:
@@ -450,6 +455,62 @@ def normalize_hysteria2_profile_uri_or_raise(raw_uri: str) -> str:
     return value
 
 
+def normalize_hysteria2_subscription_url_or_raise(raw_url: str) -> str:
+    value = raw_url.strip()
+    if not value or len(value) > 8192 or any(character.isspace() for character in value):
+        raise ValueError("Invalid Hysteria 2 subscription URL")
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError as exc:
+        raise ValueError("Invalid Hysteria 2 subscription URL") from exc
+    if parts.scheme.lower() not in {"http", "https"} or not parts.netloc or not hostname or parts.fragment:
+        raise ValueError("Subscription must use http:// or https:// and must not contain a fragment")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Invalid Hysteria 2 subscription URL")
+    return value
+
+
+def extract_hysteria2_profile_from_subscription(payload: bytes) -> str:
+    if len(payload) > HYSTERIA2_SUBSCRIPTION_MAX_BYTES:
+        raise ValueError("Hysteria 2 subscription response is too large")
+    try:
+        text = payload.decode("utf-8-sig").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError("Hysteria 2 subscription is not valid UTF-8") from exc
+
+    # Многие панели отдают список ссылок как Base64 без обязательного padding.
+    candidates = [text]
+    compact = "".join(text.split())
+    if compact:
+        with contextlib.suppress(ValueError, UnicodeDecodeError):
+            padding = "=" * (-len(compact) % 4)
+            candidates.append(base64.urlsafe_b64decode(compact + padding).decode("utf-8-sig"))
+    for candidate in candidates:
+        for line in candidate.splitlines():
+            value = line.strip()
+            if not value:
+                continue
+            with contextlib.suppress(ValueError):
+                return normalize_hysteria2_profile_uri_or_raise(value)
+    raise ValueError("Subscription does not contain a supported Hysteria 2 profile")
+
+
+def fetch_hysteria2_subscription(subscription_url: str) -> str:
+    url = normalize_hysteria2_subscription_url_or_raise(subscription_url)
+    request = Request(url, headers={"Accept": "text/plain", "User-Agent": f"{SERVICE_NAME}/subscription"})
+    opener = build_opener(ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=20) as response:  # nosec B310 - URL scheme validated above
+            if response.geturl() != url:
+                normalize_hysteria2_subscription_url_or_raise(response.geturl())
+            payload = response.read(HYSTERIA2_SUBSCRIPTION_MAX_BYTES + 1)
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(f"Could not download Hysteria 2 subscription ({type(exc).__name__})") from exc
+    return extract_hysteria2_profile_from_subscription(payload)
+
+
 def find_hysteria2_executable() -> Path:
     for candidate in (Path("/usr/local/bin/hysteria"), Path("/usr/bin/hysteria")):
         if not candidate.exists():
@@ -537,12 +598,86 @@ WantedBy=multi-user.target
     atomic_write_service_file(HYSTERIA2_UNIT_FILE, unit, mode=0o644, gid=0)
 
 
+def write_hysteria2_subscription_units() -> None:
+    service = f"""[Unit]
+Description=Update Hysteria 2 subscription for Transmission Telegram Bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={CLI_IMPL_PATH} hysteria2-refresh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={HYSTERIA2_CONFIG_FILE}
+"""
+    timer = """[Unit]
+Description=Periodically update Hysteria 2 subscription
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+    atomic_write_service_file(HYSTERIA2_UPDATE_UNIT_FILE, service, mode=0o644, gid=0)
+    atomic_write_service_file(HYSTERIA2_UPDATE_TIMER_FILE, timer, mode=0o644, gid=0)
+
+
+def refresh_hysteria2_subscription() -> bool:
+    require_root_for_update()
+    if not HYSTERIA2_SUBSCRIPTION_FILE.exists():
+        raise RuntimeError("Hysteria 2 subscription is not configured")
+    subscription_url = HYSTERIA2_SUBSCRIPTION_FILE.read_text(encoding="utf-8").strip()
+    profile = fetch_hysteria2_subscription(subscription_url)
+    old_payload = HYSTERIA2_CONFIG_FILE.read_text(encoding="utf-8") if HYSTERIA2_CONFIG_FILE.exists() else None
+    write_hysteria2_client_config(profile)
+    changed = old_payload != HYSTERIA2_CONFIG_FILE.read_text(encoding="utf-8")
+    if changed:
+        run(["systemctl", "try-restart", HYSTERIA2_SERVICE_NAME])
+    print("✅ Hysteria 2 subscription updated" if changed else "✅ Hysteria 2 subscription is unchanged")
+    return changed
+
+
+def configure_hysteria2_subscription(subscription_url: str) -> None:
+    require_root_for_update()
+    executable = find_hysteria2_executable()
+    normalized_url = normalize_hysteria2_subscription_url_or_raise(subscription_url)
+    profile = fetch_hysteria2_subscription(normalized_url)
+    write_hysteria2_client_config(profile)
+    write_hysteria2_unit(executable)
+    write_hysteria2_subscription_units()
+    atomic_write_service_file(HYSTERIA2_SUBSCRIPTION_FILE, normalized_url + "\n", mode=0o600, gid=0)
+
+    data = load_env()
+    data["HYSTERIA2_SOCKS5_PROXY"] = HYSTERIA2_SOCKS5_PROXY
+    save_env(data)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "--now", HYSTERIA2_UPDATE_SERVICE_NAME + ".timer"])
+    run(["systemctl", "enable", HYSTERIA2_SERVICE_NAME])
+    run(["systemctl", "restart", HYSTERIA2_SERVICE_NAME])
+    run(["systemctl", "try-restart", SERVICE_NAME])
+    print(f"✅ Hysteria 2 subscription configured; local SOCKS5: {HYSTERIA2_SOCKS5_PROXY}")
+
+
 def configure_hysteria2_profile(profile_uri: str) -> None:
     require_root_for_update()
     executable = find_hysteria2_executable()
     normalized_profile = normalize_hysteria2_profile_uri_or_raise(profile_uri)
     write_hysteria2_client_config(normalized_profile)
     write_hysteria2_unit(executable)
+    if HYSTERIA2_UPDATE_TIMER_FILE.exists():
+        run(["systemctl", "disable", "--now", HYSTERIA2_UPDATE_SERVICE_NAME + ".timer"], check=False)
+    with contextlib.suppress(FileNotFoundError):
+        HYSTERIA2_SUBSCRIPTION_FILE.unlink()
+    for path in (HYSTERIA2_UPDATE_UNIT_FILE, HYSTERIA2_UPDATE_TIMER_FILE):
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
 
     data = load_env()
     data["HYSTERIA2_SOCKS5_PROXY"] = HYSTERIA2_SOCKS5_PROXY
@@ -559,12 +694,20 @@ def disable_hysteria2_profile() -> None:
     require_root_for_update()
     if HYSTERIA2_UNIT_FILE.exists():
         run(["systemctl", "disable", "--now", HYSTERIA2_SERVICE_NAME], check=False)
+    if HYSTERIA2_UPDATE_TIMER_FILE.exists():
+        run(["systemctl", "disable", "--now", HYSTERIA2_UPDATE_SERVICE_NAME + ".timer"], check=False)
 
     data = load_env()
     data.pop("HYSTERIA2_SOCKS5_PROXY", None)
     save_env(data)
 
-    for path in (HYSTERIA2_CONFIG_FILE, HYSTERIA2_UNIT_FILE):
+    for path in (
+        HYSTERIA2_CONFIG_FILE,
+        HYSTERIA2_UNIT_FILE,
+        HYSTERIA2_SUBSCRIPTION_FILE,
+        HYSTERIA2_UPDATE_UNIT_FILE,
+        HYSTERIA2_UPDATE_TIMER_FILE,
+    ):
         with contextlib.suppress(FileNotFoundError):
             path.unlink()
     run(["systemctl", "daemon-reload"])
@@ -1010,6 +1153,7 @@ def menu() -> None:  # noqa: C901
             "12) Disable allow-all access (remove ALLOW_ALL_USERS)\n"
             "13) Add Hysteria 2 profile URI and configure the local client\n"
             "14) Disable Hysteria 2 and remove its saved profile\n"
+            "15) Add Hysteria 2 subscription URL with automatic updates\n"
             "0) Exit\n"
         )
 
@@ -1091,6 +1235,12 @@ def menu() -> None:  # noqa: C901
                     configure_hysteria2_profile(value)
             elif choice == "14":
                 disable_hysteria2_profile()
+            elif choice == "15":
+                value = getpass.getpass("Paste Hysteria 2 subscription URL (http:// or https://): ").strip()
+                if not value:
+                    print("⚠️ Empty subscription URL, nothing changed")
+                else:
+                    configure_hysteria2_subscription(value)
             elif choice == "0":
                 print("Bye")
                 return
@@ -1101,6 +1251,9 @@ def menu() -> None:  # noqa: C901
 
 
 def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "hysteria2-refresh":
+        refresh_hysteria2_subscription()
+        return 0
     if len(sys.argv) == 2 and sys.argv[1] == "update":
         require_root_for_update()
         menu()
