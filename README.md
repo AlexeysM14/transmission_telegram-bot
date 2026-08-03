@@ -98,7 +98,8 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
 
-Опционально: для отправки графика трафика установите `matplotlib`:
+Графики трафика работают без дополнительных зависимостей. Опционально можно установить `matplotlib`,
+чтобы использовать расширенное оформление вместо встроенного резервного графика:
 
 ```bash
 python -m pip install matplotlib

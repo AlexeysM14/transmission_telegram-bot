@@ -12,9 +12,11 @@ import os
 import re
 import secrets
 import sqlite3
+import struct
 import tempfile
 import threading
 import time as time_module
+import zlib
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime
@@ -1960,11 +1962,133 @@ def _traffic_points_last_7_days(
     return result[-7:]
 
 
+_CHART_FONT: dict[str, tuple[str, ...]] = {
+    " ": ("000",) * 7,
+    ".": ("000", "000", "000", "000", "000", "110", "110"),
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11110", "00001", "00001", "01110", "00001", "00001", "11110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "10000", "11110", "00001", "00001", "11110"),
+    "6": ("01110", "10000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00001", "01110"),
+    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
+    "C": ("01111", "10000", "10000", "10000", "10000", "10000", "01111"),
+    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
+    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
+    "G": ("01111", "10000", "10000", "10111", "10001", "10001", "01110"),
+    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
+    "I": ("11111", "00100", "00100", "00100", "00100", "00100", "11111"),
+    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
+    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
+    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
+    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
+    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
+    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
+    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
+    "W": ("10001", "10001", "10001", "10101", "10101", "11011", "10001"),
+    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
+}
+
+
+def _build_basic_traffic_chart_png(  # noqa: C901
+    down_values: list[float],
+    up_values: list[float],
+    labels: list[str],
+    title: str,
+) -> bytes:
+    """Строит резервный график без зависимостей для установок без matplotlib."""
+    width, height = 940, 520
+    left, top, right, bottom = 92, 78, 28, 62
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+    values_count = max(len(down_values), len(up_values), 1)
+    maximum = max([*down_values, *up_values, 1.0])
+    pixels = bytearray(b"\xff\xff\xff" * width * height)
+
+    def fill_rect(x1: int, y1: int, x2: int, y2: int, color: tuple[int, int, int]) -> None:
+        x1, x2 = max(0, x1), min(width, x2)
+        y1, y2 = max(0, y1), min(height, y2)
+        row = bytes(color) * max(0, x2 - x1)
+        for y in range(y1, y2):
+            offset = (y * width + x1) * 3
+            pixels[offset : offset + len(row)] = row
+
+    def draw_text(x: int, y: int, value: str, *, scale: int = 2) -> None:
+        cursor = x
+        for character in value.upper():
+            glyph = _CHART_FONT.get(character, _CHART_FONT[" "])
+            for row_index, row in enumerate(glyph):
+                for column_index, enabled in enumerate(row):
+                    if enabled == "1":
+                        fill_rect(
+                            cursor + column_index * scale,
+                            y + row_index * scale,
+                            cursor + (column_index + 1) * scale,
+                            y + (row_index + 1) * scale,
+                            (43, 52, 64),
+                        )
+            cursor += (len(glyph[0]) + 1) * scale
+
+    draw_text(left, 10, title, scale=3)
+    fill_rect(left, 45, left + 28, 59, (36, 123, 220))
+    draw_text(left + 36, 45, "DOWN")
+    fill_rect(left + 116, 45, left + 144, 59, (241, 139, 45))
+    draw_text(left + 152, 45, "UP")
+    draw_text(8, top - 34, "GIB")
+
+    # Сетка и цветные столбцы оставляют график читаемым даже без шрифтов matplotlib.
+    for step in range(6):
+        y = top + round(plot_height * step / 5)
+        fill_rect(left, y, width - right, y + 1, (218, 226, 236))
+        tick_value = maximum * (5 - step) / 5
+        draw_text(8, y - 7, f"{tick_value:.1f}")
+    fill_rect(left - 1, top, left + 1, height - bottom + 1, (93, 109, 126))
+    fill_rect(left, height - bottom, width - right, height - bottom + 2, (93, 109, 126))
+
+    group_width = plot_width / values_count
+    bar_width = max(3, min(34, int(group_width * 0.32)))
+    for index in range(values_count):
+        center = left + round(group_width * (index + 0.5))
+        for value, x, color in (
+            (down_values[index] if index < len(down_values) else 0.0, center - bar_width, (36, 123, 220)),
+            (up_values[index] if index < len(up_values) else 0.0, center, (241, 139, 45)),
+        ):
+            bar_height = round(plot_height * max(0.0, value) / maximum)
+            fill_rect(x, height - bottom - bar_height, x + bar_width, height - bottom, color)
+        if index < len(labels):
+            label = labels[index]
+            label_width = len(label) * 12
+            draw_text(center - label_width // 2, height - bottom + 12, label)
+
+    raw = b"".join(b"\x00" + pixels[y * width * 3 : (y + 1) * width * 3] for y in range(height))
+
+    def png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+        checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + chunk_type + payload + struct.pack(">I", checksum)
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + png_chunk(b"IDAT", zlib.compress(raw, level=7))
+        + png_chunk(b"IEND", b"")
+    )
+
+
 def _build_traffic_chart_last_7_days(
     points: list[dict[str, int | str]],
 ) -> tuple[Optional[bytes], Optional[str]]:
     if len(points) < 2:
         return None, "Недостаточно данных для графика. История заполняется раз в день."
+
+    labels = [str(item["date"]) for item in points]
+    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
+    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
 
     try:
         import matplotlib
@@ -1972,11 +2096,7 @@ def _build_traffic_chart_last_7_days(
         matplotlib.use("Agg")
         from matplotlib import pyplot as plt
     except ImportError:
-        return None, "Графики недоступны: установите optional-зависимость matplotlib."
-
-    labels = [str(item["date"]) for item in points]
-    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
-    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+        return _build_basic_traffic_chart_png(down_values, up_values, labels, "TRAFFIC 7 DAYS"), None
 
     fig, ax = plt.subplots(figsize=(9.4, 5.2), dpi=130)
     try:
@@ -2055,17 +2175,17 @@ def _build_traffic_chart_current_month(
 ) -> tuple[Optional[list[dict[str, int | str]]], Optional[bytes], Optional[str]]:
     points = _daily_totals_current_month(now, downloaded, uploaded, history)
 
+    labels = [str(item["day"]) for item in points]
+    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
+    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+
     try:
         import matplotlib
 
         matplotlib.use("Agg")
         from matplotlib import pyplot as plt
     except ImportError:
-        return None, None, "Графики недоступны: установите optional-зависимость matplotlib."
-
-    labels = [str(item["day"]) for item in points]
-    down_values = [float(item["downloaded"]) / (1024 * 1024 * 1024) for item in points]
-    up_values = [float(item["uploaded"]) / (1024 * 1024 * 1024) for item in points]
+        return points, _build_basic_traffic_chart_png(down_values, up_values, labels, "TRAFFIC MONTH"), None
 
     month_title = f"{_month_name_ru(now.month)} {now.year}"
 
