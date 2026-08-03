@@ -1962,10 +1962,16 @@ def _traffic_points_last_7_days(
     return result[-7:]
 
 
-def _build_basic_traffic_chart_png(down_values: list[float], up_values: list[float]) -> bytes:
+def _build_basic_traffic_chart_png(  # noqa: C901
+    labels: list[str],
+    down_values: list[float],
+    up_values: list[float],
+    *,
+    title: str,
+) -> bytes:
     """Строит резервный график без зависимостей для установок без matplotlib."""
     width, height = 940, 520
-    left, top, right, bottom = 72, 38, 28, 62
+    left, top, right, bottom = 86, 112, 28, 68
     plot_width = width - left - right
     plot_height = height - top - bottom
     pixels = bytearray(b"\xff\xff\xff" * width * height)
@@ -1978,29 +1984,89 @@ def _build_basic_traffic_chart_png(down_values: list[float], up_values: list[flo
             offset = (y * width + x1) * 3
             pixels[offset : offset + len(row)] = row
 
-    # Сетка и цветные столбцы оставляют график читаемым даже без шрифтов matplotlib.
+    # Маленький встроенный шрифт не требует ни Pillow, ни системных шрифтов.
+    glyphs = {
+        " ": (0, 0, 0, 0, 0, 0, 0), "-": (0, 0, 0, 31, 0, 0, 0), ".": (0, 0, 0, 0, 0, 12, 12),
+        "/": (1, 2, 4, 8, 16, 0, 0), ":": (0, 12, 12, 0, 12, 12, 0),
+        "0": (14, 17, 19, 21, 25, 17, 14), "1": (4, 12, 4, 4, 4, 4, 14),
+        "2": (14, 17, 1, 2, 4, 8, 31), "3": (30, 1, 1, 14, 1, 1, 30),
+        "4": (2, 6, 10, 18, 31, 2, 2), "5": (31, 16, 16, 30, 1, 1, 30),
+        "6": (14, 16, 16, 30, 17, 17, 14), "7": (31, 1, 2, 4, 8, 8, 8),
+        "8": (14, 17, 17, 14, 17, 17, 14), "9": (14, 17, 17, 15, 1, 1, 14),
+        "A": (14, 17, 17, 31, 17, 17, 17), "B": (30, 17, 17, 30, 17, 17, 30),
+        "C": (14, 17, 16, 16, 16, 17, 14),
+        "D": (30, 17, 17, 17, 17, 17, 30), "E": (31, 16, 16, 30, 16, 16, 31),
+        "F": (31, 16, 16, 30, 16, 16, 16),
+        "G": (14, 17, 16, 23, 17, 17, 15), "I": (14, 4, 4, 4, 4, 4, 14),
+        "N": (17, 25, 25, 21, 19, 19, 17), "O": (14, 17, 17, 17, 17, 17, 14),
+        "P": (30, 17, 17, 30, 16, 16, 16), "R": (30, 17, 17, 30, 20, 18, 17),
+        "S": (15, 16, 16, 14, 1, 1, 30), "T": (31, 4, 4, 4, 4, 4, 4),
+        "U": (17, 17, 17, 17, 17, 17, 14), "W": (17, 17, 17, 21, 21, 21, 10),
+        "Y": (17, 17, 10, 4, 4, 4, 4),
+    }
+
+    def draw_text(x: int, y: int, value: str, color: tuple[int, int, int], scale: int = 2) -> None:
+        for char in value.upper():
+            rows = glyphs.get(char, glyphs[" "])
+            for row_index, bits in enumerate(rows):
+                for column in range(5):
+                    if bits & (1 << (4 - column)):
+                        fill_rect(
+                            x + column * scale,
+                            y + row_index * scale,
+                            x + (column + 1) * scale,
+                            y + (row_index + 1) * scale,
+                            color,
+                        )
+            x += 6 * scale
+
+    def draw_line(x1: int, y1: int, x2: int, y2: int, color: tuple[int, int, int], thickness: int = 3) -> None:
+        steps = max(abs(x2 - x1), abs(y2 - y1), 1)
+        for step in range(steps + 1):
+            x = round(x1 + (x2 - x1) * step / steps)
+            y = round(y1 + (y2 - y1) * step / steps)
+            fill_rect(x - thickness // 2, y - thickness // 2, x + (thickness + 1) // 2, y + (thickness + 1) // 2, color)
+
+    text_color = (15, 23, 42)
+    muted_color = (100, 116, 139)
+    down_color = (37, 99, 235)
+    up_color = (234, 88, 12)
+    fill_rect(0, 0, width, height, (241, 245, 249))
+    fill_rect(20, 20, width - 20, height - 20, (248, 250, 252))
+    # Заголовок транслитерируется в вызывающем коде, чтобы не хранить большой набор глифов.
+    draw_text(48, 40, title, text_color, 3)
+    draw_text(48, 78, f"DOWN {_format_chart_total(sum(down_values))}", down_color)
+    draw_text(310, 78, f"UP {_format_chart_total(sum(up_values))}", up_color)
+
     for step in range(6):
         y = top + round(plot_height * step / 5)
-        fill_rect(left, y, width - right, y + 1, (218, 226, 236))
-    fill_rect(left - 1, top, left + 1, height - bottom + 1, (93, 109, 126))
-    fill_rect(left, height - bottom, width - right, height - bottom + 2, (93, 109, 126))
+        fill_rect(left, y, width - right, y + 1, (216, 224, 234))
 
     values_count = max(len(down_values), len(up_values), 1)
     maximum = max([*down_values, *up_values, 1.0])
     group_width = plot_width / values_count
-    bar_width = max(3, min(34, int(group_width * 0.32)))
+    down_points: list[tuple[int, int]] = []
+    up_points: list[tuple[int, int]] = []
     for index in range(values_count):
         center = left + round(group_width * (index + 0.5))
-        for value, x, color in (
-            (down_values[index] if index < len(down_values) else 0.0, center - bar_width, (36, 123, 220)),
-            (up_values[index] if index < len(up_values) else 0.0, center, (241, 139, 45)),
-        ):
-            bar_height = round(plot_height * max(0.0, value) / maximum)
-            fill_rect(x, height - bottom - bar_height, x + bar_width, height - bottom, color)
+        down_y = height - bottom - round(plot_height * max(0.0, down_values[index]) / maximum)
+        up_y = height - bottom - round(plot_height * max(0.0, up_values[index]) / maximum)
+        down_points.append((center, down_y))
+        up_points.append((center, up_y))
+        if index % max(1, (values_count + 11) // 12) == 0 or index == values_count - 1:
+            label = labels[index] if index < len(labels) else str(index + 1)
+            draw_text(center - len(label) * 6, height - bottom + 18, label, muted_color)
 
-    # Легенда: синий — загрузка, оранжевый — отдача; подписи остаются в caption сообщения.
-    fill_rect(left, 12, left + 28, 26, (36, 123, 220))
-    fill_rect(left + 46, 12, left + 74, 26, (241, 139, 45))
+    for points, color in ((down_points, down_color), (up_points, up_color)):
+        for start, end in zip(points, points[1:], strict=False):
+            draw_line(*start, *end, color)
+        for x, y in points:
+            fill_rect(x - 4, y - 4, x + 5, y + 5, (255, 255, 255))
+            fill_rect(x - 2, y - 2, x + 3, y + 3, color)
+
+    for step in range(6):
+        value = maximum * (5 - step) / 5
+        draw_text(30, top + round(plot_height * step / 5) - 7, _format_chart_value(value), muted_color)
 
     raw = b"".join(b"\x00" + pixels[y * width * 3 : (y + 1) * width * 3] for y in range(height))
 
@@ -2032,7 +2098,7 @@ def _build_traffic_chart_last_7_days(
         matplotlib.use("Agg")
         from matplotlib import pyplot as plt
     except ImportError:
-        return _build_basic_traffic_chart_png(down_values, up_values), None
+        return _build_basic_traffic_chart_png(labels, down_values, up_values, title="TRAFFIC - 7 DAYS"), None
 
     fig, ax = plt.subplots(figsize=(9.4, 5.2), dpi=130)
     try:
@@ -2121,7 +2187,12 @@ def _build_traffic_chart_current_month(
         matplotlib.use("Agg")
         from matplotlib import pyplot as plt
     except ImportError:
-        return points, _build_basic_traffic_chart_png(down_values, up_values), None
+        return points, _build_basic_traffic_chart_png(
+            labels,
+            down_values,
+            up_values,
+            title=f"TRAFFIC - {now.month:02d}/{now.year}",
+        ), None
 
     month_title = f"{_month_name_ru(now.month)} {now.year}"
 
